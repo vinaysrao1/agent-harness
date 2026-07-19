@@ -69,3 +69,7 @@ a warning (path-jailed but not isolated).
 Milestones M1–M4 of DESIGN.md §7 are implemented (loop, durability, permissions,
 two adapters, memory, skills, subagents). Not yet built: MCP connectors + OAuth
 (M5), the eval runner and consolidation loop (M6–M7).
+
+## License
+
+[Apache-2.0](LICENSE)
