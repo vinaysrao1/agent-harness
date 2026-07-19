@@ -270,6 +270,7 @@ class Orchestrator:
         *,
         adapter_override: ModelAdapter | AdapterFactory | None = None,
         budgets: Budgets | None = None,
+        sandbox: Sandbox | None = None,
     ) -> tuple[str, AgentResult]:
         """Run one task end-to-end and return ``(run_id, lead result)``.
 
@@ -286,6 +287,17 @@ class Orchestrator:
         sandbox is always stopped in a ``finally``, along with any isolated
         subagent sandboxes; subagents still running when the lead finishes
         are cancelled and marked ``cancelled``.
+
+        ``sandbox``, when provided, is used as the lead agent's sandbox in
+        place of the usual Docker/Local selection (used by external
+        integrations such as the Harbor bridge, whose sandbox wraps a
+        benchmark-owned container). Its lifecycle is still driven the same
+        way — ``start()`` before the loop, ``stop()`` in the ``finally`` —
+        so a caller-provided sandbox's ``start``/``stop`` must be
+        idempotent (the base :class:`~harness.sandbox.base.Sandbox`
+        contract already requires this; e.g.
+        :class:`~harness.sandbox.harbor_env.HarborSandbox.stop` is a
+        no-op because the caller owns the container).
 
         Raises :class:`UnknownModelError` (before any rows are created) if
         ``model_name`` is not configured and no override is given.
@@ -306,6 +318,7 @@ class Orchestrator:
             budgets=budgets or Budgets(),
             model_label=model_name,
             replay=False,
+            sandbox_override=sandbox,
         )
         return run_id, result
 
@@ -468,7 +481,7 @@ class Orchestrator:
         return LocalSandbox(workspace)
 
     def _system_prompt(
-        self, mode: PermissionMode, workspace: Path, skills: SkillLibrary
+        self, mode: PermissionMode, workspace: Path | str, skills: SkillLibrary
     ) -> str:
         """Assemble the base system prompt: harness rules + skills index."""
         sections = [_BASE_RULES.format(workspace=workspace, mode=mode.value)]
@@ -622,8 +635,19 @@ class Orchestrator:
         model_label: str,
         replay: bool,
         grants: list[str] | tuple[str, ...] = (),
+        sandbox_override: Sandbox | None = None,
     ) -> AgentResult:
         """Shared engine behind :meth:`run_task` and :meth:`resume_task`.
+
+        ``sandbox_override``, when given, replaces the Docker/Local sandbox
+        selection for the lead agent (see :meth:`run_task`) — and for every
+        subagent: ``spawn_agent(share_sandbox=false)`` is coerced back to
+        the shared override (with a note in the tool result), because a
+        host-side isolated sandbox would not contain the external
+        environment's files and its work could never reach it. The
+        ``{workspace}`` line of the base rules then renders the override's
+        ``workspace_root`` (or a "(managed by caller)" note) instead of the
+        host workspace path, which is not where an external sandbox runs.
 
         Builds sandbox, memory, skills, contexts, registries, and the
         spawn/await machinery, then runs the lead loop. ``grants`` seeds
@@ -642,7 +666,14 @@ class Orchestrator:
 
         memory = MemoryStore(self.config.home / "memory")
         skills = SkillLibrary(self.config.home / "skills")
-        system_prompt = self._system_prompt(mode, workspace, skills)
+        if sandbox_override is None:
+            workspace_label: Path | str = workspace
+        else:
+            root = getattr(sandbox_override, "workspace_root", None)
+            workspace_label = (
+                f"{root} (managed by caller)" if root else "(managed by caller)"
+            )
+        system_prompt = self._system_prompt(mode, workspace_label, skills)
         memory_index = self._memory_index_text(memory)
 
         if not replay:
@@ -653,7 +684,11 @@ class Orchestrator:
             # ledger via the add_instruction tool.
             self.store.upsert_instruction(run_id, "goal", lead_prompt, "user")
 
-        sandbox = self._create_sandbox(workspace)
+        sandbox = (
+            sandbox_override
+            if sandbox_override is not None
+            else self._create_sandbox(workspace)
+        )
         extra_sandboxes: list[Sandbox] = []
         subagent_tasks: dict[str, asyncio.Task[AgentResult]] = {}
         #: Subagent ids whose crash was already recorded (by await_agents or
@@ -727,6 +762,22 @@ class Orchestrator:
         async def spawn_handler(arguments: dict) -> str:
             prompt = _require_str("spawn_agent", arguments, "prompt")
             share_sandbox = bool(arguments.get("share_sandbox", True))
+            isolation_note = ""
+            if not share_sandbox and sandbox_override is not None:
+                # A caller-provided sandbox (e.g. the Harbor bridge) wraps
+                # the only environment that holds the task's files. A
+                # host-side Docker/Local sandbox spun up here would be an
+                # empty workspace the caller never sees (and, with no
+                # Docker daemon, an unsandboxed LocalSandbox on the host),
+                # so isolation is forced back onto the shared override and
+                # the model is told why in the tool result.
+                share_sandbox = True
+                isolation_note = (
+                    " (note: share_sandbox=false was ignored because this "
+                    "run's sandbox is managed by an external caller, so "
+                    "isolated workspaces are unavailable; the subagent "
+                    "shares your sandbox)"
+                )
             agent_id = self.store.create_agent(
                 run_id, prompt, parent_agent_id=lead_agent_id
             )
@@ -775,7 +826,7 @@ class Orchestrator:
                                 pass
 
             subagent_tasks[agent_id] = asyncio.create_task(run_child())
-            return f"spawned subagent {agent_id}"
+            return f"spawned subagent {agent_id}{isolation_note}"
 
         async def await_handler(arguments: dict) -> str:
             ids = arguments.get("ids")

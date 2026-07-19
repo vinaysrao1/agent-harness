@@ -1,0 +1,119 @@
+{
+    "id": "e9d904b7-6ea7-4470-ba8a-789d566746d3",
+    "task_name": "build-pov-ray",
+    "trial_name": "build-pov-ray__5X2pWQF",
+    "trial_uri": "file:///Users/vinay/vinaysrao1/harness/jobs/2026-07-20__03-11-00/build-pov-ray__5X2pWQF",
+    "task_id": {
+        "path": "/Users/vinay/benchmarks/terminal-bench-2.0/build-pov-ray"
+    },
+    "source": null,
+    "task_checksum": "faca0987c8afa99023a8952f31da77a9017ed01ca04de9fee03b7d3fb1d92e26",
+    "config": {
+        "task": {
+            "path": "/Users/vinay/benchmarks/terminal-bench-2.0/build-pov-ray",
+            "git_url": null,
+            "git_commit_id": null,
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": null
+        },
+        "trial_name": "build-pov-ray__5X2pWQF",
+        "trials_dir": "jobs/2026-07-20__03-11-00",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "terminus-2",
+            "import_path": null,
+            "model_name": "openrouter/moonshotai/kimi-k3",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "38a92932-ee59-41e6-b731-562ec8c1062e"
+    },
+    "agent_info": {
+        "name": "terminus-2",
+        "version": "2.0.0",
+        "model_info": {
+            "name": "moonshotai/kimi-k3",
+            "provider": "openrouter"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 4422,
+        "n_cache_tokens": 2048,
+        "n_output_tokens": 1014,
+        "cost_usd": 0.0229464,
+        "rollout_details": [],
+        "metadata": {
+            "n_episodes": 3,
+            "api_request_times_msec": [
+                11386.507034301758,
+                17018.27096939087,
+                8283.599853515625
+            ],
+            "summarization_count": 0
+        }
+    },
+    "verifier_result": null,
+    "exception_info": {
+        "exception_type": "CancelledError",
+        "exception_message": "",
+        "exception_traceback": "Traceback (most recent call last):\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/trial.py\", line 354, in run\n    await self._run()\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/single_step.py\", line 41, in _run\n    await self._run_agent()\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/single_step.py\", line 77, in _run_agent\n    await self._run_agent_phase(\n    ...<4 lines>...\n    )\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/trial.py\", line 450, in _run_agent_phase\n    await asyncio.wait_for(\n    ...<6 lines>...\n    )\n  File \"/Users/vinay/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13/asyncio/tasks.py\", line 507, in wait_for\n    return await fut\n           ^^^^^^^^^\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/terminus_2.py\", line 1607, in run\n    await self._run_agent_loop(\n    ...<3 lines>...\n    )\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/terminus_2.py\", line 1399, in _run_agent_loop\n    timeout_occurred, terminal_output = await self._execute_commands(\n                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<2 lines>...\n    )\n    ^\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/terminus_2.py\", line 1215, in _execute_commands\n    await session.send_keys(\n    ...<3 lines>...\n    )\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/tmux_session.py\", line 817, in send_keys\n    await self._send_non_blocking_keys(\n    ...<2 lines>...\n    )\n  File \"/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/tmux_session.py\", line 777, in _send_non_blocking_keys\n    await asyncio.sleep(min_timeout_sec - elapsed_time_sec)\n  File \"/Users/vinay/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13/asyncio/tasks.py\", line 718, in sleep\n    return await future\n           ^^^^^^^^^^^^\nasyncio.exceptions.CancelledError\n",
+        "occurred_at": "2026-07-20T03:14:38.129851"
+    },
+    "started_at": "2026-07-19T21:41:04.534426Z",
+    "finished_at": "2026-07-19T21:44:39.710177Z",
+    "environment_setup": {
+        "started_at": "2026-07-19T21:41:04.558947Z",
+        "finished_at": "2026-07-19T21:41:41.198104Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-07-19T21:41:41.198286Z",
+        "finished_at": "2026-07-19T21:42:00.604460Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-07-19T21:42:00.604627Z",
+        "finished_at": "2026-07-19T21:44:37.290747Z"
+    },
+    "verifier": null,
+    "step_results": null
+}

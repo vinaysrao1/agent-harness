@@ -1,0 +1,7 @@
+Skipping image OS validation for alexgshaw/build-pov-ray:20251031: docker inspect returned 1
+Trajectory dumped to jobs/2026-07-20__03-11-00/build-pov-ray__5X2pWQF/agent/trajectory.json
+Trajectory dumped to jobs/2026-07-20__03-11-00/build-pov-ray__5X2pWQF/agent/trajectory.json
+Trajectory dumped to jobs/2026-07-20__03-11-00/build-pov-ray__5X2pWQF/agent/trajectory.json
+Trial build-pov-ray__5X2pWQF cancelled
+Collecting main service artifacts
+Cleanup interrupted for build-pov-ray__5X2pWQF, but agent environment stop is shielded and will complete

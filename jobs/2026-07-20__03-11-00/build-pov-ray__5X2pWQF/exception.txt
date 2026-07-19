@@ -1,0 +1,40 @@
+Traceback (most recent call last):
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/trial.py", line 354, in run
+    await self._run()
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/single_step.py", line 41, in _run
+    await self._run_agent()
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/single_step.py", line 77, in _run_agent
+    await self._run_agent_phase(
+    ...<4 lines>...
+    )
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/trial.py", line 450, in _run_agent_phase
+    await asyncio.wait_for(
+    ...<6 lines>...
+    )
+  File "/Users/vinay/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/terminus_2.py", line 1607, in run
+    await self._run_agent_loop(
+    ...<3 lines>...
+    )
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/terminus_2.py", line 1399, in _run_agent_loop
+    timeout_occurred, terminal_output = await self._execute_commands(
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+    )
+    ^
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/terminus_2.py", line 1215, in _execute_commands
+    await session.send_keys(
+    ...<3 lines>...
+    )
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/tmux_session.py", line 817, in send_keys
+    await self._send_non_blocking_keys(
+    ...<2 lines>...
+    )
+  File "/Users/vinay/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/agents/terminus_2/tmux_session.py", line 777, in _send_non_blocking_keys
+    await asyncio.sleep(min_timeout_sec - elapsed_time_sec)
+  File "/Users/vinay/.local/share/uv/python/cpython-3.13.5-macos-aarch64-none/lib/python3.13/asyncio/tasks.py", line 718, in sleep
+    return await future
+           ^^^^^^^^^^^^
+asyncio.exceptions.CancelledError

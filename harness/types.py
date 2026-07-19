@@ -110,8 +110,14 @@ class Message(BaseModel):
 class Usage(BaseModel):
     """Token accounting for a single model call, accumulable via ``+``.
 
-    ``cache_read_tokens``/``cache_write_tokens`` track prompt-cache traffic on
-    providers that support it (they stay 0 elsewhere).
+    Convention: ``input_tokens`` counts uncached input only — it *excludes*
+    prompt-cache reads and writes, which are tracked separately in
+    ``cache_read_tokens``/``cache_write_tokens`` (they stay 0 on providers
+    without prompt caching). Total input-side traffic is therefore always
+    ``input_tokens + cache_read_tokens + cache_write_tokens``, regardless of
+    adapter. This matches the Anthropic API's fields directly; adapters for
+    APIs whose prompt total is cache-inclusive (e.g. OpenAI ``prompt_tokens``)
+    must subtract cache traffic when mapping to ``input_tokens``.
     """
 
     input_tokens: int = 0

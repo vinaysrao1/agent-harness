@@ -1,0 +1,12 @@
+{
+    "task": {
+        "path": "/Users/vinay/benchmarks/terminal-bench-2.0/build-pov-ray"
+    },
+    "trial_name": "build-pov-ray__5X2pWQF",
+    "trials_dir": "jobs/2026-07-20__03-11-00",
+    "agent": {
+        "name": "terminus-2",
+        "model_name": "openrouter/moonshotai/kimi-k3"
+    },
+    "job_id": "38a92932-ee59-41e6-b731-562ec8c1062e"
+}

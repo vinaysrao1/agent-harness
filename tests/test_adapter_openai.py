@@ -190,7 +190,9 @@ class TestFromOpenAIResponse:
         assert result.message.content == "hello"
         assert result.message.tool_calls == []
         assert result.stop_reason is StopReason.END_TURN
-        assert result.usage.input_tokens == 7
+        # prompt_tokens=7 is cache-inclusive; Usage.input_tokens excludes
+        # the 4 cached tokens per the harness-wide Usage convention.
+        assert result.usage.input_tokens == 3
         assert result.usage.output_tokens == 3
         assert result.usage.cache_read_tokens == 4
 
@@ -245,8 +247,56 @@ class TestFromOpenAIResponse:
             usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2)
         )
         usage = from_openai_response(resp).usage
+        assert usage.input_tokens == 1
         assert usage.cache_read_tokens == 0
         assert usage.cache_write_tokens == 0
+
+    def test_input_tokens_exclude_cache_traffic(self) -> None:
+        """Regression: OpenAI's prompt_tokens INCLUDES cached tokens
+        (prompt_tokens_details fields are subsets of it), while the harness
+        Usage convention is cache-exclusive input_tokens. The adapter must
+        subtract cache reads/writes so downstream consumers that sum
+        input + cache_read + cache_write (e.g. the Harbor bridge) recover
+        the true prompt total instead of double-counting cache traffic.
+        """
+        resp = fake_response(
+            usage=SimpleNamespace(
+                prompt_tokens=1000,
+                completion_tokens=3,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=700, cache_write_tokens=100
+                ),
+            )
+        )
+        usage = from_openai_response(resp).usage
+        assert usage.input_tokens == 200  # 1000 - 700 - 100
+        assert usage.cache_read_tokens == 700
+        assert usage.cache_write_tokens == 100
+        # Invariant the Harbor bridge relies on: the sum reconstructs
+        # the provider's cache-inclusive prompt total.
+        total = (
+            usage.input_tokens
+            + usage.cache_read_tokens
+            + usage.cache_write_tokens
+        )
+        assert total == 1000
+
+    def test_input_tokens_clamped_when_cache_counts_exceed_prompt_total(
+        self,
+    ) -> None:
+        """Providers that report cache counts outside prompt_tokens must not
+        produce negative input_tokens."""
+        resp = fake_response(
+            usage=SimpleNamespace(
+                prompt_tokens=5,
+                completion_tokens=1,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=4, cache_write_tokens=3
+                ),
+            )
+        )
+        usage = from_openai_response(resp).usage
+        assert usage.input_tokens == 0
 
     def test_cache_write_tokens_populated_when_reported(self) -> None:
         resp = fake_response(

@@ -186,6 +186,14 @@ def from_openai_response(response: Any) -> ModelResponse:
     ``prompt_tokens``/``completion_tokens`` (cache read/write tokens read
     from ``usage.prompt_tokens_details.cached_tokens``/``cache_write_tokens``
     when present).
+
+    Usage normalization: the OpenAI API's ``prompt_tokens`` *includes* cache
+    traffic (``prompt_tokens_details`` fields are subsets of it), but
+    :class:`~harness.types.Usage` defines ``input_tokens`` as *excluding*
+    cache reads/writes (the Anthropic convention — see the ``Usage``
+    docstring). So cache tokens are subtracted from ``prompt_tokens`` here,
+    clamped at zero for providers that report cache counts outside the
+    prompt total.
     """
     choices = getattr(response, "choices", None)
     if not choices:
@@ -204,7 +212,12 @@ def from_openai_response(response: Any) -> ModelResponse:
         )
     usage = getattr(response, "usage", None)
     details = getattr(usage, "prompt_tokens_details", None)
+    cache_read_tokens = getattr(details, "cached_tokens", 0) or 0
     cache_write_tokens = getattr(details, "cache_write_tokens", 0) or 0
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    # prompt_tokens is cache-inclusive per the OpenAI API; Usage.input_tokens
+    # is cache-exclusive by convention, so peel the cache traffic off here.
+    input_tokens = max(0, prompt_tokens - cache_read_tokens - cache_write_tokens)
     raw: dict | None = None
     dump = getattr(response, "model_dump", None)
     if callable(dump):
@@ -219,9 +232,9 @@ def from_openai_response(response: Any) -> ModelResponse:
             tool_calls=tool_calls,
         ),
         usage=Usage(
-            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            input_tokens=input_tokens,
             output_tokens=getattr(usage, "completion_tokens", 0) or 0,
-            cache_read_tokens=getattr(details, "cached_tokens", 0) or 0,
+            cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
         ),
         stop_reason=map_finish_reason(getattr(choice, "finish_reason", None)),

@@ -1,0 +1,13 @@
+{
+    "agents": [
+        {
+            "name": "terminus-2",
+            "model_name": "openrouter/moonshotai/kimi-k3"
+        }
+    ],
+    "tasks": [
+        {
+            "path": "/Users/vinay/benchmarks/terminal-bench-2.0/build-pov-ray"
+        }
+    ]
+}
