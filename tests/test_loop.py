@@ -1,0 +1,837 @@
+"""Tests for harness.loop (DESIGN.md §4.1).
+
+No network, no API keys, no Docker: every test drives :class:`AgentLoop`
+with a scripted :class:`FakeAdapter`, a tmp-dir :class:`RunStore`, and —
+where a real sandbox tool is exercised — :class:`LocalSandbox` on
+``tmp_path``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from harness.adapters.fake import FakeAdapter
+from harness.config import PermissionMode
+from harness.context import COMPACTION_SUMMARY_PREFIX, ContextManager
+from harness.loop import AgentLoop, AgentResult, Budgets
+from harness.permissions import Policy, ToolMeta
+from harness.persistence import RunStore
+from harness.sandbox.local import LocalSandbox
+from harness.tools.builtin import bash_tool
+from harness.tools.registry import Tool, ToolRegistry
+from harness.types import (
+    Message,
+    ModelResponse,
+    Role,
+    StopReason,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
+
+GOAL = "Ship the widget."
+
+#: A final message the diligence check accepts as finished.
+CLEAN_FINISH = "Task complete. All tests pass: 3 passed in 0.02s."
+
+
+def resp(
+    content: str | None = None,
+    calls: list[ToolCall] | None = None,
+    usage: Usage | None = None,
+) -> ModelResponse:
+    """Build one scripted assistant response."""
+    tool_calls = calls or []
+    return ModelResponse(
+        message=Message(
+            role=Role.ASSISTANT, content=content, tool_calls=tool_calls
+        ),
+        usage=usage or Usage(),
+        stop_reason=StopReason.TOOL_USE if tool_calls else StopReason.END_TURN,
+    )
+
+
+def call(id: str, name: str, **arguments: object) -> ToolCall:
+    """Build one tool call."""
+    return ToolCall(id=id, name=name, arguments=dict(arguments))
+
+
+def simple_tool(
+    name: str,
+    *,
+    side_effect: bool = False,
+    delay: float = 0.0,
+    log: list[str] | None = None,
+) -> Tool:
+    """A test tool that echoes its ``text`` argument, optionally after a
+    delay (for completion-order tests) and logging its execution."""
+
+    async def handler(arguments: dict) -> str:
+        if delay:
+            await asyncio.sleep(delay)
+        if log is not None:
+            log.append(name)
+        return f"{name}:{arguments.get('text', '')}"
+
+    return Tool(
+        spec=ToolSpec(name=name, description=f"test tool {name}"),
+        meta=ToolMeta(side_effect=side_effect),
+        handler=handler,
+    )
+
+
+async def stub_summarize(messages: list[Message]) -> str:
+    return f"STUB SUMMARY of {len(messages)} messages"
+
+
+@dataclass
+class Harness:
+    """Everything a test needs to poke at one wired-up AgentLoop."""
+
+    loop: AgentLoop
+    adapter: FakeAdapter
+    store: RunStore
+    run_id: str
+    agent_id: str
+    ask_log: list[tuple[str, dict, ToolMeta]] = field(default_factory=list)
+
+    def event_kinds(self) -> list[str]:
+        return [e.kind for e in self.store.load_events(self.agent_id)]
+
+    def events(self, kind: str) -> list[dict]:
+        return [
+            e.payload
+            for e in self.store.load_events(self.agent_id)
+            if e.kind == kind
+        ]
+
+
+def make_harness(
+    tmp_path: Path,
+    script: list[ModelResponse],
+    *,
+    tools: list[Tool] = (),
+    policy: Policy | None = None,
+    budgets: Budgets | None = None,
+    ask_answer: bool = True,
+    context: ContextManager | None = None,
+) -> Harness:
+    """Wire a full AgentLoop from real lower layers on ``tmp_path``."""
+    store = RunStore(tmp_path / "state.db")
+    run_id = store.create_run(GOAL, "fake-model", "auto")
+    agent_id = store.create_agent(run_id, GOAL)
+    adapter = FakeAdapter(script)
+    registry = ToolRegistry()
+    for tool in tools:
+        registry.register(tool)
+    if context is None:
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=adapter.count_tokens,
+            max_context=adapter.capabilities.max_context,
+            summarize=stub_summarize,
+        )
+    ask_log: list[tuple[str, dict, ToolMeta]] = []
+
+    async def ask(tool_name: str, arguments: dict, meta: ToolMeta) -> bool:
+        ask_log.append((tool_name, arguments, meta))
+        return ask_answer
+
+    loop = AgentLoop(
+        adapter,
+        registry,
+        policy or Policy(mode=PermissionMode.AUTO),
+        store,
+        run_id,
+        agent_id,
+        context,
+        budgets or Budgets(),
+        ask,
+        model="fake-model",
+    )
+    return Harness(
+        loop=loop,
+        adapter=adapter,
+        store=store,
+        run_id=run_id,
+        agent_id=agent_id,
+        ask_log=ask_log,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Happy path
+# ---------------------------------------------------------------------------
+
+
+class TestHappyPath:
+    async def test_multi_turn_with_tool_calls(self, tmp_path: Path) -> None:
+        """Two tool turns (one via a real LocalSandbox bash tool), then a
+        clean finish: completed, with usage and turns accounted."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sandbox = LocalSandbox(workspace)
+        script = [
+            resp(
+                "listing",
+                [call("c1", "bash", command="echo hello-from-sandbox")],
+                usage=Usage(input_tokens=10, output_tokens=5),
+            ),
+            resp(
+                "echoing",
+                [call("c2", "echo", text="hi")],
+                usage=Usage(input_tokens=20, output_tokens=6),
+            ),
+            resp(CLEAN_FINISH, usage=Usage(input_tokens=30, output_tokens=7)),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox), simple_tool("echo")],
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert result.turns == 3
+        assert result.usage == Usage(input_tokens=60, output_tokens=18)
+
+        # The bash result (with real sandbox output) went back to the model.
+        second_call_messages = h.adapter.calls[1].messages
+        tool_payloads = [
+            m.tool_result.content
+            for m in second_call_messages
+            if m.tool_result is not None
+        ]
+        assert any("hello-from-sandbox" in p for p in tool_payloads)
+        # Goal seeded as the first user message.
+        assert h.adapter.calls[0].messages[0] == Message(
+            role=Role.USER, content=GOAL
+        )
+        assert h.store.get_agent(h.agent_id).status == "completed"
+
+    async def test_unknown_tool_becomes_error_result(
+        self, tmp_path: Path
+    ) -> None:
+        script = [
+            resp("trying", [call("c1", "no_such_tool")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+        assert result.status == "completed"
+        (payload,) = h.events("tool_result")
+        assert payload["is_error"] is True
+        assert "unknown tool" in payload["content"]
+
+
+# ---------------------------------------------------------------------------
+# Parallel dispatch ordering
+# ---------------------------------------------------------------------------
+
+
+class TestParallelDispatch:
+    async def test_results_keep_original_call_order(
+        self, tmp_path: Path
+    ) -> None:
+        """The slow first call finishes after the fast second one, yet
+        results are appended in the original tool-call order."""
+        completion_order: list[str] = []
+        script = [
+            resp(
+                None,
+                [
+                    call("slow-id", "slow", text="a"),
+                    call("fast-id", "fast", text="b"),
+                ],
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[
+                simple_tool("slow", delay=0.05, log=completion_order),
+                simple_tool("fast", log=completion_order),
+            ],
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        # They genuinely ran concurrently: fast completed first ...
+        assert completion_order == ["fast", "slow"]
+        # ... but persisted results follow the original call order.
+        results = h.events("tool_result")
+        assert [r["tool_call_id"] for r in results] == ["slow-id", "fast-id"]
+        assert results[0]["content"] == "slow:a"
+        assert results[1]["content"] == "fast:b"
+        # And the transcript fed back to the model has the same order.
+        feedback = [
+            m.tool_result.tool_call_id
+            for m in h.adapter.calls[1].messages
+            if m.tool_result is not None
+        ]
+        assert feedback == ["slow-id", "fast-id"]
+
+
+# ---------------------------------------------------------------------------
+# Permissions: ASK / DENY
+# ---------------------------------------------------------------------------
+
+
+class TestPermissions:
+    async def test_ask_approved_dispatches(self, tmp_path: Path) -> None:
+        ran: list[str] = []
+        script = [
+            resp(None, [call("c1", "send", text="msg")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("send", side_effect=True, log=ran)],
+            policy=Policy(mode=PermissionMode.GATED),
+            ask_answer=True,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert ran == ["send"]  # the handler actually executed
+        assert h.ask_log == [
+            ("send", {"text": "msg"}, ToolMeta(side_effect=True))
+        ]
+        (decision,) = h.events("decision")
+        assert decision["decision"] == "allow"
+        assert decision["decided_by"] == "user"
+        (approval,) = h.store.list_approvals(h.run_id)
+        assert (approval.decision, approval.decided_by) == ("allow", "user")
+
+    async def test_ask_denied_returns_error_result(
+        self, tmp_path: Path
+    ) -> None:
+        ran: list[str] = []
+        script = [
+            resp(None, [call("c1", "send", text="msg")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("send", side_effect=True, log=ran)],
+            policy=Policy(mode=PermissionMode.GATED),
+            ask_answer=False,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert ran == []  # handler never executed
+        assert len(h.ask_log) == 1  # asked exactly once
+        (payload,) = h.events("tool_result")
+        assert payload == {
+            "tool_call_id": "c1",
+            "content": "denied by user",
+            "is_error": True,
+        }
+        # The denial went back to the model as a tool result.
+        feedback = [
+            m.tool_result.content
+            for m in h.adapter.calls[1].messages
+            if m.tool_result is not None
+        ]
+        assert feedback == ["denied by user"]
+
+    async def test_policy_deny_skips_ask_and_preserves_order(
+        self, tmp_path: Path
+    ) -> None:
+        """A denied call and an allowed call in one turn: no ask() for the
+        deny, and results stay in original order."""
+        ran: list[str] = []
+        script = [
+            resp(
+                None,
+                [
+                    call("d1", "danger_zone", text="x"),
+                    call("a1", "echo", text="y"),
+                ],
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[
+                simple_tool("danger_zone", log=ran),
+                simple_tool("echo", log=ran),
+            ],
+            policy=Policy(mode=PermissionMode.AUTO, deny=("danger*",)),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.ask_log == []  # DENY never consults the user
+        assert ran == ["echo"]
+        results = h.events("tool_result")
+        assert [r["tool_call_id"] for r in results] == ["d1", "a1"]
+        assert results[0] == {
+            "tool_call_id": "d1",
+            "content": "denied by policy",
+            "is_error": True,
+        }
+        assert results[1]["content"] == "echo:y"
+        decisions = h.events("decision")
+        assert [(d["decision"], d["decided_by"]) for d in decisions] == [
+            ("deny", "policy"),
+            ("allow", "policy"),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Budgets
+# ---------------------------------------------------------------------------
+
+
+class TestBudgets:
+    async def test_turn_budget_pauses_resumably(self, tmp_path: Path) -> None:
+        script = [
+            resp(None, [call("c1", "echo", text="a")]),
+            resp(None, [call("c2", "echo", text="b")]),  # never reached
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=1),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.final_text is None
+        assert result.turns == 1
+        assert len(h.adapter.calls) == 1  # no second model call
+        # State persisted for resume: events + agent status.
+        assert h.store.get_agent(h.agent_id).status == "paused_budget"
+        assert h.event_kinds() == [
+            "message",  # goal
+            "message",  # assistant turn 1
+            "tool_call",
+            "decision",
+            "tool_result",
+        ]
+
+    async def test_token_budget_pauses_resumably(self, tmp_path: Path) -> None:
+        script = [
+            resp(
+                None,
+                [call("c1", "echo", text="a")],
+                usage=Usage(input_tokens=80, output_tokens=30),
+            ),
+            resp(CLEAN_FINISH),  # never reached
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_tokens=100),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 1
+        assert result.usage == Usage(input_tokens=80, output_tokens=30)
+        assert len(h.adapter.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Diligence nudges
+# ---------------------------------------------------------------------------
+
+
+class TestNudges:
+    async def test_nudge_fires_on_promised_future_work(
+        self, tmp_path: Path
+    ) -> None:
+        script = [
+            resp("I will run the tests next."),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert result.turns == 2
+        nudges = h.events("nudge")
+        assert len(nudges) == 1
+        assert "promises future work" in nudges[0]["reason"]
+        # The reminder reached the model as a user message on turn 2.
+        last = h.adapter.calls[1].messages[-1]
+        assert last.role is Role.USER
+        assert "unfinished" in (last.content or "")
+
+    async def test_nudges_respect_max_nudges(self, tmp_path: Path) -> None:
+        unfinished = "I will keep going after this."
+        script = [resp(unfinished), resp(unfinished), resp(unfinished)]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        # Two nudges (MAX_NUDGES), then the third answer is accepted as-is.
+        assert result.status == "completed"
+        assert result.final_text == unfinished
+        assert result.turns == 3
+        assert [n["nudge_number"] for n in h.events("nudge")] == [1, 2]
+
+    async def test_open_ledger_items_trigger_nudge(
+        self, tmp_path: Path
+    ) -> None:
+        script = [resp(CLEAN_FINISH), resp(CLEAN_FINISH), resp(CLEAN_FINISH)]
+        h = make_harness(tmp_path, script)
+        h.store.upsert_task_item(
+            h.run_id, "t1", "write the report", "in_progress"
+        )
+        result = await h.loop.run(GOAL)
+
+        # Item never closed: nudged twice, then accepted.
+        assert result.status == "completed"
+        nudges = h.events("nudge")
+        assert len(nudges) == 2
+        assert "task-ledger item" in nudges[0]["reason"]
+
+    async def test_closed_ledger_items_do_not_nudge(
+        self, tmp_path: Path
+    ) -> None:
+        script = [resp(CLEAN_FINISH)]
+        h = make_harness(tmp_path, script)
+        h.store.upsert_task_item(
+            h.run_id, "t1", "write the report", "done", "report.md exists"
+        )
+        result = await h.loop.run(GOAL)
+        assert result.status == "completed"
+        assert h.events("nudge") == []
+        assert result.turns == 1
+
+
+# ---------------------------------------------------------------------------
+# Event log
+# ---------------------------------------------------------------------------
+
+
+class TestEventLog:
+    async def test_events_persisted_in_order_with_kinds(
+        self, tmp_path: Path
+    ) -> None:
+        script = [
+            resp("working", [call("c1", "echo", text="x")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        await h.loop.run(GOAL)
+
+        events = h.store.load_events(h.agent_id)
+        assert [e.kind for e in events] == [
+            "message",  # goal (user)
+            "message",  # assistant with tool call
+            "tool_call",
+            "decision",
+            "tool_result",
+            "message",  # final assistant
+        ]
+        assert [e.seq for e in events] == list(range(1, 7))
+        assert events[0].payload["role"] == "user"
+        assert events[0].payload["content"] == GOAL
+        assert events[1].payload["role"] == "assistant"
+        assert events[2].payload == {
+            "id": "c1",
+            "name": "echo",
+            "arguments": {"text": "x"},
+        }
+        assert events[4].payload["content"] == "echo:x"
+        assert events[5].payload["content"] == CLEAN_FINISH
+
+    async def test_usage_recorded_per_model_call(self, tmp_path: Path) -> None:
+        script = [
+            resp(
+                None,
+                [call("c1", "echo", text="x")],
+                usage=Usage(input_tokens=7, output_tokens=3),
+            ),
+            resp(CLEAN_FINISH, usage=Usage(input_tokens=11, output_tokens=4)),
+        ]
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        result = await h.loop.run(GOAL)
+
+        records = h.store.list_usage(h.run_id)
+        assert len(records) == 2
+        assert records[0].usage == Usage(input_tokens=7, output_tokens=3)
+        assert records[0].model == "fake-model"
+        assert records[0].agent_id == h.agent_id
+        assert h.store.total_usage(h.run_id) == {
+            "input_tokens": 18,
+            "output_tokens": 7,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+        assert result.usage == Usage(input_tokens=18, output_tokens=7)
+
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+
+class TestCompaction:
+    async def test_compaction_path_with_tiny_context(
+        self, tmp_path: Path
+    ) -> None:
+        """A tiny max_context forces compaction mid-run; the evicted span is
+        persisted as a 'compaction' event and the summary (with the verbatim
+        goal) reaches the model."""
+
+        def count_by_message(messages: list[Message]) -> int:
+            return 100 * len(messages)
+
+        summarizer_calls: list[int] = []
+
+        async def summarize(messages: list[Message]) -> str:
+            summarizer_calls.append(len(messages))
+            return "TINY SUMMARY"
+
+        # threshold = 0.8 * 500 = 400 tokens -> compaction once the full
+        # assembly (system + transcript) exceeds 4 messages.
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=count_by_message,
+            max_context=500,
+            summarize=summarize,
+        )
+        script = [
+            resp("step 1", [call("c1", "echo", text="a")]),
+            resp("step 2", [call("c2", "echo", text="b")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path, script, tools=[simple_tool("echo")], context=context
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert summarizer_calls == [3]  # compacted exactly once
+        (compaction,) = h.events("compaction")
+        # The boundary snapped past turn 1's tool result, so the evicted
+        # span is the goal + first assistant message + its tool result.
+        assert compaction["evicted_count"] == 3
+        assert compaction["evicted"][0]["content"] == GOAL
+        assert compaction["evicted"][1]["content"] == "step 1"
+        assert compaction["evicted"][2]["tool_result"]["tool_call_id"] == "c1"
+        # The summary text is persisted with the event (resume substitutes
+        # it for the evicted span when replaying).
+        assert "TINY SUMMARY" in compaction["summary"]
+        assert GOAL in compaction["summary"]
+        # The model's next call saw the summary with the verbatim goal.
+        summary_messages = [
+            m.content
+            for m in h.adapter.calls[2].messages
+            if m.content and COMPACTION_SUMMARY_PREFIX in m.content
+        ]
+        assert len(summary_messages) == 1
+        assert GOAL in summary_messages[0]
+        assert "TINY SUMMARY" in summary_messages[0]
+
+
+    async def test_compaction_runs_to_fixpoint_within_one_turn(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: one halving may not bring a heavy transcript under
+        the threshold; the loop keeps compacting until it fits instead of
+        calling the model with an over-window assembly."""
+
+        def count_by_message(messages: list[Message]) -> int:
+            return 100 * len(messages)
+
+        summarizer_calls: list[int] = []
+
+        async def summarize(messages: list[Message]) -> str:
+            summarizer_calls.append(len(messages))
+            return "S"
+
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=count_by_message,
+            max_context=500,  # threshold: 400 tokens = 4 messages
+            summarize=summarize,
+        )
+        # Pre-seed a long plain-message history (as if replayed): 12
+        # messages + goal + system = 14 messages, far over threshold, and a
+        # single halving still leaves it over.
+        for i in range(12):
+            context.append(Message(role=Role.USER, content=f"note {i}"))
+        script = [resp(CLEAN_FINISH)]
+        h = make_harness(tmp_path, script, context=context)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        # Compacted more than once in the same turn ...
+        compactions = h.events("compaction")
+        assert len(compactions) >= 2
+        assert len(summarizer_calls) == len(compactions)
+        # ... and every compaction event carries its summary for resume.
+        assert all("summary" in c and c["summary"] for c in compactions)
+        # The model call finally happened on a genuinely shrunken assembly.
+        assert len(h.adapter.calls) == 1
+        assert len(h.adapter.calls[0].messages) < 14
+
+    async def test_summarizer_adapter_error_ends_run_with_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: an AdapterError raised during compaction
+        summarization must finish the run with status 'error' (like any
+        model-call failure), not escape AgentLoop.run as an exception."""
+        from harness.adapters.base import AdapterError
+
+        async def failing_summarize(messages: list[Message]) -> str:
+            raise AdapterError("rate limited during summarization", retryable=True)
+
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=lambda messages: 100 * len(messages),
+            max_context=500,
+            summarize=failing_summarize,
+        )
+        script = [
+            resp("step 1", [call("c1", "echo", text="a")]),
+            resp("step 2", [call("c2", "echo", text="b")]),
+            resp(CLEAN_FINISH),  # never reached: compaction fails first
+        ]
+        h = make_harness(
+            tmp_path, script, tools=[simple_tool("echo")], context=context
+        )
+        result = await h.loop.run(GOAL)  # must not raise
+
+        assert result.status == "error"
+        assert "rate limited" in (result.final_text or "")
+        assert h.store.get_agent(h.agent_id).status == "error"
+
+
+# ---------------------------------------------------------------------------
+# Adapter errors
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterError:
+    async def test_exhausted_script_ends_run_with_error(
+        self, tmp_path: Path
+    ) -> None:
+        h = make_harness(tmp_path, [])  # empty script -> AdapterError
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.turns == 0
+        assert "exhausted" in (result.final_text or "")
+        assert h.store.get_agent(h.agent_id).status == "error"
+        # The goal was still persisted before the failure.
+        assert h.event_kinds() == ["message"]
+
+    async def test_error_after_successful_turns_keeps_usage(
+        self, tmp_path: Path
+    ) -> None:
+        script = [
+            resp(
+                None,
+                [call("c1", "echo", text="x")],
+                usage=Usage(input_tokens=5, output_tokens=2),
+            ),
+        ]  # second complete() call exhausts the script
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.turns == 1
+        assert result.usage == Usage(input_tokens=5, output_tokens=2)
+
+    async def test_loop_adds_no_second_retry_layer(self, tmp_path: Path) -> None:
+        """Regression: retries live in exactly one layer — the adapters
+        (which wrap their provider calls in retry_with_backoff). The loop
+        must call complete() exactly once per turn, even for a retryable
+        failure, instead of multiplying the adapter's attempts."""
+        from typing import Any
+
+        from harness.adapters.base import AdapterError, ModelAdapter
+        from harness.types import Capabilities, ToolSpec
+
+        class AlwaysRetryableAdapter(ModelAdapter):
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            @property
+            def capabilities(self) -> Capabilities:
+                return Capabilities(
+                    parallel_tool_calls=True,
+                    max_context=1_000_000,
+                    supports_cache_control=False,
+                )
+
+            async def complete(
+                self,
+                messages: list[Message],
+                tools: list[ToolSpec],
+                system: str | None = None,
+                **params: Any,
+            ) -> ModelResponse:
+                # A real adapter would have exhausted its *internal*
+                # retries before raising; the loop must not restart them.
+                self.attempts += 1
+                raise AdapterError("still throttled", retryable=True)
+
+        h = make_harness(tmp_path, [])
+        adapter = AlwaysRetryableAdapter()
+        h.loop.adapter = adapter
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert "throttled" in (result.final_text or "")
+        assert adapter.attempts == 1  # exactly one complete() per turn
+
+
+class TestNudgePersistence:
+    async def test_nudge_reminder_persisted_as_message_event(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: the continue-reminder user message must be persisted
+        as a 'message' event (not just the 'nudge' bookkeeping event), so a
+        resumed transcript matches what the model actually saw."""
+        script = [
+            resp("I will run the tests next."),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        message_events = h.events("message")
+        reminders = [
+            payload
+            for payload in message_events
+            if payload["role"] == "user"
+            and "unfinished" in (payload["content"] or "")
+        ]
+        assert len(reminders) == 1
+        # The persisted reminder is exactly the message the model saw.
+        live_reminder = next(
+            m
+            for m in h.adapter.calls[1].messages
+            if m.role is Role.USER and "unfinished" in (m.content or "")
+        )
+        assert reminders[0]["content"] == live_reminder.content
+        # The bookkeeping event is still recorded alongside.
+        assert len(h.events("nudge")) == 1
+
+
+class TestResultModel:
+    def test_agent_result_rejects_unknown_status(self) -> None:
+        with pytest.raises(Exception):
+            AgentResult(
+                status="exploded", final_text=None, usage=Usage(), turns=0
+            )
