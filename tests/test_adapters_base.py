@@ -213,3 +213,51 @@ class TestRetryWithBackoff:
 
         with pytest.raises(ValueError):
             await retry_with_backoff(fn, max_attempts=0)
+
+    async def test_max_elapsed_stops_before_attempts_exhausted(self):
+        # A fake clock that advances 100s per read simulates slow-hanging
+        # attempts; with a 250s budget the sequence must give up early even
+        # though max_attempts (5) has not been reached.
+        delays: list[float] = []
+        attempts = 0
+        ticks = iter([0.0, 100.0, 200.0, 300.0, 400.0])
+
+        async def fn():
+            nonlocal attempts
+            attempts += 1
+            raise AdapterError("hanging", retryable=True)
+
+        with pytest.raises(AdapterError, match="hanging"):
+            await retry_with_backoff(
+                fn,
+                max_attempts=5,
+                jitter=lambda: 0.0,
+                sleep=self.make_sleep_recorder(delays),
+                max_elapsed=250.0,
+                clock=lambda: next(ticks),
+            )
+        # start=0; after attempt1 clock=100, 100+1<250 -> sleep; after attempt2
+        # clock=200, 200+2<250 -> sleep; after attempt3 clock=300, 300+4>=250
+        # -> re-raise without sleeping. Three attempts, two sleeps.
+        assert attempts == 3
+        assert delays == [1.0, 2.0]
+
+    async def test_max_elapsed_none_is_unbounded_by_time(self):
+        # Default (None) preserves the old behavior: bounded only by attempts.
+        delays: list[float] = []
+        attempts = 0
+
+        async def fn():
+            nonlocal attempts
+            attempts += 1
+            raise AdapterError("down", retryable=True)
+
+        with pytest.raises(AdapterError):
+            await retry_with_backoff(
+                fn,
+                max_attempts=3,
+                jitter=lambda: 0.0,
+                sleep=self.make_sleep_recorder(delays),
+            )
+        assert attempts == 3
+        assert delays == [1.0, 2.0]

@@ -12,6 +12,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import random
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -104,6 +105,8 @@ async def retry_with_backoff(
     backoff_cap: float = 30.0,
     jitter: Callable[[], float] = random.random,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    max_elapsed: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> T:
     """Call ``fn`` with exponential backoff, retrying only retryable errors.
 
@@ -119,17 +122,31 @@ async def retry_with_backoff(
       backoff with up to 2x multiplicative jitter, capped.
     - The final attempt's error is re-raised once attempts are exhausted.
 
-    ``jitter`` and ``sleep`` are injectable so tests can run deterministically
-    and without real sleeping.
+    Wall-clock ceiling: when ``max_elapsed`` is set, the total time spent in
+    this call (including the duration of the ``fn`` attempts themselves, read
+    via ``clock``) is bounded — before sleeping for a retry, if the elapsed
+    time plus that sleep would reach ``max_elapsed``, the current error is
+    re-raised instead. This keeps ``per-attempt-timeout × max_attempts`` from
+    silently overrunning an upstream deadline (e.g. a benchmark harness's
+    per-agent timeout) on a persistently-hanging provider. ``None`` (default)
+    leaves the sequence bounded only by ``max_attempts``.
+
+    ``jitter``, ``sleep``, and ``clock`` are injectable so tests can run
+    deterministically and without real sleeping.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
+    start = clock()
     for attempt in range(1, max_attempts + 1):
         try:
             return await fn()
         except AdapterError as exc:
             if not exc.retryable or attempt == max_attempts:
                 raise
-            delay = min(backoff_base * 2 ** (attempt - 1), backoff_cap)
-            await sleep(delay * (1 + jitter()))
+            delay = min(backoff_base * 2 ** (attempt - 1), backoff_cap) * (
+                1 + jitter()
+            )
+            if max_elapsed is not None and (clock() - start) + delay >= max_elapsed:
+                raise
+            await sleep(delay)
     raise AssertionError("unreachable")  # pragma: no cover

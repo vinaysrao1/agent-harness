@@ -20,6 +20,7 @@ be unit-tested without a client or network.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from harness.adapters.base import AdapterError, ModelAdapter, retry_with_backoff
@@ -47,6 +48,16 @@ __all__ = [
 
 #: Anthropic requires ``max_tokens``; used when the caller does not pass one.
 DEFAULT_MAX_TOKENS = 8192
+
+#: Default per-request SDK timeout (seconds): bounds one hung call so it
+#: surfaces as a retryable timeout instead of blocking. Overridable per adapter.
+_DEFAULT_REQUEST_TIMEOUT = 120.0
+
+#: Default wall-clock ceiling for the whole retry sequence of one ``complete()``
+#: call, passed through to :func:`retry_with_backoff` so
+#: ``request_timeout × max_attempts`` cannot overrun an upstream agent-execution
+#: deadline when a provider hangs on every attempt. Overridable via ``retry``.
+_DEFAULT_RETRY_MAX_ELAPSED = 300.0
 
 #: ``cache_control`` value for ephemeral prompt-cache breakpoints.
 _EPHEMERAL = {"type": "ephemeral"}
@@ -247,9 +258,15 @@ class AnthropicAdapter(ModelAdapter):
     ``anthropic.AsyncAnthropic`` client is built with ``api_key`` (``None``
     lets the SDK fall back to ``ANTHROPIC_API_KEY``) and ``base_url`` (``None``
     lets the SDK fall back to ``api.anthropic.com``; set it to point at a
-    proxy/gateway per DESIGN.md's per-model registry field). ``retry``
-    overrides keyword arguments to :func:`retry_with_backoff` (tests inject a
-    no-op ``sleep``).
+    proxy/gateway per DESIGN.md's per-model registry field). The client is
+    built with ``max_retries=0`` so :func:`retry_with_backoff` is the single
+    retry layer (DESIGN.md §4.1 — the SDK otherwise retries twice on its own),
+    and with an explicit ``request_timeout`` so a hung upstream fails fast as a
+    retryable timeout instead of blocking; ``request_timeout`` is ignored when
+    an explicit ``client`` is injected. ``retry`` overrides keyword arguments
+    to :func:`retry_with_backoff` (tests inject a no-op ``sleep``); it defaults
+    a wall-clock ceiling so ``request_timeout × max_attempts`` cannot overrun
+    an upstream agent-execution deadline on a persistently-hanging provider.
     """
 
     def __init__(
@@ -260,15 +277,25 @@ class AnthropicAdapter(ModelAdapter):
         base_url: str | None = None,
         client: Any | None = None,
         max_context: int = 200_000,
+        request_timeout: float = _DEFAULT_REQUEST_TIMEOUT,
         retry: dict[str, Any] | None = None,
     ) -> None:
         if client is None:
             import anthropic
 
-            client = anthropic.AsyncAnthropic(api_key=api_key, base_url=base_url)
+            client = anthropic.AsyncAnthropic(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=request_timeout,
+                max_retries=0,
+            )
         self._client = client
         self._model = model
-        self._retry = dict(retry or {})
+        # Hard per-attempt deadline (see the OpenAI adapter for rationale): a
+        # single in-flight call cannot outlive request_timeout even if the SDK
+        # transport timeout fails to fire.
+        self._request_timeout = request_timeout
+        self._retry = {"max_elapsed": _DEFAULT_RETRY_MAX_ELAPSED, **(retry or {})}
         self._capabilities = Capabilities(
             parallel_tool_calls=True,
             max_context=max_context,
@@ -308,7 +335,16 @@ class AnthropicAdapter(ModelAdapter):
 
         async def _call() -> Any:
             try:
-                return await self._client.messages.create(**kwargs)
+                return await asyncio.wait_for(
+                    self._client.messages.create(**kwargs),
+                    timeout=self._request_timeout,
+                )
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise AdapterError(
+                    f"model call exceeded {self._request_timeout}s hard "
+                    "timeout (no response)",
+                    retryable=True,
+                ) from exc
             except Exception as exc:
                 raise wrap_anthropic_error(exc) from exc
 
