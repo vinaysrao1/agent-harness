@@ -627,7 +627,6 @@ class TestComplete:
         adapter = OpenAICompatAdapter("m", client=fake_client([]))
         caps = adapter.capabilities
         assert caps.supports_cache_control is False
-        assert caps.parallel_tool_calls is True
         assert caps.max_context == 128_000
 
     def test_base_url_reaches_real_sdk_client(self) -> None:

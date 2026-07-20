@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from harness.diligence import CONTINUE_REMINDER, MAX_NUDGES, looks_unfinished
+from harness.diligence import (
+    CONTINUE_REMINDER,
+    MAX_NUDGES,
+    VERIFICATION_FAILED_REMINDER,
+    VERIFICATION_OUTPUT_LIMIT,
+    VERIFICATION_TOOL_NAME,
+    looks_unfinished,
+    truncate_verification_output,
+)
 
 
 class TestPromisedFutureWork:
@@ -114,3 +122,41 @@ class TestConstants:
         assert "promises future work" in rendered
         assert "evidence" in rendered
         assert "{reason}" not in rendered
+
+
+class TestVerificationConstants:
+    """Constants for the §10.3 B1 self-verification mechanism."""
+
+    def test_tool_name(self) -> None:
+        assert VERIFICATION_TOOL_NAME == "declare_verification"
+
+    def test_failed_reminder_formats_all_placeholders(self) -> None:
+        rendered = VERIFICATION_FAILED_REMINDER.format(
+            command="pytest -q",
+            exit_code=1,
+            output="2 failed, 3 passed",
+        )
+        assert "pytest -q" in rendered
+        assert "exit code 1" in rendered
+        assert "2 failed, 3 passed" in rendered
+        assert "redeclare" in rendered
+        for token in ("{command}", "{exit_code}", "{output}"):
+            assert token not in rendered
+
+
+class TestTruncateVerificationOutput:
+    def test_short_output_is_unchanged(self) -> None:
+        assert truncate_verification_output("all good") == "all good"
+
+    def test_output_at_exact_limit_is_unchanged(self) -> None:
+        text = "x" * VERIFICATION_OUTPUT_LIMIT
+        assert truncate_verification_output(text) == text
+
+    def test_long_output_keeps_the_tail_with_a_marker(self) -> None:
+        # The tail carries the signal (test runners summarize at the end).
+        long_text = "x" * 5000 + "FINAL SUMMARY: 1 failed"
+        truncated = truncate_verification_output(long_text)
+        assert truncated.endswith("FINAL SUMMARY: 1 failed")
+        assert "chars truncated" in truncated
+        dropped = len(long_text) - VERIFICATION_OUTPUT_LIMIT
+        assert f"{dropped} chars truncated" in truncated

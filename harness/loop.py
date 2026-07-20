@@ -30,7 +30,17 @@ Loop shape per turn:
    regardless of completion order.
 5. If it carries none: run :func:`harness.diligence.looks_unfinished`; an
    unfinished-looking answer earns a continue-reminder nudge (bounded by
-   :data:`~harness.diligence.MAX_NUDGES`), otherwise the run completes.
+   :data:`~harness.diligence.MAX_NUDGES`). Then, if the model declared a
+   verification command (DESIGN.md §10.3 B1, via the
+   ``declare_verification`` tool), the loop re-executes it in the sandbox
+   before accepting ``completed`` — gated through the same permission
+   engine as a model-issued ``bash`` call, so a deny glob or ASK policy
+   applies to verification executions too: exit 0 finishes the run
+   (``verification_passed``); anything else injects a fix-and-re-verify
+   reminder and continues, consuming the same nudge budget — once nudges
+   are exhausted the run completes anyway with the failure recorded
+   (``verification_failed`` with ``nudges_exhausted``) so it stays
+   auditable. With no declaration, the heuristic alone decides, as before.
 """
 
 from __future__ import annotations
@@ -44,9 +54,18 @@ from pydantic import BaseModel, ConfigDict
 
 from harness.adapters.base import AdapterError, ModelAdapter
 from harness.context import ContextManager
-from harness.diligence import CONTINUE_REMINDER, MAX_NUDGES, looks_unfinished
+from harness.diligence import (
+    CONTINUE_REMINDER,
+    MAX_NUDGES,
+    VERIFICATION_FAILED_REMINDER,
+    VERIFICATION_TIMEOUT_SECONDS,
+    VERIFICATION_TOOL_NAME,
+    looks_unfinished,
+    truncate_verification_output,
+)
 from harness.permissions import Decision, Policy, ToolMeta, evaluate
 from harness.persistence import RunStore
+from harness.sandbox.base import Sandbox
 from harness.tools.registry import ToolRegistry
 from harness.types import (
     Message,
@@ -186,6 +205,16 @@ class AgentLoop:
         Async approval callback for ASK decisions, awaited once per call.
     model:
         Model label recorded with each usage row (for `harness cost`).
+    sandbox:
+        Where a declared verification command is re-executed (§10.3 B1).
+        ``None`` disables the verification gate entirely — a declared
+        command is then ignored, like the pre-B1 loop.
+    declared_command:
+        A previously declared verification command to re-arm the B1 gate
+        with (used by resume: the last persisted ``verification_declared``
+        event is rehydrated here so an interrupted run keeps the promise
+        that the check "will be re-run before your answer is accepted").
+        ``None`` (the default) starts with no declaration, as before.
     """
 
     def __init__(
@@ -202,6 +231,8 @@ class AgentLoop:
         *,
         model: str = "unknown",
         clock: Callable[[], float] = time.monotonic,
+        sandbox: Sandbox | None = None,
+        declared_command: str | None = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -213,9 +244,18 @@ class AgentLoop:
         self.budgets = budgets
         self.ask = ask
         self.model = model
-        #: Monotonic clock for the wall-clock wind-down check; injectable so
-        #: tests can drive the deadline deterministically.
+        #: Monotonic clock for the wall-clock wind-down check and per-turn
+        #: duration recording (§10.2 A5); injectable so tests can drive
+        #: deadlines and durations deterministically.
         self.clock = clock
+        self.sandbox = sandbox
+        #: Rehydrated verification declaration (resume); ``run()`` seeds its
+        #: loop-local ``declared_command`` from this.
+        self.declared_command = declared_command
+        #: Monotonic counter for synthetic verification-execution tool-call
+        #: ids, so each execution's permission decision is auditable on its
+        #: own row (§4.11: every decision is logged).
+        self._verification_seq = 0
 
     # -- persistence helpers -------------------------------------------------
 
@@ -323,6 +363,95 @@ class AgentLoop:
 
     # -- diligence -----------------------------------------------------------
 
+    async def _gate_verification(self, command: str) -> tuple[Decision, str]:
+        """Gate a verification execution through the permission engine.
+
+        The declared command is arbitrary shell that the harness is about
+        to run on the model's behalf, so it must clear exactly the policy
+        that would have applied had the model run it through the ``bash``
+        tool (§4.11: an explicit user deny glob is the highest-precedence
+        rule and must not be circumventable by declaring the command as a
+        verification instead). ASK defers to :attr:`ask` like any other
+        gated call, and the decision — including auto-allows — is recorded
+        as a ``decision`` event plus an approval row under a synthetic
+        tool-call id, keeping the "every decision is logged" invariant.
+
+        When the registry has no ``bash`` tool (a custom profile that
+        includes ``declare_verification`` but excludes ``bash``), there is
+        no policy-blessed shell meta to reuse, so the execution is
+        conservatively treated as side-effecting rather than silently
+        allowed through the benign unknown-tool default.
+        """
+        try:
+            meta = self.registry.get("bash").meta
+        except KeyError:
+            meta = ToolMeta(side_effect=True)
+        decision = evaluate("bash", meta, self.policy)
+        decided_by = "policy"
+        if decision is Decision.ASK:
+            approved = await self.ask("bash", {"command": command}, meta)
+            decision = Decision.ALLOW if approved else Decision.DENY
+            decided_by = "user"
+        self._verification_seq += 1
+        self._record_decision(
+            ToolCall(
+                id=f"verification-exec-{self._verification_seq}",
+                name="bash",
+                arguments={"command": command},
+            ),
+            decision,
+            decided_by,
+        )
+        return decision, decided_by
+
+    async def _run_verification(self, command: str) -> tuple[bool, dict]:
+        """Execute the declared verification command in the sandbox (B1).
+
+        Returns ``(passed, payload)`` where ``payload`` is the event body
+        for ``verification_passed``/``verification_failed``: the command,
+        its exit code (``None`` if it could not even execute), its combined
+        output (tail-truncated via
+        :func:`~harness.diligence.truncate_verification_output`), and
+        ``timed_out`` when the :data:`~harness.diligence.VERIFICATION_TIMEOUT_SECONDS`
+        bound was hit. A command that fails to *run* (sandbox error) is a
+        failed verification, never an exception out of the loop.
+
+        Execution is first gated through :meth:`_gate_verification`; a
+        denied command never reaches the sandbox and yields a failed-not-run
+        payload with ``denied: True``.
+        """
+        decision, decided_by = await self._gate_verification(command)
+        if decision is not Decision.ALLOW:
+            return False, {
+                "command": command,
+                "exit_code": None,
+                "output": (
+                    "verification command was not executed: "
+                    f"denied by {decided_by}"
+                ),
+                "denied": True,
+            }
+        try:
+            result = await self.sandbox.exec(
+                command, timeout=VERIFICATION_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 - any sandbox failure is a
+            # verification failure, not a crashed run
+            return False, {
+                "command": command,
+                "exit_code": None,
+                "output": f"verification command failed to execute: {exc}",
+            }
+        parts = [part for part in (result.stdout, result.stderr) if part]
+        payload: dict = {
+            "command": command,
+            "exit_code": result.exit_code,
+            "output": truncate_verification_output("\n".join(parts).strip()),
+        }
+        if result.timed_out:
+            payload["timed_out"] = True
+        return result.exit_code == 0 and not result.timed_out, payload
+
     def _open_task_count(self) -> int:
         """Count task-ledger items not yet closed out (§4.9)."""
         return sum(
@@ -348,6 +477,11 @@ class AgentLoop:
         nudges = 0
         truncation_continues = 0
         wound_down = False
+        #: The model's currently declared verification command (§10.3 B1);
+        #: set/replaced by successful ``declare_verification`` tool calls.
+        #: Seeded from the constructor so resume can re-arm a declaration
+        #: replayed from the persisted event log.
+        declared_command: str | None = self.declared_command
         start = self.clock()
         call_params: dict[str, object] = {}
         if self.budgets.max_output_tokens is not None:
@@ -418,6 +552,7 @@ class AgentLoop:
                 # with status 'error' — never an unhandled exception.
                 system, messages = self.context.assemble()
                 specs = self.registry.specs()
+                call_started = self.clock()
                 response = await self.adapter.complete(
                     messages, specs, system, **call_params
                 )
@@ -427,7 +562,14 @@ class AgentLoop:
             turns += 1
             total_usage = total_usage + response.usage
             self.store.record_usage(
-                self.run_id, self.agent_id, self.model, response.usage
+                self.run_id,
+                self.agent_id,
+                self.model,
+                response.usage,
+                # Wall-clock duration of this model call (§10.2 A5),
+                # measured on the same injectable monotonic clock as the
+                # wind-down check so tests stay deterministic.
+                duration_ms=int((self.clock() - call_started) * 1000),
             )
             self._append_message(response.message)
 
@@ -449,6 +591,31 @@ class AgentLoop:
                         "tool_result",
                         result.model_dump(mode="json"),
                     )
+                # Self-verification declarations (§10.3 B1): a successful
+                # declare_verification call sets (or replaces) the command
+                # the loop will hold the model to at completion time.
+                # ``results[i]`` answers ``calls[i]`` by contract, so a
+                # denied or invalid call (error result) never counts.
+                for tool_call, result in zip(
+                    response.message.tool_calls, results
+                ):
+                    if (
+                        tool_call.name == VERIFICATION_TOOL_NAME
+                        and not result.is_error
+                    ):
+                        declared_command = str(
+                            tool_call.arguments.get("command", "")
+                        )
+                        self.store.append_event(
+                            self.agent_id,
+                            "verification_declared",
+                            {
+                                "command": declared_command,
+                                "description": str(
+                                    tool_call.arguments.get("description", "")
+                                ),
+                            },
+                        )
                 continue
 
             # 5a. Truncated turn with no action: the model hit the output-token
@@ -492,5 +659,61 @@ class AgentLoop:
                     {"nudge_number": nudges, "reason": reason},
                 )
                 continue
+
+            # 5c. Self-verification gate (§10.3 B1): the model declared a
+            # command that proves the goal — re-run it before accepting
+            # completed. Failures share the diligence nudge budget above,
+            # so a permanently-failing check cannot loop forever; once the
+            # budget is spent (or the run is wound down) the answer is
+            # accepted anyway, with the failure persisted for audit. With
+            # no declaration (or no sandbox), behavior is unchanged.
+            if declared_command and self.sandbox is not None:
+                passed, payload = await self._run_verification(
+                    declared_command
+                )
+                if passed:
+                    self.store.append_event(
+                        self.agent_id, "verification_passed", payload
+                    )
+                elif payload.get("denied"):
+                    # Policy denied the execution (§4.11): the check cannot
+                    # run no matter what the model changes, so nudging would
+                    # only burn budget re-hitting the same deny. Accept the
+                    # answer with the not-run failure persisted for audit.
+                    self.store.append_event(
+                        self.agent_id, "verification_failed", payload
+                    )
+                elif nudges < MAX_NUDGES and not wound_down:
+                    nudges += 1
+                    payload["nudge_number"] = nudges
+                    self.store.append_event(
+                        self.agent_id, "verification_failed", payload
+                    )
+                    # Persisted as a regular 'message' event (like the
+                    # diligence nudge) so resume replays the transcript
+                    # the model actually saw.
+                    self._append_message(
+                        Message(
+                            role=Role.USER,
+                            content=VERIFICATION_FAILED_REMINDER.format(
+                                command=payload["command"],
+                                exit_code=payload["exit_code"],
+                                output=payload["output"],
+                            ),
+                        )
+                    )
+                    continue
+                else:
+                    # Record *why* the failure is accepted anyway — the
+                    # nudge budget ran out, the run wound down, or both.
+                    # Folding wind-down into "nudges_exhausted" would
+                    # corrupt the failure-classification signal B2/B4 mine.
+                    if nudges >= MAX_NUDGES:
+                        payload["nudges_exhausted"] = True
+                    if wound_down:
+                        payload["wound_down"] = True
+                    self.store.append_event(
+                        self.agent_id, "verification_failed", payload
+                    )
 
             return self._finish("completed", final_text, total_usage, turns)

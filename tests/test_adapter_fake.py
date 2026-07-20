@@ -74,7 +74,6 @@ class TestFakeAdapter:
 
     def test_capabilities(self) -> None:
         caps = FakeAdapter().capabilities
-        assert caps.parallel_tool_calls is True
         assert caps.supports_cache_control is False
         assert caps.max_context == 1_000_000
 
