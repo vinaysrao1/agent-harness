@@ -13,6 +13,17 @@ case-insensitive phrase patterns (promised-future-work phrasings like
 trailing-question check, and the open-item count from the SQLite-backed task
 ledger. DESIGN.md §4.9 sketches a cheap-model check; that is a possible v2
 upgrade behind this same function signature.
+
+Self-verification (DESIGN.md §10.3 B1) hardens this heuristic into
+enforcement: the model may *declare* a shell command that proves the goal is
+met (via the ``declare_verification`` tool,
+:data:`VERIFICATION_TOOL_NAME`), and the loop then re-executes that command
+before accepting ``completed`` — exit 0 finishes the run, anything else
+injects :data:`VERIFICATION_FAILED_REMINDER` and continues, sharing the
+same :data:`MAX_NUDGES` budget so a permanently-failing check cannot loop
+forever. With no declaration, :func:`looks_unfinished` alone decides,
+exactly as before. The constants for that mechanism live here; the
+execution itself is in :mod:`harness.loop`.
 """
 
 from __future__ import annotations
@@ -23,6 +34,11 @@ from typing import Final
 __all__ = [
     "MAX_NUDGES",
     "CONTINUE_REMINDER",
+    "VERIFICATION_TOOL_NAME",
+    "VERIFICATION_TIMEOUT_SECONDS",
+    "VERIFICATION_OUTPUT_LIMIT",
+    "VERIFICATION_FAILED_REMINDER",
+    "truncate_verification_output",
     "looks_unfinished",
 ]
 
@@ -44,6 +60,58 @@ CONTINUE_REMINDER: Final[str] = (
     "yourself — do the work, or explain precisely why it cannot be done.\n"
     "</system-reminder>"
 )
+
+#: Name of the tool the model uses to declare its verification command
+#: (DESIGN.md §10.3 B1). Shared by the tool factory
+#: (:func:`harness.tools.builtin.declare_verification_tool`) and the loop,
+#: which watches for successful calls to it and holds the model to the
+#: declared check before accepting completion.
+VERIFICATION_TOOL_NAME: Final[str] = "declare_verification"
+
+#: Hard timeout for one execution of the declared verification command.
+#: Bounded so a hung check (e.g. a test suite waiting on input) cannot
+#: stall the run indefinitely; a timeout counts as a failed verification.
+VERIFICATION_TIMEOUT_SECONDS: Final[float] = 300.0
+
+#: Max characters of verification-command output persisted with
+#: ``verification_passed``/``verification_failed`` events and injected into
+#: :data:`VERIFICATION_FAILED_REMINDER`. The *tail* is kept — test runners
+#: put the failure summary at the end.
+VERIFICATION_OUTPUT_LIMIT: Final[int] = 4_000
+
+#: Injected as a user message when the declared verification command exits
+#: non-zero (or times out) on a would-be final answer. Format with
+#: ``command=``, ``exit_code=``, and ``output=`` (already truncated via
+#: :func:`truncate_verification_output`).
+VERIFICATION_FAILED_REMINDER: Final[str] = (
+    "<system-reminder>\n"
+    "Your declared verification command failed (exit code {exit_code}):\n"
+    "  {command}\n"
+    "Output:\n"
+    "{output}\n"
+    "The task is not complete until this check passes. Fix the underlying\n"
+    "problem and finish again — the command will be re-run before your\n"
+    "answer is accepted. If the check itself is wrong, redeclare it with\n"
+    "declare_verification.\n"
+    "</system-reminder>"
+)
+
+
+def truncate_verification_output(output: str) -> str:
+    """Truncate verification output to :data:`VERIFICATION_OUTPUT_LIMIT`.
+
+    Keeps the *tail* (where test runners summarize failures) and prepends a
+    marker naming how much was dropped, so the model knows it is looking at
+    the end of a longer stream.
+    """
+    if len(output) <= VERIFICATION_OUTPUT_LIMIT:
+        return output
+    dropped = len(output) - VERIFICATION_OUTPUT_LIMIT
+    return (
+        f"[...{dropped} chars truncated...]\n"
+        + output[-VERIFICATION_OUTPUT_LIMIT:]
+    )
+
 
 #: Promised-future-work phrasings, each paired with the human-readable
 #: reason reported when it matches. Patterns are matched case-insensitively

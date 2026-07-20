@@ -39,8 +39,10 @@ recorded instructions join the instruction ledger that reminders re-inject.
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING
 
+from harness.diligence import VERIFICATION_TOOL_NAME
 from harness.memory.store import FactType, MemoryStore
 from harness.permissions import ToolMeta
 from harness.persistence import RunStore, TaskLedgerItem
@@ -66,6 +68,7 @@ __all__ = [
     "load_skill_tool",
     "add_instruction_tool",
     "search_history_tool",
+    "declare_verification_tool",
     "render_task_items",
 ]
 
@@ -108,6 +111,10 @@ def bash_tool(sandbox: Sandbox) -> Tool:
 
     Result is exit code + stdout + stderr formatted as plain text -- no
     JSON wrapping, so the model reads it the way a human reads a terminal.
+    Empty stdout/stderr sections are omitted (DESIGN.md §10.2 A4: trim
+    result-string boilerplate) rather than printed as empty headers -- most
+    successful commands produce no stderr, and paying two boilerplate lines
+    for that on every single `bash` call (the highest-volume tool) adds up.
     """
 
     spec = ToolSpec(
@@ -140,27 +147,80 @@ def bash_tool(sandbox: Sandbox) -> Tool:
         lines = [f"exit code: {result.exit_code}"]
         if result.timed_out:
             lines.append(f"(command timed out after {timeout}s)")
-        lines.append("--- stdout ---")
-        lines.append(result.stdout)
-        lines.append("--- stderr ---")
-        lines.append(result.stderr)
+        if result.stdout:
+            lines.append("--- stdout ---")
+            lines.append(result.stdout)
+        if result.stderr:
+            lines.append("--- stderr ---")
+            lines.append(result.stderr)
+        if not result.stdout and not result.stderr:
+            lines.append("(no output)")
         return "\n".join(lines)
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 
 
 def read_file_tool(sandbox: Sandbox) -> Tool:
-    """Build the ``read_file`` tool: reads a text file from ``sandbox``."""
+    """Build the ``read_file`` tool: reads a text file from ``sandbox``.
+
+    Three optional arguments (DESIGN.md §10.2 A4) turn a whole-file read into
+    a scoped one, so large files stop being read (and truncated at the
+    registry's :data:`~harness.tools.registry.MAX_RESULT_BYTES` cap, §4.7/A4)
+    by default:
+
+    - ``offset``/``limit`` page through the file by 1-indexed line number.
+    - ``pattern`` (a regex) greps within that window (the whole file if
+      ``offset``/``limit`` are absent), returning only matching lines.
+
+    Both scoped modes prefix every returned line with its absolute line
+    number (``N:text``, mirroring ``grep -n``) so the model can hand that
+    number straight to a follow-up ``offset`` or to `edit_file`. Calling with
+    none of the three preserves the original behavior exactly: the raw file
+    content, unmodified.
+    """
 
     spec = ToolSpec(
         name="read_file",
-        description="Read the text content of a file in the sandbox workspace.",
+        description=(
+            "Read a file in the sandbox workspace. Returns the whole file "
+            "by default -- but for files that might be large, PREFER a "
+            "scoped read instead: `offset`/`limit` to page through a line "
+            "range, or `pattern` (a regex) to grep for matching lines "
+            "(optionally within that range). Both scoped modes prefix each "
+            "returned line with its 1-indexed line number, like `grep -n`, "
+            "so you know what to pass to `edit_file` or to a follow-up "
+            "`offset`."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": "Path relative to the sandbox workspace root.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "1-indexed line number to start reading from "
+                        "(default: 1, the start of the file)."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum number of lines to read starting at "
+                        "`offset` (default: through the end of the file). "
+                        "Combine with `offset` to page through a large file."
+                    ),
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Regex; if set, only lines matching it are "
+                        "returned (searched within `offset`/`limit` if "
+                        "those are also given), each prefixed with its "
+                        "line number -- like `grep -n`."
+                    ),
                 },
             },
             "required": ["path"],
@@ -169,7 +229,67 @@ def read_file_tool(sandbox: Sandbox) -> Tool:
 
     async def handler(arguments: dict) -> str:
         path = _require_str("read_file", arguments, "path")
-        return await sandbox.read_file(path)
+        content = await sandbox.read_file(path)
+
+        raw_offset = arguments.get("offset")
+        raw_limit = arguments.get("limit")
+        pattern = arguments.get("pattern")
+        if raw_offset is None and raw_limit is None and pattern is None:
+            return content
+
+        lines = content.splitlines()
+        total = len(lines)
+
+        offset = int(raw_offset) if raw_offset is not None else 1
+        if offset < 1:
+            raise ValueError(
+                "'read_file' argument 'offset' must be >= 1 (lines are 1-indexed)"
+            )
+
+        if raw_limit is not None:
+            limit = int(raw_limit)
+            if limit < 1:
+                raise ValueError("'read_file' argument 'limit' must be >= 1")
+            end_index = min(offset - 1 + limit, total)
+        else:
+            end_index = total
+
+        start_index = min(offset - 1, total)
+        window = lines[start_index:end_index]
+        last_line = start_index + len(window)
+
+        if pattern is not None:
+            if not isinstance(pattern, str):
+                raise ValueError("'read_file' argument 'pattern' must be a string")
+            try:
+                regex = re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"'read_file' argument 'pattern' is not a valid regex: {exc}"
+                ) from None
+            matched = [
+                (start_index + 1 + i, line)
+                for i, line in enumerate(window)
+                if regex.search(line)
+            ]
+            if not matched:
+                return (
+                    f"no lines in {path} matched pattern {pattern!r} "
+                    f"(searched lines {start_index + 1}-{last_line} of {total})"
+                )
+            body = "\n".join(f"{n}:{line}" for n, line in matched)
+            return (
+                f"{body}\n[{len(matched)} match(es) among lines "
+                f"{start_index + 1}-{last_line} of {total} in {path}]"
+            )
+
+        if not window:
+            return f"{path} has {total} line(s); offset {offset} is beyond end of file"
+
+        body = "\n".join(
+            f"{n}:{line}" for n, line in enumerate(window, start=start_index + 1)
+        )
+        return f"{body}\n[lines {start_index + 1}-{last_line} of {total} in {path}]"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 
@@ -287,10 +407,10 @@ def memory_read_fact_tool(store: MemoryStore) -> Tool:
     async def handler(arguments: dict) -> str:
         name = _require_str("memory_read_fact", arguments, "name")
         fact = store.read_fact(name)
-        return (
-            f"[{fact.name}] ({fact.type.value}) {fact.description}\n"
-            f"sources: {', '.join(fact.sources) or '(none)'}\n\n{fact.body}"
-        )
+        header = f"[{fact.name}] ({fact.type.value}) {fact.description}"
+        if fact.sources:
+            header += f"\nsources: {', '.join(fact.sources)}"
+        return f"{header}\n\n{fact.body}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 
@@ -680,5 +800,72 @@ def search_history_tool(store: RunStore, run_id: str) -> Tool:
         if total > len(matches):
             header += f" (showing first {len(matches)})"
         return "\n".join([header, *matches])
+
+    return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+# ---------------------------------------------------------------------------
+# Self-verification tool
+# ---------------------------------------------------------------------------
+
+
+def declare_verification_tool() -> Tool:
+    """Build the ``declare_verification`` tool (DESIGN.md §10.3 B1).
+
+    The model declares the shell command that proves the goal is met; the
+    *loop* holds it to that claim — it watches for successful calls to this
+    tool (by :data:`~harness.diligence.VERIFICATION_TOOL_NAME`) and
+    re-executes the declared command in the sandbox before accepting a
+    final answer as ``completed`` (see :class:`~harness.loop.AgentLoop`).
+    The handler itself only validates and acknowledges the declaration —
+    deliberately stateless, so the mechanism's single source of truth is
+    the transcript the loop already persists.
+    """
+
+    spec = ToolSpec(
+        name=VERIFICATION_TOOL_NAME,
+        description=(
+            "Declare the shell command that will prove this task's goal is "
+            "met (e.g. running the test suite); before your final answer "
+            "is accepted, the harness re-runs it in the sandbox and treats "
+            "the task as complete only if it exits 0. Declare your check "
+            "early — as soon as you know what would prove success, not "
+            "after the work is done. Calling this again replaces the "
+            "previously declared command."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "Shell command that exits 0 exactly when the goal "
+                        "is met (run in the sandbox workspace)."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "What passing this command proves.",
+                },
+            },
+            "required": ["command", "description"],
+        },
+    )
+
+    async def handler(arguments: dict) -> str:
+        command = _require_str(VERIFICATION_TOOL_NAME, arguments, "command")
+        description = _require_str(
+            VERIFICATION_TOOL_NAME, arguments, "description"
+        )
+        if not command.strip():
+            raise ValueError(
+                f"{VERIFICATION_TOOL_NAME!r} argument 'command' must be "
+                "non-empty"
+            )
+        return (
+            f"verification declared: {command!r} ({description}). It will "
+            "be re-run before your final answer is accepted; exit 0 means "
+            "verified."
+        )
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)

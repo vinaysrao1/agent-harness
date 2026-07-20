@@ -17,6 +17,7 @@ from harness.tools.builtin import (
     MissingArgumentError,
     add_instruction_tool,
     bash_tool,
+    declare_verification_tool,
     edit_file_tool,
     load_skill_tool,
     memory_read_fact_tool,
@@ -255,13 +256,29 @@ class TestBashTool:
         assert "exit code: 0" in output
         assert "hello" in output
         assert "stdout" in output
-        assert "stderr" in output
+
+    async def test_empty_stdout_and_stderr_omit_boilerplate_sections(
+        self, sandbox: LocalSandbox
+    ):
+        """Regression (DESIGN.md §10.2 A4): an empty stdout/stderr section is
+        no longer printed as an empty ``--- stdout/stderr ---`` header --
+        that's boilerplate with no information content, and `bash` is the
+        highest-volume tool, so it adds up."""
+        tool = bash_tool(sandbox)
+        output = await tool.handler({"command": "true"})
+        assert "exit code: 0" in output
+        assert "--- stdout ---" not in output
+        assert "--- stderr ---" not in output
+        assert "(no output)" in output
 
     async def test_captures_nonzero_exit_and_stderr(self, sandbox: LocalSandbox):
         tool = bash_tool(sandbox)
         output = await tool.handler({"command": "echo problem 1>&2; exit 3"})
         assert "exit code: 3" in output
         assert "problem" in output
+        assert "--- stderr ---" in output
+        # No stdout was produced, so its section is omitted.
+        assert "--- stdout ---" not in output
 
     async def test_missing_command_raises(self, sandbox: LocalSandbox):
         tool = bash_tool(sandbox)
@@ -351,6 +368,135 @@ class TestReadWriteEditFileTools:
             _call("read_file", {"path": "../outside.txt"})
         )
         assert result.is_error is True
+
+
+class TestReadFileRangeAndPattern:
+    """DESIGN.md §10.2 A4: `read_file` gains `offset`/`limit`/`pattern`."""
+
+    _CONTENT = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"  # line1..line10
+
+    @pytest.fixture
+    async def populated(self, sandbox: LocalSandbox) -> LocalSandbox:
+        await write_file_tool(sandbox).handler(
+            {"path": "f.txt", "content": self._CONTENT}
+        )
+        return sandbox
+
+    def test_schema_declares_offset_limit_pattern_as_optional(
+        self, sandbox: LocalSandbox
+    ):
+        tool = read_file_tool(sandbox)
+        _assert_valid_object_schema(tool.spec.input_schema)
+        props = tool.spec.input_schema["properties"]
+        assert {"offset", "limit", "pattern"} <= props.keys()
+        # Only `path` is required -- the new arguments are all optional.
+        assert tool.spec.input_schema["required"] == ["path"]
+
+    async def test_no_range_args_is_unchanged_whole_file_read(
+        self, populated: LocalSandbox
+    ):
+        """Backward compatibility: omitting offset/limit/pattern must return
+        the exact, unmodified file content -- no line numbers, no footer."""
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt"})
+        assert result == self._CONTENT
+
+    async def test_offset_and_limit_return_numbered_line_range(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt", "offset": 3, "limit": 2})
+        assert "3:line3" in result
+        assert "4:line4" in result
+        assert "line2" not in result
+        assert "line5" not in result
+        assert "lines 3-4 of 10" in result
+
+    async def test_offset_without_limit_reads_to_end_of_file(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt", "offset": 9})
+        assert "9:line9" in result
+        assert "10:line10" in result
+        assert "line8" not in result
+        assert "lines 9-10 of 10" in result
+
+    async def test_limit_without_offset_defaults_to_start_of_file(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt", "limit": 2})
+        assert "1:line1" in result
+        assert "2:line2" in result
+        assert "line3" not in result
+
+    async def test_offset_beyond_end_of_file_reports_clearly_not_a_crash(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt", "offset": 100})
+        assert "100" in result
+        assert "10" in result  # total line count is reported
+
+    async def test_offset_zero_is_a_clear_error(self, populated: LocalSandbox):
+        tool = read_file_tool(populated)
+        with pytest.raises(ValueError, match="offset"):
+            await tool.handler({"path": "f.txt", "offset": 0})
+
+    async def test_limit_zero_is_a_clear_error(self, populated: LocalSandbox):
+        tool = read_file_tool(populated)
+        with pytest.raises(ValueError, match="limit"):
+            await tool.handler({"path": "f.txt", "limit": 0})
+
+    async def test_pattern_returns_matching_lines_grep_n_style(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt", "pattern": r"line[13]$"})
+        assert "1:line1" in result
+        assert "3:line3" in result
+        assert "line2" not in result
+        assert "match(es)" in result
+
+    async def test_pattern_no_match_returns_clear_message_not_error(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        result = await tool.handler({"path": "f.txt", "pattern": "nope-not-here"})
+        assert "no lines" in result
+        assert "nope-not-here" in result
+
+    async def test_pattern_within_offset_limit_window(self, populated: LocalSandbox):
+        """`pattern` composes with `offset`/`limit`: it greps only within the
+        given range, and reported line numbers stay absolute."""
+        tool = read_file_tool(populated)
+        result = await tool.handler(
+            {"path": "f.txt", "offset": 1, "limit": 3, "pattern": "line3"}
+        )
+        assert "3:line3" in result
+        # line5 also matches /line\d/ loosely but is outside the window and
+        # must not appear.
+        await tool.handler({"path": "f.txt", "offset": 5, "limit": 1})  # sanity call
+        assert "match(es) among lines 1-3 of 10" in result
+
+    async def test_invalid_regex_is_a_clear_error_not_a_crash(
+        self, populated: LocalSandbox
+    ):
+        tool = read_file_tool(populated)
+        with pytest.raises(ValueError, match="regex"):
+            await tool.handler({"path": "f.txt", "pattern": "(unclosed["})
+
+    async def test_invalid_regex_via_dispatch_is_error_result_not_a_crash(
+        self, populated: LocalSandbox
+    ):
+        registry = ToolRegistry()
+        registry.register(read_file_tool(populated))
+        result = await registry.dispatch(
+            _call("read_file", {"path": "f.txt", "pattern": "(unclosed["})
+        )
+        assert result.is_error is True
+        assert "regex" in result.content
 
 
 # ---------------------------------------------------------------------------
@@ -781,3 +927,81 @@ class TestSearchHistoryTool:
         )
         assert result.is_error is False
         assert "needle" in result.content
+
+
+# ---------------------------------------------------------------------------
+# declare_verification tool (DESIGN.md §10.3 B1)
+# ---------------------------------------------------------------------------
+
+
+class TestDeclareVerificationTool:
+    def test_schema_and_meta(self):
+        tool = declare_verification_tool()
+        assert tool.spec.name == "declare_verification"
+        _assert_valid_object_schema(tool.spec.input_schema)
+        assert set(tool.spec.input_schema["required"]) == {
+            "command",
+            "description",
+        }
+        assert tool.meta.side_effect is False
+
+    def test_description_tells_the_model_to_declare_early(self):
+        tool = declare_verification_tool()
+        assert "early" in tool.spec.description.lower()
+
+    async def test_handler_acknowledges_the_declaration(self):
+        tool = declare_verification_tool()
+        result = await tool.handler(
+            {"command": "pytest -q", "description": "tests pass"}
+        )
+        assert "pytest -q" in result
+        assert "tests pass" in result
+        assert "exit 0" in result
+
+    async def test_missing_command_raises(self):
+        tool = declare_verification_tool()
+        with pytest.raises(MissingArgumentError, match="command"):
+            await tool.handler({"description": "tests pass"})
+
+    async def test_missing_description_raises(self):
+        tool = declare_verification_tool()
+        with pytest.raises(MissingArgumentError, match="description"):
+            await tool.handler({"command": "pytest -q"})
+
+    async def test_blank_command_is_rejected(self):
+        tool = declare_verification_tool()
+        with pytest.raises(ValueError, match="non-empty"):
+            await tool.handler({"command": "   ", "description": "d"})
+
+    async def test_dispatch_error_result_not_exception(self):
+        registry = ToolRegistry()
+        registry.register(declare_verification_tool())
+        result = await registry.dispatch(_call("declare_verification", {}))
+        assert result.is_error is True
+        assert "command" in result.content
+
+    def test_registered_in_default_coding_toolset(
+        self,
+        sandbox: LocalSandbox,
+        memory_store: MemoryStore,
+        skill_library: SkillLibrary,
+        run_store: RunStore,
+        run_id: str,
+    ):
+        """B1 wiring: the default CODING_TOOL_FACTORIES build a registry
+        that contains declare_verification."""
+        from harness.orchestrator import CODING_TOOL_FACTORIES, ToolDeps
+
+        deps = ToolDeps(
+            sandbox=sandbox,
+            memory=memory_store,
+            skills=skill_library,
+            store=run_store,
+            run_id=run_id,
+            context=_make_context(),
+        )
+        registry = ToolRegistry()
+        for factory in CODING_TOOL_FACTORIES:
+            registry.register(factory(deps))
+        names = [spec.name for spec in registry.specs()]
+        assert "declare_verification" in names

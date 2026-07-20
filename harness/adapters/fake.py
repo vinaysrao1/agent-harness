@@ -119,7 +119,6 @@ class FakeAdapter(ModelAdapter):
     def capabilities(self) -> Capabilities:
         """Permissive capabilities so no harness feature is gated off."""
         return Capabilities(
-            parallel_tool_calls=True,
             max_context=1_000_000,
             supports_cache_control=False,
         )

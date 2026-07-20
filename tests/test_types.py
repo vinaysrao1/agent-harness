@@ -168,12 +168,23 @@ class TestModelResponse:
 class TestCapabilities:
     def test_fields_required(self):
         with pytest.raises(ValidationError):
-            Capabilities(parallel_tool_calls=True)  # type: ignore[call-arg]
+            Capabilities(max_context=200_000)  # type: ignore[call-arg]
 
     def test_round_trip(self):
         caps = Capabilities(
-            parallel_tool_calls=True,
             max_context=200_000,
             supports_cache_control=True,
         )
         assert Capabilities.model_validate(caps.model_dump()) == caps
+
+    def test_unknown_fields_rejected(self):
+        """Regression (A3 sweep): a removed capability field must fail
+        loudly at construction, not be silently swallowed — a stub passing
+        the deleted ``parallel_tool_calls`` survived the sweep exactly
+        because pydantic's default is to ignore unknown kwargs."""
+        with pytest.raises(ValidationError):
+            Capabilities(
+                parallel_tool_calls=True,  # type: ignore[call-arg]
+                max_context=200_000,
+                supports_cache_control=True,
+            )

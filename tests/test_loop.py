@@ -130,6 +130,7 @@ def make_harness(
     ask_answer: bool = True,
     context: ContextManager | None = None,
     clock: "Callable[[], float] | None" = None,
+    sandbox: LocalSandbox | None = None,
 ) -> Harness:
     """Wire a full AgentLoop from real lower layers on ``tmp_path``."""
     store = RunStore(tmp_path / "state.db")
@@ -163,6 +164,7 @@ def make_harness(
         budgets or Budgets(),
         ask,
         model="fake-model",
+        sandbox=sandbox,
         **({"clock": clock} if clock is not None else {}),
     )
     return Harness(
@@ -580,7 +582,11 @@ class TestEventLog:
         assert records[0].usage == Usage(input_tokens=7, output_tokens=3)
         assert records[0].model == "fake-model"
         assert records[0].agent_id == h.agent_id
-        assert h.store.total_usage(h.run_id) == {
+        totals = h.store.total_usage(h.run_id)
+        # Real (monotonic) durations: non-negative, exact value not asserted
+        # here — TestDurationRecording drives the clock deterministically.
+        assert totals.pop("duration_ms") >= 0
+        assert totals == {
             "input_tokens": 18,
             "output_tokens": 7,
             "cache_read_tokens": 0,
@@ -780,7 +786,6 @@ class TestAdapterError:
             @property
             def capabilities(self) -> Capabilities:
                 return Capabilities(
-                    parallel_tool_calls=True,
                     max_context=1_000_000,
                     supports_cache_control=False,
                 )
@@ -991,3 +996,570 @@ class TestTruncationContinue:
         assert result.status == "completed"
         assert h.events("truncation_continue") == []
         assert len(h.events("tool_result")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-turn duration recording (§10.2 A5)
+# ---------------------------------------------------------------------------
+
+
+def scripted_clock(values: list[float]) -> Callable[[], float]:
+    """A clock returning ``values`` in order, then repeating the last."""
+    it = iter(values)
+    last = values[-1]
+
+    def clock() -> float:
+        nonlocal last
+        last = next(it, last)
+        return last
+
+    return clock
+
+
+class TestDurationRecording:
+    async def test_duration_measured_around_each_model_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Each usage row records the wall-clock duration of exactly its
+        model call, from the injected monotonic clock. Clock reads with no
+        wall-clock budget: run start, then (call start, call end) per turn."""
+        clock = scripted_clock([0.0, 10.0, 10.5, 20.0, 20.25])
+        script = [
+            resp(None, [call("c1", "echo", text="a")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path, script, tools=[simple_tool("echo")], clock=clock
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        records = h.store.list_usage(h.run_id)
+        assert [record.duration_ms for record in records] == [500, 250]
+        assert h.store.total_usage(h.run_id)["duration_ms"] == 750
+
+
+# ---------------------------------------------------------------------------
+# Self-verification (§10.3 B1)
+# ---------------------------------------------------------------------------
+
+
+def declare(id: str, command: str, description: str = "proves the goal") -> ToolCall:
+    """Build one declare_verification tool call."""
+    return call(id, "declare_verification", command=command, description=description)
+
+
+def verification_harness(
+    tmp_path: Path, script: list[ModelResponse]
+) -> Harness:
+    """A harness with a real LocalSandbox wired to both the loop (as the
+    verification runner) and its bash/declare_verification tools."""
+    from harness.tools.builtin import declare_verification_tool
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(exist_ok=True)
+    sandbox = LocalSandbox(workspace)
+    return make_harness(
+        tmp_path,
+        script,
+        tools=[bash_tool(sandbox), declare_verification_tool()],
+        sandbox=sandbox,
+    )
+
+
+class TestVerification:
+    async def test_declared_check_passes_and_run_completes(
+        self, tmp_path: Path
+    ) -> None:
+        """Pass path: the declared command is re-run at completion time;
+        exit 0 persists verification_passed (with output) and finishes."""
+        script = [
+            resp("declaring", [declare("v1", "echo verified-ok")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        (declared,) = h.events("verification_declared")
+        assert declared == {
+            "command": "echo verified-ok",
+            "description": "proves the goal",
+        }
+        (passed,) = h.events("verification_passed")
+        assert passed["command"] == "echo verified-ok"
+        assert passed["exit_code"] == 0
+        assert "verified-ok" in passed["output"]
+        assert h.events("verification_failed") == []
+
+    async def test_failed_check_nudges_then_fixed_check_passes(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail-then-fix: a failing check bounces the final answer back with
+        the failure output; once the agent fixes the workspace, the same
+        check passes and the run completes."""
+        script = [
+            resp("declaring", [declare("v1", "test -f done.txt")]),
+            resp(CLEAN_FINISH),  # bounced: done.txt does not exist yet
+            resp("fixing", [call("c1", "bash", command="touch done.txt")]),
+            resp(CLEAN_FINISH),  # now verification passes
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 4
+        (failed,) = h.events("verification_failed")
+        assert failed["command"] == "test -f done.txt"
+        assert failed["exit_code"] != 0
+        assert failed["nudge_number"] == 1
+        assert "nudges_exhausted" not in failed
+        (passed,) = h.events("verification_passed")
+        assert passed["exit_code"] == 0
+        # The failure reminder reached the model as a user message on the
+        # turn after the bounced answer, and was persisted as a message.
+        turn3_last = h.adapter.calls[2].messages[-1]
+        assert turn3_last.role is Role.USER
+        assert "verification command failed" in (turn3_last.content or "")
+        assert "test -f done.txt" in (turn3_last.content or "")
+        assert any(
+            payload["role"] == "user"
+            and "verification command failed" in (payload["content"] or "")
+            for payload in h.events("message")
+        )
+
+    async def test_permanently_failing_check_is_bounded_by_nudges(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail-exhausted: verification failures consume MAX_NUDGES; after
+        that the run completes anyway, with the final failure persisted
+        (nudges_exhausted) so it stays auditable."""
+        from harness.diligence import MAX_NUDGES
+
+        script = [
+            resp("declaring", [declare("v1", "exit 1")]),
+            *[resp(CLEAN_FINISH) for _ in range(MAX_NUDGES + 1)],
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        failures = h.events("verification_failed")
+        assert len(failures) == MAX_NUDGES + 1
+        assert [f.get("nudge_number") for f in failures[:-1]] == list(
+            range(1, MAX_NUDGES + 1)
+        )
+        assert failures[-1]["nudges_exhausted"] is True
+        assert h.events("verification_passed") == []
+        assert h.store.get_agent(h.agent_id).status == "completed"
+
+    async def test_redeclaring_replaces_the_previous_command(
+        self, tmp_path: Path
+    ) -> None:
+        script = [
+            resp("first", [declare("v1", "exit 1")]),
+            resp("second", [declare("v2", "echo second-ok")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        declared = h.events("verification_declared")
+        assert [d["command"] for d in declared] == ["exit 1", "echo second-ok"]
+        (passed,) = h.events("verification_passed")
+        assert passed["command"] == "echo second-ok"
+        assert h.events("verification_failed") == []
+
+    async def test_heuristic_nudges_and_verification_share_one_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """A looks_unfinished nudge and verification failures draw from the
+        same MAX_NUDGES pool, so the combination cannot loop forever."""
+        script = [
+            resp("declaring", [declare("v1", "exit 1")]),
+            resp("I will keep going after this."),  # heuristic nudge (1)
+            resp(CLEAN_FINISH),  # verification fail (nudge 2)
+            resp(CLEAN_FINISH),  # budget spent: completes despite failure
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 4
+        assert len(h.events("nudge")) == 1
+        failures = h.events("verification_failed")
+        assert len(failures) == 2
+        assert failures[0]["nudge_number"] == 2
+        assert failures[1]["nudges_exhausted"] is True
+
+    async def test_invalid_declaration_does_not_arm_the_gate(
+        self, tmp_path: Path
+    ) -> None:
+        """A declare_verification call that errors (missing command) never
+        arms the gate: no verification events, heuristic path unchanged."""
+        script = [
+            resp("declaring", [call("v1", "declare_verification")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        (tool_result,) = h.events("tool_result")
+        assert tool_result["is_error"] is True
+        assert h.events("verification_declared") == []
+        assert h.events("verification_passed") == []
+        assert h.events("verification_failed") == []
+
+    async def test_no_declaration_leaves_heuristic_behavior_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """With a sandbox wired but nothing declared, completion is decided
+        by looks_unfinished alone — no verification events at all."""
+        script = [resp(CLEAN_FINISH)]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 1
+        assert h.events("verification_passed") == []
+        assert h.events("verification_failed") == []
+
+    async def test_verification_execution_records_an_allow_decision(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression (§4.11): the harness-initiated verification execution
+        is itself a logged permission decision — even an auto-allow —
+        under a synthetic verification-exec tool-call id."""
+        script = [
+            resp("declaring", [declare("v1", "echo verified-ok")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = verification_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        ver_decisions = [
+            d
+            for d in h.events("decision")
+            if d["tool_call_id"].startswith("verification-exec-")
+        ]
+        assert len(ver_decisions) == 1
+        assert ver_decisions[0]["tool_name"] == "bash"
+        assert ver_decisions[0]["arguments"] == {"command": "echo verified-ok"}
+        assert ver_decisions[0]["decision"] == "allow"
+        assert ver_decisions[0]["decided_by"] == "policy"
+
+    async def test_policy_deny_glob_blocks_verification_execution(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression (§4.11): an explicit user deny glob on bash is the
+        highest-precedence rule and must cover the B1 verification
+        execution too — the model cannot run arbitrary shell by declaring
+        it as a verification command. The command never reaches the
+        sandbox, the deny is logged, and no nudge budget is burned (a
+        policy deny is not something the model can fix)."""
+        from harness.tools.builtin import declare_verification_tool
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir(exist_ok=True)
+        sandbox = LocalSandbox(workspace)
+        script = [
+            resp("declaring", [declare("v1", "touch PWNED")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox), declare_verification_tool()],
+            policy=Policy(mode=PermissionMode.GATED, deny=("bash",)),
+            sandbox=sandbox,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 2
+        assert not (workspace / "PWNED").exists()  # never executed
+        (failed,) = h.events("verification_failed")
+        assert failed["denied"] is True
+        assert failed["exit_code"] is None
+        assert "not executed" in failed["output"]
+        assert h.events("verification_passed") == []
+        assert h.events("nudge") == []
+        # The deny outranks ASK: the callback was never consulted.
+        assert h.ask_log == []
+        ver_decisions = [
+            d
+            for d in h.events("decision")
+            if d["tool_call_id"].startswith("verification-exec-")
+        ]
+        assert len(ver_decisions) == 1
+        assert ver_decisions[0]["decision"] == "deny"
+        assert ver_decisions[0]["decided_by"] == "policy"
+
+    async def test_missing_bash_tool_gates_execution_in_gated_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: a registry with declare_verification but no bash
+        tool has no policy-blessed shell meta, so the execution is treated
+        as side-effecting — GATED mode routes it through ask instead of
+        auto-allowing via the benign unknown-tool default."""
+        from harness.tools.builtin import declare_verification_tool
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir(exist_ok=True)
+        sandbox = LocalSandbox(workspace)
+        script = [
+            resp("declaring", [declare("v1", "touch GATED")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[declare_verification_tool()],
+            policy=Policy(mode=PermissionMode.GATED),
+            ask_answer=False,
+            sandbox=sandbox,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert not (workspace / "GATED").exists()
+        assert h.ask_log == [
+            ("bash", {"command": "touch GATED"}, ToolMeta(side_effect=True))
+        ]
+        (failed,) = h.events("verification_failed")
+        assert failed["denied"] is True
+        ver_decisions = [
+            d
+            for d in h.events("decision")
+            if d["tool_call_id"].startswith("verification-exec-")
+        ]
+        assert len(ver_decisions) == 1
+        assert ver_decisions[0]["decision"] == "deny"
+        assert ver_decisions[0]["decided_by"] == "user"
+
+    async def test_wound_down_failure_is_labeled_wound_down_not_exhausted(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: a verification failure accepted because the run
+        wound down — with nudge budget remaining — must be stamped
+        wound_down, not nudges_exhausted, or the B2/B4 failure
+        classification mines a corrupted audit signal."""
+        from harness.tools.builtin import declare_verification_tool
+
+        # start=0; turn-1 checks read 0/0/1; the turn-2 check reads 90 →
+        # 10s of a 100s budget left, so wind-down fires before turn 2.
+        values = iter([0.0, 0.0, 0.0, 1.0, 90.0])
+        last = 90.0
+
+        def clock() -> float:
+            nonlocal last
+            last = next(values, last)
+            return last
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir(exist_ok=True)
+        sandbox = LocalSandbox(workspace)
+        script = [
+            resp("declaring", [declare("v1", "exit 1")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox), declare_verification_tool()],
+            budgets=Budgets(wall_clock_seconds=100.0),
+            clock=clock,
+            sandbox=sandbox,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert len(h.events("wind_down")) == 1
+        assert h.events("nudge") == []  # budget untouched
+        (failed,) = h.events("verification_failed")
+        assert failed["wound_down"] is True
+        assert "nudges_exhausted" not in failed
+
+    async def test_sandbox_exec_error_is_a_failed_verification_not_a_crash(
+        self, tmp_path: Path
+    ) -> None:
+        """A verification command that cannot even execute (sandbox raises)
+        is treated as a failed check, never an exception out of run()."""
+        from harness.sandbox.base import SandboxError
+        from harness.tools.builtin import declare_verification_tool
+
+        class ExplodingSandbox:
+            async def exec(self, command: str, timeout: float = 120):
+                raise SandboxError("no such sandbox backend")
+
+        script = [
+            resp("declaring", [declare("v1", "pytest -q")]),
+            resp(CLEAN_FINISH),
+            resp(CLEAN_FINISH),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path, script, tools=[declare_verification_tool()]
+        )
+        h.loop.sandbox = ExplodingSandbox()  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        failures = h.events("verification_failed")
+        assert len(failures) == 3
+        assert failures[0]["exit_code"] is None
+        assert "failed to execute" in failures[0]["output"]
+
+
+class TestVerificationOrchestratorWiring:
+    async def test_orchestrated_run_executes_declared_verification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end through the Orchestrator: declare_verification is in
+        the default coding toolset and the lead loop gets the run's sandbox,
+        so the declared command really executes before completion."""
+        from harness.config import HarnessConfig
+        from harness.orchestrator import Orchestrator
+        from harness.sandbox.docker import DockerSandbox
+
+        monkeypatch.setattr(
+            DockerSandbox, "availability", classmethod(lambda cls: False)
+        )
+        with pytest.warns(UserWarning, match="no Docker daemon"):
+            with RunStore(tmp_path / "orch.db") as store:
+                orchestrator = Orchestrator(
+                    HarnessConfig(home=tmp_path / "home"), store
+                )
+                adapter = FakeAdapter(
+                    [
+                        resp("declaring", [declare("v1", "echo wired-ok")]),
+                        resp(CLEAN_FINISH),
+                    ]
+                )
+                run_id, result = await orchestrator.run_task(
+                    GOAL, "fake-model", adapter_override=adapter
+                )
+                assert result.status == "completed"
+                # The declaration was offered as a tool and the check ran.
+                names = [spec.name for spec in adapter.calls[0].tools]
+                assert "declare_verification" in names
+                lead = store.list_agents(run_id)[0]
+                events = store.load_events(lead.id)
+                passed = [
+                    e.payload
+                    for e in events
+                    if e.kind == "verification_passed"
+                ]
+                assert len(passed) == 1
+                assert "wired-ok" in passed[0]["output"]
+
+
+class TestVerificationResume:
+    async def test_resume_replays_verification_events_without_breaking(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resume-safety: verification_* event kinds in the persisted log
+        are ignored by the orchestrator's transcript replay (not crashed
+        on), and the resumed run completes normally."""
+        from harness.config import HarnessConfig
+        from harness.orchestrator import Orchestrator
+        from harness.sandbox.docker import DockerSandbox
+
+        monkeypatch.setattr(
+            DockerSandbox, "availability", classmethod(lambda cls: False)
+        )
+        with pytest.warns(UserWarning, match="no Docker daemon"):
+            with RunStore(tmp_path / "orch.db") as store:
+                orchestrator = Orchestrator(
+                    HarnessConfig(home=tmp_path / "home"), store
+                )
+                first = FakeAdapter(
+                    [resp("declaring", [declare("v1", "echo resumed-ok")])]
+                )
+                run_id, paused = await orchestrator.run_task(
+                    GOAL,
+                    "fake-model",
+                    adapter_override=first,
+                    budgets=Budgets(max_turns=1),
+                )
+                assert paused.status == "paused_budget"
+                lead = store.list_agents(run_id)[0]
+                kinds = [e.kind for e in store.load_events(lead.id)]
+                assert "verification_declared" in kinds
+
+                second = FakeAdapter([resp(CLEAN_FINISH)])
+                result = await orchestrator.resume_task(
+                    run_id, adapter_override=second
+                )
+                assert result.status == "completed"
+                assert store.get_run(run_id).status == "completed"
+                # The replayed transcript still carries the declaration's
+                # tool call/result pair (regular events), goal first.
+                messages = second.calls[0].messages
+                assert messages[0].content == GOAL
+                assert any(
+                    m.tool_result is not None
+                    and m.tool_result.tool_call_id == "v1"
+                    for m in messages
+                )
+
+    async def test_resume_rearms_the_last_declared_verification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: resume must re-arm the B1 gate from the last
+        persisted verification_declared event — the replayed transcript
+        promises the model its check "will be re-run before your answer is
+        accepted", and a resume that silently disarms it breaks that
+        promise. The *last* declaration wins, mirroring the live loop."""
+        from harness.config import HarnessConfig
+        from harness.orchestrator import Orchestrator
+        from harness.sandbox.docker import DockerSandbox
+
+        monkeypatch.setattr(
+            DockerSandbox, "availability", classmethod(lambda cls: False)
+        )
+        with pytest.warns(UserWarning, match="no Docker daemon"):
+            with RunStore(tmp_path / "orch.db") as store:
+                orchestrator = Orchestrator(
+                    HarnessConfig(home=tmp_path / "home"), store
+                )
+                first = FakeAdapter(
+                    [
+                        resp("declaring", [declare("v1", "exit 1")]),
+                        resp(
+                            "redeclaring",
+                            [declare("v2", "echo resumed-ok")],
+                        ),
+                    ]
+                )
+                run_id, paused = await orchestrator.run_task(
+                    GOAL,
+                    "fake-model",
+                    adapter_override=first,
+                    budgets=Budgets(max_turns=2),
+                )
+                assert paused.status == "paused_budget"
+
+                second = FakeAdapter([resp(CLEAN_FINISH)])
+                result = await orchestrator.resume_task(
+                    run_id, adapter_override=second
+                )
+                assert result.status == "completed"
+                lead = store.list_agents(run_id)[0]
+                events = store.load_events(lead.id)
+                passed = [
+                    e.payload
+                    for e in events
+                    if e.kind == "verification_passed"
+                ]
+                assert len(passed) == 1
+                assert passed[0]["command"] == "echo resumed-ok"
+                assert "resumed-ok" in passed[0]["output"]
+                assert [
+                    e for e in events if e.kind == "verification_failed"
+                ] == []

@@ -22,7 +22,6 @@ class FakeAdapter(ModelAdapter):
     @property
     def capabilities(self) -> Capabilities:
         return Capabilities(
-            parallel_tool_calls=True,
             max_context=100_000,
             supports_cache_control=False,
         )

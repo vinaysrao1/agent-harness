@@ -163,12 +163,16 @@ class Capabilities(BaseModel):
     """What a model/adapter pair can do, used for capability negotiation.
 
     The harness queries this rather than assuming a lowest common denominator:
-    e.g. it serializes tool calls when ``parallel_tool_calls`` is False and
-    sets cache breakpoints only when ``supports_cache_control`` is True.
+    e.g. it sets cache breakpoints only when ``supports_cache_control`` is
+    True.
+
+    ``extra="forbid"``: constructing with an unknown field is an error, so
+    a capability field that has been removed (e.g. the A3-deleted
+    ``parallel_tool_calls``) fails loudly at every construction site
+    instead of being silently swallowed by pydantic's default ignore.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    parallel_tool_calls: bool
     max_context: int
     supports_cache_control: bool

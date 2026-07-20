@@ -169,7 +169,12 @@ class ApprovalRecord(BaseModel):
 
 
 class UsageRecord(BaseModel):
-    """A row of the `usage` table."""
+    """A row of the `usage` table.
+
+    ``duration_ms`` is the wall-clock duration of the model call this row
+    records (DESIGN.md §10.2 A5), in whole milliseconds; ``0`` for rows
+    written before the column existed (or by callers that don't measure).
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -178,6 +183,7 @@ class UsageRecord(BaseModel):
     agent_id: str | None
     model: str
     usage: Usage
+    duration_ms: int = 0
     created_at: str
 
 
@@ -250,6 +256,7 @@ CREATE TABLE IF NOT EXISTS usage (
     output_tokens       INTEGER NOT NULL,
     cache_read_tokens   INTEGER NOT NULL,
     cache_write_tokens  INTEGER NOT NULL,
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL
 );
 """
@@ -277,6 +284,26 @@ class RunStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         with self._conn:
             self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring a pre-existing database up to the current schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves tables created by an older
+        harness untouched, so columns added since then are applied here via
+        ``ALTER TABLE`` — currently just ``usage.duration_ms`` (DESIGN.md
+        §10.2 A5). Idempotent: opening an up-to-date database is a no-op.
+        """
+        usage_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(usage)")
+        }
+        if "duration_ms" not in usage_columns:
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE usage ADD COLUMN "
+                    "duration_ms INTEGER NOT NULL DEFAULT 0"
+                )
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -605,14 +632,21 @@ class RunStore:
         agent_id: str | None,
         model: str,
         usage: Usage,
+        *,
+        duration_ms: int = 0,
     ) -> int:
-        """Log token usage for one model call and return the new row's id."""
+        """Log token usage for one model call and return the new row's id.
+
+        ``duration_ms`` is the call's wall-clock duration in whole
+        milliseconds (DESIGN.md §10.2 A5); it defaults to ``0`` for callers
+        that do not measure.
+        """
         created_at = _utc_now_iso()
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO usage (run_id, agent_id, model, input_tokens, "
                 "output_tokens, cache_read_tokens, cache_write_tokens, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     agent_id,
@@ -621,6 +655,7 @@ class RunStore:
                     usage.output_tokens,
                     usage.cache_read_tokens,
                     usage.cache_write_tokens,
+                    duration_ms,
                     created_at,
                 ),
             )
@@ -643,6 +678,7 @@ class RunStore:
                     cache_read_tokens=row["cache_read_tokens"],
                     cache_write_tokens=row["cache_write_tokens"],
                 ),
+                duration_ms=row["duration_ms"],
                 created_at=row["created_at"],
             )
             for row in rows
@@ -653,8 +689,9 @@ class RunStore:
 
         Returns a dict with the same field names as :class:`~harness.types.Usage`
         (``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
-        ``cache_write_tokens``), summed across every agent and model. Missing
-        usage rows sum to ``0``, never ``NULL``.
+        ``cache_write_tokens``), plus ``duration_ms`` (total wall-clock time
+        across the run's model calls, §10.2 A5), summed across every agent
+        and model. Missing usage rows sum to ``0``, never ``NULL``.
         """
         row = self._conn.execute(
             """
@@ -662,7 +699,8 @@ class RunStore:
                 COALESCE(SUM(input_tokens), 0)       AS input_tokens,
                 COALESCE(SUM(output_tokens), 0)      AS output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)  AS cache_read_tokens,
-                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(duration_ms), 0)        AS duration_ms
             FROM usage WHERE run_id = ?
             """,
             (run_id,),
@@ -672,6 +710,7 @@ class RunStore:
             "output_tokens": row["output_tokens"],
             "cache_read_tokens": row["cache_read_tokens"],
             "cache_write_tokens": row["cache_write_tokens"],
+            "duration_ms": row["duration_ms"],
         }
 
 

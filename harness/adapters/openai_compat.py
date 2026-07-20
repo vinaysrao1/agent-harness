@@ -552,7 +552,6 @@ class OpenAICompatAdapter(ModelAdapter):
         # ``retry`` mapping may override it (or any other retry knob).
         self._retry = {"max_elapsed": _DEFAULT_RETRY_MAX_ELAPSED, **(retry or {})}
         self._capabilities = Capabilities(
-            parallel_tool_calls=True,
             max_context=max_context,
             supports_cache_control=False,
         )
