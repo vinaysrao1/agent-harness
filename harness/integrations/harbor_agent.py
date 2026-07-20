@@ -64,6 +64,13 @@ __all__ = ["HarnessAgent", "resolve_model"]
 _DEFAULT_MAX_TURNS = 80
 _DEFAULT_MAX_TOKENS = 2_000_000
 
+#: Per-call completion-token cap (provider ``max_tokens``), overridable via
+#: HARNESS_MAX_OUTPUT_TOKENS. Bounds a single turn so one pathologically long
+#: generation cannot eat the whole per-trial wall clock (the failure mode
+#: where a model spent ~15 uninterrupted minutes on one turn and wrote
+#: nothing). Generous enough for a full-file write in one call.
+_DEFAULT_MAX_OUTPUT_TOKENS = 8192
+
 #: Cap on the ``final_text`` echoed into Harbor's context metadata.
 _FINAL_TEXT_LIMIT = 2000
 
@@ -200,6 +207,10 @@ class HarnessAgent(BaseAgent):
             max_tokens=self._int_setting(
                 "HARNESS_MAX_TOKENS", _DEFAULT_MAX_TOKENS
             ),
+            max_output_tokens=self._int_setting(
+                "HARNESS_MAX_OUTPUT_TOKENS", _DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            wall_clock_seconds=self._wall_clock_budget(),
         )
 
         sandbox = HarborSandbox(environment)
@@ -250,6 +261,36 @@ class HarnessAgent(BaseAgent):
         if user_config_path.is_file():
             return load_config(user_config_path)
         return HarnessConfig()
+
+    def _wall_clock_budget(self) -> float | None:
+        """The per-trial wall-clock deadline that drives loop wind-down.
+
+        Prefers an explicit ``HARNESS_WALL_CLOCK_SECONDS`` override, then
+        Harbor's own per-trial ``agent_timeout_sec`` (the deadline after which
+        Harbor raises ``AgentTimeoutError`` and kills the trial mid-turn) — so
+        the loop can inject its wind-down reminder and land a best-effort
+        answer *before* that hard kill. Returns ``None`` (wind-down disabled)
+        when neither is available or the value is unusable, rather than
+        guessing a deadline that might not match Harbor's.
+        """
+        override = self.extra_env.get(
+            "HARNESS_WALL_CLOCK_SECONDS",
+            os.environ.get("HARNESS_WALL_CLOCK_SECONDS"),
+        )
+        if override is not None:
+            try:
+                return float(override)
+            except ValueError:
+                warnings.warn(
+                    f"HARNESS_WALL_CLOCK_SECONDS={override!r} is not a number; "
+                    "ignoring",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        timeout = getattr(self, "agent_timeout_sec", None)
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            return float(timeout)
+        return None
 
     def _int_setting(self, name: str, default: int) -> int:
         """Read an integer setting from ``extra_env`` then ``os.environ``.

@@ -72,6 +72,7 @@ def get_adapter(model_config: ModelConfig) -> ModelAdapter:
             model=model_config.model,
             api_key=model_config.resolve_api_key(),
             base_url=model_config.base_url,
+            extra_body=model_config.extra_body,
         )
     if adapter == "fake":
         from harness.adapters.fake import FakeAdapter

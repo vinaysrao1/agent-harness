@@ -46,6 +46,7 @@ import tomllib
 import warnings
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
@@ -165,6 +166,13 @@ class ModelConfig(BaseModel):
     model: str
     base_url: str | None = None
     api_key: SecretStr | None = None
+    #: Provider-specific request fields forwarded verbatim into the
+    #: OpenAI-compatible request's ``extra_body`` — most usefully a
+    #: reasoning/thinking control, e.g. ``extra_body = { reasoning = { effort
+    #: = "low" } }`` in TOML, to stop a reasoning model from spending a whole
+    #: turn's token budget thinking. An unsupported field is ignored by the
+    #: gateway, not an error.
+    extra_body: dict[str, Any] | None = None
 
     def resolve_api_key(self) -> str | None:
         """Resolve the stored reference to the actual API key, if any."""

@@ -12,6 +12,7 @@ import pytest
 from harness.adapters.base import AdapterError
 from harness.adapters.openai_compat import (
     OpenAICompatAdapter,
+    accumulate_stream_chunks,
     from_openai_response,
     map_finish_reason,
     to_openai_messages,
@@ -437,6 +438,27 @@ class TestWrapOpenAIError:
         assert wrap_openai_error(APITimeoutError()).retryable is True
         assert wrap_openai_error(APIConnectionError()).retryable is True
 
+    @pytest.mark.parametrize(
+        "exc_name",
+        [
+            "ReadError",
+            "ReadTimeout",
+            "WriteError",
+            "RemoteProtocolError",
+            "LocalProtocolError",
+            "StreamError",
+            "IncompleteRead",
+            "PoolTimeout",
+        ],
+    )
+    def test_streaming_transport_errors_retryable(self, exc_name: str) -> None:
+        # Reading the body incrementally makes mid-stream httpx transport
+        # errors likely; they are transient and must retry, not forfeit the run.
+        exc = type(exc_name, (Exception,), {})()
+        wrapped = wrap_openai_error(exc)
+        assert wrapped.retryable is True
+        assert exc_name in str(wrapped)
+
     def test_unknown_not_retryable(self) -> None:
         assert wrap_openai_error(RuntimeError("boom")).retryable is False
 
@@ -451,7 +473,7 @@ class TestWrapOpenAIError:
 class TestComplete:
     async def test_translates_request_and_response(self) -> None:
         client = fake_client([fake_response(content="done")])
-        adapter = OpenAICompatAdapter("kimi-k3", client=client)
+        adapter = OpenAICompatAdapter("kimi-k3", client=client, stream=False)
         result = await adapter.complete(
             [Message(role=Role.USER, content="hi")],
             [ToolSpec(name="bash", description="run", input_schema={})],
@@ -467,7 +489,7 @@ class TestComplete:
 
     async def test_omits_tools_when_absent(self) -> None:
         client = fake_client([fake_response()])
-        adapter = OpenAICompatAdapter("m", client=client)
+        adapter = OpenAICompatAdapter("m", client=client, stream=False)
         await adapter.complete([Message(role=Role.USER, content="hi")], [])
         (kwargs,) = client.chat.completions.calls
         assert "tools" not in kwargs
@@ -480,7 +502,8 @@ class TestComplete:
             sleeps.append(delay)
 
         adapter = OpenAICompatAdapter(
-            "m", client=client, retry={"sleep": fake_sleep, "jitter": lambda: 0.0}
+            "m", client=client, stream=False,
+            retry={"sleep": fake_sleep, "jitter": lambda: 0.0},
         )
         result = await adapter.complete([Message(role=Role.USER, content="hi")], [])
         assert result.message.content == "ok"
@@ -489,7 +512,7 @@ class TestComplete:
 
     async def test_non_retryable_raises_immediately(self) -> None:
         client = fake_client([FakeStatusError(400)])
-        adapter = OpenAICompatAdapter("m", client=client)
+        adapter = OpenAICompatAdapter("m", client=client, stream=False)
         with pytest.raises(AdapterError) as excinfo:
             await adapter.complete([Message(role=Role.USER, content="hi")], [])
         assert excinfo.value.retryable is False
@@ -507,7 +530,8 @@ class TestComplete:
             sleeps.append(delay)
 
         adapter = OpenAICompatAdapter(
-            "m", client=client, retry={"sleep": fake_sleep, "jitter": lambda: 0.0}
+            "m", client=client, stream=False,
+            retry={"sleep": fake_sleep, "jitter": lambda: 0.0},
         )
         result = await adapter.complete([Message(role=Role.USER, content="hi")], [])
         assert result.message.content == "recovered"
@@ -525,7 +549,8 @@ class TestComplete:
             pass
 
         adapter = OpenAICompatAdapter(
-            "m", client=client, retry={"sleep": fake_sleep, "jitter": lambda: 0.0}
+            "m", client=client, stream=False,
+            retry={"sleep": fake_sleep, "jitter": lambda: 0.0},
         )
         result = await adapter.complete([Message(role=Role.USER, content="hi")], [])
         assert result.message.content == "ok"
@@ -541,7 +566,7 @@ class TestComplete:
             pass
 
         adapter = OpenAICompatAdapter(
-            "m", client=client,
+            "m", client=client, stream=False,
             retry={"max_attempts": 3, "sleep": fake_sleep, "jitter": lambda: 0.0},
         )
         with pytest.raises(AdapterError) as excinfo:
@@ -564,7 +589,8 @@ class TestComplete:
 
         client = SimpleNamespace(chat=SimpleNamespace(completions=HungAPI()))
         adapter = OpenAICompatAdapter(
-            "m", client=client, request_timeout=0.02, retry={"max_attempts": 1}
+            "m", client=client, stream=False,
+            request_timeout=0.02, retry={"max_attempts": 1},
         )
         with pytest.raises(AdapterError) as excinfo:
             await adapter.complete([Message(role=Role.USER, content="hi")], [])
@@ -592,7 +618,7 @@ class TestComplete:
             finish_reason="tool_calls",
         )
         client = fake_client([bad, fake_response(content="unreached")])
-        adapter = OpenAICompatAdapter("m", client=client)
+        adapter = OpenAICompatAdapter("m", client=client, stream=False)
         with pytest.raises(AdapterError, match="malformed JSON"):
             await adapter.complete([Message(role=Role.USER, content="hi")], [])
         assert len(client.chat.completions.calls) == 1
@@ -626,3 +652,324 @@ class TestComplete:
         )
         assert adapter._client.max_retries == 0
         assert adapter._client.timeout == 90.0
+
+    def test_streaming_is_the_default(self) -> None:
+        adapter = OpenAICompatAdapter("m", client=fake_client([]))
+        assert adapter._stream is True
+
+    def test_get_adapter_threads_extra_body_from_config(self) -> None:
+        import warnings as _warnings
+
+        from harness.adapters import get_adapter
+        from harness.config import ModelConfig
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")  # literal api_key warns; irrelevant
+            mc = ModelConfig(
+                adapter="openai",
+                model="m",
+                api_key="sk-dummy",
+                extra_body={"reasoning": {"effort": "low"}},
+            )
+            adapter = get_adapter(mc)
+        assert adapter._extra_body == {"reasoning": {"effort": "low"}}
+
+
+# --------------------------------------------------------------- stream chunks
+
+
+def stream_chunk(
+    *,
+    content: str | None = None,
+    tool_calls: list[Any] | None = None,
+    finish_reason: str | None = None,
+    usage: Any = None,
+    error: Any = None,
+) -> SimpleNamespace:
+    """Build one streamed chat.completion chunk (SDK-shaped stand-in).
+
+    A usage-only terminal chunk (``stream_options`` include_usage) carries
+    ``choices == []``; model this by passing only ``usage``.
+    """
+    chunk = SimpleNamespace(choices=[], usage=usage)
+    if content is not None or tool_calls is not None or finish_reason is not None:
+        delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+        chunk.choices = [SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+    if error is not None:
+        chunk.error = error
+    return chunk
+
+
+def tc_delta(
+    index: int,
+    *,
+    id: str | None = None,
+    name: str | None = None,
+    arguments: str | None = None,
+) -> SimpleNamespace:
+    """A streamed tool-call delta fragment."""
+    return SimpleNamespace(
+        index=index,
+        id=id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+class FakeStream:
+    """Async-iterable stand-in for the SDK's ``AsyncStream``.
+
+    ``gaps[i]`` (seconds) is awaited before yielding chunk ``i`` — used to
+    simulate an inter-chunk stall the idle timeout must catch.
+    """
+
+    def __init__(self, chunks: list[Any], *, gaps: list[float] | None = None) -> None:
+        self._chunks = list(chunks)
+        self._gaps = list(gaps) if gaps is not None else [0.0] * len(chunks)
+        self._i = 0
+        self.closed = False
+
+    def __aiter__(self) -> "FakeStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._i >= len(self._chunks):
+            raise StopAsyncIteration
+        gap = self._gaps[self._i] if self._i < len(self._gaps) else 0.0
+        if gap:
+            await asyncio.sleep(gap)
+        chunk = self._chunks[self._i]
+        self._i += 1
+        return chunk
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeStreamingCompletionsAPI:
+    def __init__(self, streams: list[Any]) -> None:
+        self.streams = list(streams)
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        result = self.streams.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def fake_streaming_client(streams: list[Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeStreamingCompletionsAPI(streams))
+    )
+
+
+class TestAccumulateStreamChunks:
+    def test_text_fragments_concatenated(self) -> None:
+        resp = accumulate_stream_chunks(
+            [
+                stream_chunk(content="he"),
+                stream_chunk(content="llo"),
+                stream_chunk(finish_reason="stop"),
+            ]
+        )
+        translated = from_openai_response(resp)
+        assert translated.message.content == "hello"
+        assert translated.stop_reason is StopReason.END_TURN
+
+    def test_tool_calls_merged_by_index_across_chunks(self) -> None:
+        resp = accumulate_stream_chunks(
+            [
+                stream_chunk(
+                    tool_calls=[tc_delta(0, id="c1", name="bash", arguments='{"cmd"')]
+                ),
+                stream_chunk(tool_calls=[tc_delta(0, arguments=': "ls"}')]),
+                stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        translated = from_openai_response(resp)
+        assert translated.message.tool_calls == [
+            ToolCall(id="c1", name="bash", arguments={"cmd": "ls"})
+        ]
+        assert translated.stop_reason is StopReason.TOOL_USE
+
+    def test_two_parallel_tool_calls_kept_in_index_order(self) -> None:
+        resp = accumulate_stream_chunks(
+            [
+                stream_chunk(tool_calls=[tc_delta(0, id="a", name="one", arguments="{}")]),
+                stream_chunk(tool_calls=[tc_delta(1, id="b", name="two", arguments="{}")]),
+                stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        calls = from_openai_response(resp).message.tool_calls
+        assert [c.id for c in calls] == ["a", "b"]
+        assert [c.name for c in calls] == ["one", "two"]
+
+    def test_usage_captured_from_terminal_chunk(self) -> None:
+        usage = SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=42,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=700),
+        )
+        resp = accumulate_stream_chunks(
+            [stream_chunk(content="hi"), stream_chunk(finish_reason="stop", usage=usage)]
+        )
+        translated = from_openai_response(resp)
+        assert translated.usage.input_tokens == 300  # 1000 - 700 cached
+        assert translated.usage.output_tokens == 42
+        assert translated.usage.cache_read_tokens == 700
+
+    def test_content_less_stream_collapses_to_retryable_no_choices(self) -> None:
+        # A stream that yields only a usage chunk (no content, no tool calls, no
+        # finish_reason) is a transient empty reply — it must translate to the
+        # SAME retryable "no choices" error a non-streamed empty response does.
+        usage = SimpleNamespace(prompt_tokens=5, completion_tokens=0)
+        resp = accumulate_stream_chunks([stream_chunk(usage=usage)])
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert "no choices" in str(excinfo.value)
+        assert excinfo.value.retryable is True
+
+    def test_inline_error_chunk_preserved_for_translation(self) -> None:
+        resp = accumulate_stream_chunks(
+            [stream_chunk(error={"code": 429, "message": "rate limited"})]
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is True
+
+
+class TestStreamingComplete:
+    async def test_streams_text_and_requests_usage(self) -> None:
+        client = fake_streaming_client(
+            [
+                FakeStream(
+                    [
+                        stream_chunk(content="done"),
+                        stream_chunk(
+                            finish_reason="stop",
+                            usage=SimpleNamespace(
+                                prompt_tokens=7, completion_tokens=3
+                            ),
+                        ),
+                    ]
+                )
+            ]
+        )
+        adapter = OpenAICompatAdapter("kimi-k3", client=client)
+        result = await adapter.complete(
+            [Message(role=Role.USER, content="hi")], []
+        )
+        assert result.message.content == "done"
+        (kwargs,) = client.chat.completions.calls
+        assert kwargs["stream"] is True
+        assert kwargs["stream_options"] == {"include_usage": True}
+
+    async def test_streamed_tool_call_round_trips(self) -> None:
+        client = fake_streaming_client(
+            [
+                FakeStream(
+                    [
+                        stream_chunk(
+                            tool_calls=[
+                                tc_delta(0, id="c1", name="bash", arguments="")
+                            ]
+                        ),
+                        stream_chunk(
+                            tool_calls=[tc_delta(0, arguments='{"cmd": "ls"}')]
+                        ),
+                        stream_chunk(finish_reason="tool_calls"),
+                    ]
+                )
+            ]
+        )
+        adapter = OpenAICompatAdapter("m", client=client)
+        result = await adapter.complete(
+            [Message(role=Role.USER, content="hi")], []
+        )
+        assert result.message.tool_calls == [
+            ToolCall(id="c1", name="bash", arguments={"cmd": "ls"})
+        ]
+
+    async def test_slow_but_steady_stream_is_not_a_stall(self) -> None:
+        # Each chunk arrives just under the idle window: a long, slow-but-healthy
+        # generation must complete regardless of total wall time — the exact
+        # case a whole-call timeout wrongly guillotined.
+        chunks = [stream_chunk(content=str(i)) for i in range(6)]
+        chunks.append(stream_chunk(finish_reason="stop"))
+        client = fake_streaming_client(
+            [FakeStream(chunks, gaps=[0.03] * len(chunks))]
+        )
+        adapter = OpenAICompatAdapter(
+            "m", client=client, stream_idle_timeout=0.2
+        )
+        result = await adapter.complete(
+            [Message(role=Role.USER, content="hi")], []
+        )
+        assert result.message.content == "012345"
+
+    async def test_idle_stall_surfaces_retryable(self) -> None:
+        # A gap between chunks longer than the idle timeout is a stall.
+        stream = FakeStream(
+            [stream_chunk(content="a"), stream_chunk(content="b")],
+            gaps=[0.0, 0.3],
+        )
+        client = fake_streaming_client([stream])
+        adapter = OpenAICompatAdapter(
+            "m", client=client, stream_idle_timeout=0.1,
+            retry={"max_attempts": 1},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.retryable is True
+        assert "stalled" in str(excinfo.value)
+        assert stream.closed is True  # the stalled stream was closed, not leaked
+
+    async def test_stall_then_retry_succeeds(self) -> None:
+        # A transient stall on the first attempt self-heals on a fresh stream.
+        stalled = FakeStream([stream_chunk(content="x")], gaps=[0.3])
+        healthy = FakeStream(
+            [stream_chunk(content="recovered"), stream_chunk(finish_reason="stop")]
+        )
+        client = fake_streaming_client([stalled, healthy])
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        adapter = OpenAICompatAdapter(
+            "m", client=client, stream_idle_timeout=0.1,
+            retry={"sleep": fake_sleep, "jitter": lambda: 0.0},
+        )
+        result = await adapter.complete(
+            [Message(role=Role.USER, content="hi")], []
+        )
+        assert result.message.content == "recovered"
+        assert len(client.chat.completions.calls) == 2
+        assert sleeps == [1.0]
+
+    async def test_extra_body_forwarded_to_request(self) -> None:
+        # A reasoning/thinking control (or any gateway field) set on the adapter
+        # rides through as ``extra_body`` on every request.
+        client = fake_streaming_client(
+            [FakeStream([stream_chunk(content="ok"), stream_chunk(finish_reason="stop")])]
+        )
+        adapter = OpenAICompatAdapter(
+            "m", client=client, extra_body={"reasoning": {"effort": "low"}}
+        )
+        await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        (kwargs,) = client.chat.completions.calls
+        assert kwargs["extra_body"] == {"reasoning": {"effort": "low"}}
+
+    async def test_empty_stream_is_retryable(self) -> None:
+        stream = FakeStream(
+            [stream_chunk(usage=SimpleNamespace(prompt_tokens=5, completion_tokens=0))]
+        )
+        client = fake_streaming_client([stream])
+        adapter = OpenAICompatAdapter(
+            "m", client=client, retry={"max_attempts": 1}
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert "no choices" in str(excinfo.value)
+        assert excinfo.value.retryable is True

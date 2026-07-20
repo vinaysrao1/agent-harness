@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 from harness.adapters.base import AdapterError, ModelAdapter, retry_with_backoff
@@ -55,13 +56,25 @@ __all__ = [
     "to_openai_messages",
     "to_openai_tools",
     "from_openai_response",
+    "accumulate_stream_chunks",
     "map_finish_reason",
     "wrap_openai_error",
 ]
 
 #: Default per-request SDK timeout (seconds): bounds one hung call so it
 #: surfaces as a retryable timeout instead of blocking. Overridable per adapter.
+#: Used as the whole-call ceiling on the non-streaming path only.
 _DEFAULT_REQUEST_TIMEOUT = 120.0
+
+#: Default *idle* timeout (seconds) for the streaming path: the maximum gap
+#: allowed between successive streamed chunks (and to the first chunk). A
+#: healthy generation — however long and however slow the provider's
+#: throughput — keeps emitting tokens and never trips this; a genuine upstream
+#: stall (a live socket producing no bytes) trips it fast and surfaces as a
+#: retryable error. This is the fix for the failure mode where a *whole-call*
+#: timeout could not tell a slow-but-healthy long generation apart from a
+#: stall and guillotined both (see :meth:`OpenAICompatAdapter.complete`).
+_DEFAULT_STREAM_IDLE_TIMEOUT = 60.0
 
 #: Default wall-clock ceiling for the whole retry sequence of one ``complete()``
 #: call, passed through to :func:`retry_with_backoff`. Keeps
@@ -327,12 +340,130 @@ def from_openai_response(response: Any) -> ModelResponse:
     )
 
 
+def accumulate_stream_chunks(chunks: Any) -> Any:
+    """Reduce streamed ``chat.completions`` chunks into a full-response shape.
+
+    The streaming API delivers a completion as a sequence of delta chunks —
+    ``choices[0].delta.content`` fragments, ``choices[0].delta.tool_calls``
+    fragments (each carrying an ``index`` and partial ``id``/``function.name``/
+    ``function.arguments``), a terminal ``finish_reason``, and — when
+    ``stream_options={"include_usage": True}`` is requested — a final
+    usage-only chunk (``choices == []``). This function folds them back into an
+    object shaped exactly like a non-streamed response so
+    :func:`from_openai_response` can translate it **unchanged** — keeping one
+    translation path for both modes.
+
+    ``chunks`` is any iterable of duck-typed chunk objects (SDK objects or
+    same-shaped stand-ins). Text fragments are concatenated in arrival order;
+    tool-call fragments are merged by ``index`` (``id``/``name`` take the first
+    non-empty value, ``arguments`` fragments are concatenated). A stream that
+    yields no content, no tool calls, no ``finish_reason`` and no inline error
+    collapses to an empty ``choices`` list, so
+    :func:`from_openai_response` raises the same *retryable* "no choices" error
+    an empty non-streamed reply would — a content-less stream is a transient
+    fault, not a clean empty turn.
+    """
+    content_parts: list[str] = []
+    tool_frags: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
+    usage: Any = None
+    error: Any = None
+
+    for chunk in chunks:
+        chunk_error = getattr(chunk, "error", None)
+        if chunk_error:
+            error = chunk_error
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = chunk_usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        reason = getattr(choice, "finish_reason", None)
+        if reason is not None:
+            finish_reason = reason
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        piece = getattr(delta, "content", None)
+        if piece:
+            content_parts.append(piece)
+        for call in getattr(delta, "tool_calls", None) or []:
+            index = getattr(call, "index", 0) or 0
+            frag = tool_frags.setdefault(
+                index, {"id": None, "name": None, "arguments": ""}
+            )
+            call_id = getattr(call, "id", None)
+            if call_id:
+                frag["id"] = call_id
+            function = getattr(call, "function", None)
+            if function is not None:
+                name = getattr(function, "name", None)
+                if name:
+                    frag["name"] = name
+                arguments = getattr(function, "arguments", None)
+                if arguments:
+                    frag["arguments"] += arguments
+
+    # A stream carrying nothing usable is a transient empty reply: emit empty
+    # choices so translation raises the retryable "no choices" error, matching
+    # the non-streamed empty-response contract.
+    if not content_parts and not tool_frags and finish_reason is None and not error:
+        empty = SimpleNamespace(choices=[], usage=usage)
+        if error:
+            empty.error = error
+        return empty
+
+    tool_calls = [
+        SimpleNamespace(
+            id=tool_frags[index]["id"] or "",
+            function=SimpleNamespace(
+                name=tool_frags[index]["name"] or "",
+                arguments=tool_frags[index]["arguments"] or "",
+            ),
+        )
+        for index in sorted(tool_frags)
+    ]
+    message = SimpleNamespace(
+        content="".join(content_parts) if content_parts else None,
+        tool_calls=tool_calls or None,
+    )
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    response = SimpleNamespace(choices=[choice], usage=usage)
+    if error:
+        response.error = error
+    return response
+
+
+#: Substrings of exception *class names* that denote a transient transport
+#: fault worth retrying. These are the httpx/openai transport errors that can
+#: interrupt a call — and, because streaming reads the response body
+#: incrementally, are markedly more likely mid-stream than on a buffered
+#: whole-call read: a dropped/reset connection surfaces as ``ReadError`` or
+#: ``RemoteProtocolError`` partway through the token stream. A statusless
+#: transport error is transient by nature (the request may simply not have
+#: been served), so retrying is safe and correct; classifying ``ReadError`` as
+#: permanent forfeited whole trials on a single mid-stream blip.
+_TRANSIENT_ERROR_MARKERS = (
+    "Timeout",  # ReadTimeout, ConnectTimeout, PoolTimeout, APITimeoutError
+    "Connection",  # ConnectError, APIConnectionError
+    "ReadError",
+    "WriteError",
+    "ProtocolError",  # Remote/LocalProtocolError
+    "StreamError",
+    "IncompleteRead",
+)
+
+
 def wrap_openai_error(exc: Exception) -> AdapterError:
     """Wrap an SDK exception in an :class:`AdapterError` with ``retryable`` set.
 
     Classification: HTTP 408/429 and all 5xx are retryable; other statuses
-    (400 invalid request, 401 auth, ...) are not. Statusless connection or
-    timeout failures are retryable. Anything else is non-retryable.
+    (400 invalid request, 401 auth, ...) are not. Statusless transport faults
+    — connection errors, timeouts, and mid-stream read/protocol errors (see
+    :data:`_TRANSIENT_ERROR_MARKERS`) — are retryable. Anything else is
+    non-retryable.
     """
     if isinstance(exc, AdapterError):
         return exc
@@ -344,9 +475,11 @@ def wrap_openai_error(exc: Exception) -> AdapterError:
             retryable=retryable,
         )
     name = type(exc).__name__
-    if isinstance(exc, TimeoutError) or "Timeout" in name or "Connection" in name:
+    if isinstance(exc, TimeoutError) or any(
+        marker in name for marker in _TRANSIENT_ERROR_MARKERS
+    ):
         return AdapterError(
-            f"openai-compatible connection error: {exc}", retryable=True
+            f"openai-compatible transport error ({name}): {exc}", retryable=True
         )
     return AdapterError(f"openai SDK error: {name}: {exc}", retryable=False)
 
@@ -376,6 +509,9 @@ class OpenAICompatAdapter(ModelAdapter):
         client: Any | None = None,
         max_context: int = 128_000,
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+        stream: bool = True,
+        stream_idle_timeout: float = _DEFAULT_STREAM_IDLE_TIMEOUT,
+        extra_body: dict[str, Any] | None = None,
         retry: dict[str, Any] | None = None,
     ) -> None:
         if client is None:
@@ -389,13 +525,28 @@ class OpenAICompatAdapter(ModelAdapter):
             )
         self._client = client
         self._model = model
+        # Streaming (default) vs. whole-call mode. Streaming replaces the
+        # whole-call ``request_timeout`` deadline with a per-chunk *idle*
+        # timeout (:data:`_DEFAULT_STREAM_IDLE_TIMEOUT`), which is the only way
+        # to bound a genuine upstream stall *without* also killing a healthy
+        # long generation from a slow provider — a whole-call timeout cannot
+        # tell the two apart. Non-streaming mode is retained for endpoints or
+        # tests that do not stream; it keeps the hard whole-call backstop.
+        self._stream = stream
+        self._stream_idle_timeout = stream_idle_timeout
+        # Provider-specific request fields (e.g. a reasoning/thinking control)
+        # merged into every request's ``extra_body``. Kept out of the typed
+        # ``create`` kwargs so an arbitrary gateway field rides through the SDK
+        # untouched; an unsupported field is ignored by the gateway.
+        self._extra_body = extra_body
         # A hard per-attempt deadline enforced with asyncio.wait_for, so a
         # single in-flight call cannot outlive request_timeout even if the SDK
         # transport timeout fails to fire (a stalled-but-alive connection whose
         # read timeout keeps resetting) — the failure mode behind an observed
         # turns=0 900s hang. The SDK's own ``timeout`` (set on the client
         # above) still applies and normally fires first with a cleaner error;
-        # this is the guaranteed backstop at the same deadline.
+        # this is the guaranteed backstop at the same deadline. Streaming mode
+        # supersedes it with the idle timeout above.
         self._request_timeout = request_timeout
         # Default the retry sequence's wall-clock ceiling; an explicit
         # ``retry`` mapping may override it (or any other retry knob).
@@ -438,18 +589,32 @@ class OpenAICompatAdapter(ModelAdapter):
         }
         if tools:
             kwargs["tools"] = to_openai_tools(tools)
+        if self._extra_body:
+            # A per-call ``extra_body`` (rare) wins over the adapter default so
+            # a caller can still override, but both are preserved.
+            kwargs["extra_body"] = {**self._extra_body, **(kwargs.get("extra_body") or {})}
 
         async def _call() -> ModelResponse:
             try:
-                response = await asyncio.wait_for(
-                    self._client.chat.completions.create(**kwargs),
-                    timeout=self._request_timeout,
-                )
+                if self._stream:
+                    response = await self._consume_stream(kwargs)
+                else:
+                    response = await asyncio.wait_for(
+                        self._client.chat.completions.create(**kwargs),
+                        timeout=self._request_timeout,
+                    )
             except (asyncio.TimeoutError, TimeoutError) as exc:
+                # Streaming: no chunk arrived within the idle window (a stall on
+                # a live socket). Non-streaming: the whole call outlived the
+                # hard timeout. Both are transient — retry on a fresh call.
+                detail = (
+                    f"stalled: no data for {self._stream_idle_timeout}s"
+                    if self._stream
+                    else f"exceeded {self._request_timeout}s hard timeout "
+                    "(no response)"
+                )
                 raise AdapterError(
-                    f"model call exceeded {self._request_timeout}s hard "
-                    "timeout (no response)",
-                    retryable=True,
+                    f"model call {detail}", retryable=True
                 ) from exc
             except Exception as exc:
                 raise wrap_openai_error(exc) from exc
@@ -467,3 +632,45 @@ class OpenAICompatAdapter(ModelAdapter):
                 ) from exc
 
         return await retry_with_backoff(_call, **self._retry)
+
+    async def _consume_stream(self, kwargs: dict[str, Any]) -> Any:
+        """Drive one streamed completion, bounded by a per-chunk idle timeout.
+
+        Opens the stream (``stream=True`` plus ``stream_options`` to get a
+        final usage chunk) and pulls chunks, wrapping **each** await —
+        including the initial connect/first-chunk await — in
+        :func:`asyncio.wait_for` with :attr:`_stream_idle_timeout`. A healthy
+        generation keeps the gaps short and completes no matter how long it
+        runs in total; a stall (no bytes within the idle window) raises
+        :class:`asyncio.TimeoutError`, which :meth:`complete` turns into a
+        retryable :class:`AdapterError`. The stream is always closed, so a
+        timed-out or partially-read connection is not leaked. The accumulated
+        chunks fold back into a full-response shape
+        (:func:`accumulate_stream_chunks`) for the shared translation path.
+        """
+        idle = self._stream_idle_timeout
+        stream = await asyncio.wait_for(
+            self._client.chat.completions.create(
+                **kwargs, stream=True, stream_options={"include_usage": True}
+            ),
+            timeout=idle,
+        )
+        chunks: list[Any] = []
+        try:
+            iterator = stream.__aiter__()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=idle
+                    )
+                except StopAsyncIteration:
+                    break
+                chunks.append(chunk)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:  # pragma: no cover - best-effort cleanup
+                    pass
+        return accumulate_stream_chunks(chunks)
