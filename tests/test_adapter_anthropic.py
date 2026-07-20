@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -400,6 +401,26 @@ class TestComplete:
         assert excinfo.value.retryable is False
         assert len(client.messages.calls) == 1
 
+    async def test_hard_timeout_interrupts_hung_call(self) -> None:
+        # Parity with the OpenAI adapter: a single in-flight Messages call that
+        # outlives request_timeout is interrupted and raised as retryable.
+        class HungAPI:
+            calls = 0
+
+            async def create(self, **kwargs: Any) -> Any:
+                HungAPI.calls += 1
+                await asyncio.sleep(10.0)
+
+        client = SimpleNamespace(messages=HungAPI())
+        adapter = AnthropicAdapter(
+            "m", client=client, request_timeout=0.02, retry={"max_attempts": 1}
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.retryable is True
+        assert "hard timeout" in str(excinfo.value)
+        assert HungAPI.calls == 1
+
     def test_capabilities(self) -> None:
         adapter = AnthropicAdapter("m", client=fake_client([]))
         caps = adapter.capabilities
@@ -419,3 +440,18 @@ class TestComplete:
         assert str(adapter._client.base_url).startswith(
             "https://my-gateway.example/"
         )
+
+    def test_real_client_has_single_retry_layer_and_timeout(self) -> None:
+        # Same invariant as the OpenAI adapter: retry_with_backoff is the sole
+        # retrier (SDK max_retries=0) and a request timeout bounds hung calls.
+        adapter = AnthropicAdapter(
+            "claude-opus-4-8",
+            api_key="dummy-key",
+            request_timeout=90.0,
+        )
+        assert adapter._client.max_retries == 0
+        assert adapter._client.timeout == 90.0
+
+    def test_default_retry_config_bounds_wall_clock(self) -> None:
+        adapter = AnthropicAdapter("m", client=fake_client([]))
+        assert adapter._retry["max_elapsed"] == 300.0

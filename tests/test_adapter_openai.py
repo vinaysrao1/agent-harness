@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -238,9 +239,74 @@ class TestFromOpenAIResponse:
         with pytest.raises(AdapterError, match="non-object"):
             from_openai_response(resp)
 
-    def test_no_choices_rejected(self) -> None:
-        with pytest.raises(AdapterError, match="no choices"):
+    def test_no_choices_rejected_and_retryable(self) -> None:
+        # Empty choices is a transient upstream fault (e.g. OpenRouter under
+        # rate-limit returns HTTP 200 with []), so it must be retryable — a
+        # regression here silently kills whole tasks on a single blip.
+        with pytest.raises(AdapterError) as excinfo:
             from_openai_response(SimpleNamespace(choices=[], usage=None))
+        assert "no choices" in str(excinfo.value)
+        assert excinfo.value.retryable is True
+
+    def test_inline_provider_error_retryable_by_code(self) -> None:
+        # OpenRouter reports upstream faults as an inline error object on an
+        # HTTP 200 body; a 429 there means the same as an HTTP 429 → retry.
+        resp = SimpleNamespace(
+            choices=[], usage=None,
+            error={"code": 429, "message": "rate limited upstream"},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert "inline error" in str(excinfo.value)
+        assert "429" in str(excinfo.value)
+        assert excinfo.value.retryable is True
+
+    def test_inline_provider_error_non_retryable_client_code(self) -> None:
+        resp = SimpleNamespace(
+            choices=[], usage=None,
+            error={"code": 400, "message": "bad request upstream"},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is False
+
+    def test_inline_provider_error_without_code_defaults_retryable(self) -> None:
+        resp = SimpleNamespace(
+            choices=[], usage=None, error={"message": "something transient"}
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is True
+
+    def test_inline_error_object_attribute_style(self) -> None:
+        # Duck-typed: some SDK stand-ins expose error as an object, not a dict.
+        resp = SimpleNamespace(
+            choices=[], usage=None,
+            error=SimpleNamespace(code=503, message="upstream down"),
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is True
+
+    def test_inline_error_wins_over_present_choices(self) -> None:
+        # A gateway may return BOTH an error object and (stale/partial) choices;
+        # the error must take precedence so a fault is never silently parsed.
+        good_choice = fake_response(content="ignore me").choices[0]
+        resp = SimpleNamespace(
+            choices=[good_choice], usage=None,
+            error={"code": 429, "message": "rate limited"},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is True
+
+    def test_falsy_error_field_is_ignored(self) -> None:
+        # error: null and error: {} are not faults — the response parses normally.
+        for empty in (None, {}, ""):
+            resp = fake_response(content="fine")
+            resp.error = empty
+            result = from_openai_response(resp)
+            assert result.message.content == "fine"
 
     def test_missing_usage_details_default_zero(self) -> None:
         resp = fake_response(
@@ -429,6 +495,108 @@ class TestComplete:
         assert excinfo.value.retryable is False
         assert len(client.chat.completions.calls) == 1
 
+    async def test_empty_choices_response_is_retried(self) -> None:
+        # Regression for the production failure: an HTTP-200 empty-choices
+        # reply must be retried (translation happens inside the retried call),
+        # not raised straight out and killing the run.
+        empty = SimpleNamespace(choices=[], usage=None)
+        client = fake_client([empty, fake_response(content="recovered")])
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        adapter = OpenAICompatAdapter(
+            "m", client=client, retry={"sleep": fake_sleep, "jitter": lambda: 0.0}
+        )
+        result = await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert result.message.content == "recovered"
+        assert len(client.chat.completions.calls) == 2
+        assert sleeps == [1.0]
+
+    async def test_inline_gateway_error_response_is_retried(self) -> None:
+        err = SimpleNamespace(
+            choices=[], usage=None,
+            error={"code": 429, "message": "upstream rate limit"},
+        )
+        client = fake_client([err, fake_response(content="ok")])
+
+        async def fake_sleep(_delay: float) -> None:
+            pass
+
+        adapter = OpenAICompatAdapter(
+            "m", client=client, retry={"sleep": fake_sleep, "jitter": lambda: 0.0}
+        )
+        result = await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert result.message.content == "ok"
+        assert len(client.chat.completions.calls) == 2
+
+    async def test_empty_choices_exhaustion_reraises_retryable(self) -> None:
+        # If every attempt returns empty choices, the final error still carries
+        # retryable=True (it was transient; we just ran out of attempts).
+        empties = [SimpleNamespace(choices=[], usage=None) for _ in range(3)]
+        client = fake_client(empties)
+
+        async def fake_sleep(_delay: float) -> None:
+            pass
+
+        adapter = OpenAICompatAdapter(
+            "m", client=client,
+            retry={"max_attempts": 3, "sleep": fake_sleep, "jitter": lambda: 0.0},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.retryable is True
+        assert len(client.chat.completions.calls) == 3
+
+    async def test_hard_timeout_interrupts_hung_call(self) -> None:
+        # Regression for the observed turns=0 900s hang: a single in-flight
+        # call that outlives request_timeout must be interrupted and surfaced
+        # as a retryable error, not awaited indefinitely (the SDK/httpx
+        # transport timeout is not trusted to fire on a stalled connection).
+        class HungAPI:
+            calls = 0
+
+            async def create(self, **kwargs: Any) -> Any:
+                HungAPI.calls += 1
+                await asyncio.sleep(10.0)  # far longer than request_timeout
+                return fake_response()
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=HungAPI()))
+        adapter = OpenAICompatAdapter(
+            "m", client=client, request_timeout=0.02, retry={"max_attempts": 1}
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.retryable is True
+        assert "hard timeout" in str(excinfo.value)
+        assert HungAPI.calls == 1
+
+    def test_default_retry_config_bounds_wall_clock(self) -> None:
+        # The adapter defaults a retry budget so request_timeout × max_attempts
+        # cannot silently overrun an upstream agent deadline.
+        adapter = OpenAICompatAdapter("m", client=fake_client([]))
+        assert adapter._retry["max_elapsed"] == 300.0
+        # An explicit retry mapping still overrides it.
+        override = OpenAICompatAdapter(
+            "m", client=fake_client([]), retry={"max_elapsed": 42.0}
+        )
+        assert override._retry["max_elapsed"] == 42.0
+
+    async def test_malformed_tool_json_not_retried(self) -> None:
+        # Non-retryable translation errors must still fail fast even though
+        # translation now runs inside the retried call.
+        bad = fake_response(
+            content=None,
+            tool_calls=[fake_tool_call("c1", "bash", '{"cmd": ')],
+            finish_reason="tool_calls",
+        )
+        client = fake_client([bad, fake_response(content="unreached")])
+        adapter = OpenAICompatAdapter("m", client=client)
+        with pytest.raises(AdapterError, match="malformed JSON"):
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert len(client.chat.completions.calls) == 1
+
     def test_capabilities(self) -> None:
         adapter = OpenAICompatAdapter("m", client=fake_client([]))
         caps = adapter.capabilities
@@ -445,3 +613,16 @@ class TestComplete:
             base_url="https://api.moonshot.ai/v1",
         )
         assert str(adapter._client.base_url).startswith("https://api.moonshot.ai/v1")
+
+    def test_real_client_has_single_retry_layer_and_timeout(self) -> None:
+        # The SDK must not add its own retry layer (retry_with_backoff is the
+        # sole retrier, DESIGN.md §4.1), and a request timeout must bound hung
+        # calls so they fail fast as retryable timeouts.
+        adapter = OpenAICompatAdapter(
+            "kimi-k3",
+            api_key="dummy-key",
+            base_url="https://openrouter.ai/api/v1",
+            request_timeout=90.0,
+        )
+        assert adapter._client.max_retries == 0
+        assert adapter._client.timeout == 90.0
