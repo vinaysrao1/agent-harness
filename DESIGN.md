@@ -456,6 +456,15 @@ the last line of defense.
    scheduled consolidation with skill distillation. *Exit: an ALE score exists
    (any score — it's the baseline for "smarter over time"); a skill distilled
    from episodes measurably improves a repeat task.*
+8. **M8 — Efficiency + self-improvement (see §10):** split into **M8a**
+   (batteries-included, lands as one batch after the current Terminal-Bench
+   baseline run: parallel-batching prompt, dead-capability cleanup, output
+   shaping, duration instrumentation, self-verifying diligence) and **M8b**
+   (blocked on prerequisites: `python_exec` behind a §4.11 permission decision,
+   and the B2→B6 failure-learning chain behind the M6 eval runner + a new
+   reward-ingestion path). *Exit (M8a): tokens/task down at equal-or-better pass
+   rate. Exit (M8b): a pass-rate gain that survives the held-out promotion
+   gate.*
 
 ## 8. Expected performance vs. production harnesses (calibration guesses)
 
@@ -489,6 +498,280 @@ initially vs ~25% frontier.
 6. **Consolidation trust** — when does skill distillation graduate from
    user-reviewed drafts to auto-commit? (Proposal: when eval pass rate with
    auto-distilled skills ≥ pass rate without, over two consecutive suites.)
+   *Design resolved in §10.3 B6 (eval-gated promotion); pending implementation.*
 7. **ALE task selection** — which command-line-subset tasks to license/pull
    first, and does the harness need any capability (e.g., long-file editing,
    spreadsheet output) those tasks assume?
+
+## 10. Planned improvements — M8 (efficiency + self-improvement)
+
+**Status: TO DO. Not yet implemented.** This section aggregates the design
+work from two analyses (tool-use/efficiency and failure-understanding) into a
+planned changeset, landed *after* the current Terminal-Bench baseline run
+completes so the baseline is frozen and the before/after delta is attributable
+(§10.6).
+
+M8 has two workstreams. **A (efficiency)** makes the agent spend fewer tokens
+and fewer round-trips per task. **B (self-improvement)** lets the harness
+notice, classify, and learn from its own failures.
+
+**Reality check on batching (revised after design review).** These do *not* all
+land in one shot, because B has hard prerequisites that do not exist yet. The
+batch therefore splits:
+
+- **M8a (ready now, one batch):** A1, A3, A4, A5, B1. All are self-contained
+  against the code as built.
+- **M8b (blocked on prerequisites):** A2 (needs its own permission-surface
+  decision, §4.11 amendment) and the entire B2→B6 chain. **B2–B6 cannot start
+  until two things are built that DESIGN.md still lists as future work:** the
+  **M6 internal eval runner** (fixtures, grading, N-trial reruns) *and* a new
+  **reward-ingestion path** that feeds an external verifier's pass/fail back
+  into the harness. Neither exists today — see §10.0.
+
+### 10.0 Prerequisites for workstream B (must be built first)
+
+Workstream B learns from failure, which requires *knowing* a run failed. The
+harness knows its own internal outcome (`error` / `paused_budget` / `completed`)
+but has **no channel for an external verifier's verdict**. Critically, the
+Harbor adapter (`integrations/harbor_agent.py`) is **write-only**: `HarnessAgent.run`
+returns `None` and only writes tokens/metadata *into* Harbor's `AgentContext`;
+Harbor computes pass/fail externally, *after* the agent returns, and that score
+never re-enters the harness process. So the "completed-but-wrong" case — the
+costliest blind spot B exists to close — is exactly the one the harness cannot
+currently observe.
+
+Two prerequisites, both currently listed as unbuilt (M6/M7):
+
+- **P1 — Internal eval runner (part of M6).** Load a task fixture, run the
+  harness against it, execute a grading script, report pass/fail over N trials.
+  §4.13 describes this in the future tense; there is no `eval` CLI subcommand
+  and no `evals/` directory today.
+- **P2 — Reward-ingestion path (new).** A way for a verifier's pass/fail to
+  reach the harness and be stored against the run — so B2 can fire on
+  `reward = 0` and B3 can compare reruns. This is genuinely new plumbing, not a
+  by-product of the Harbor adapter.
+
+Until P1 and P2 exist, only B1 (self-verification, which needs neither) is
+buildable.
+
+### 10.1 Framing: which problems are the model's vs the harness's
+
+A recurring question this design answers explicitly. Two axes are often
+conflated:
+
+- **Orchestration locus** ("coding vs tool-calling harness"): does the model
+  take one discrete tool step per model round-trip (current design), or write
+  code that itself loops/filters/calls in a single round-trip? This is a
+  **harness** decision — see A2.
+- **Grounding** ("does the agent verify beliefs against real signal"): are
+  claims (tests pass, file exists) checked against execution before being
+  trusted? This is *partly* a harness decision — see B1. The base system prompt
+  already commits to evidence-based completion (§4.9), so the harness is
+  grounding-first in intent; B1 hardens intent into enforcement.
+
+Ownership split, to set expectations:
+
+| Concern | Model's share | Harness's share |
+|---|---|---|
+| Picking the right tool | Large (reads schemas, decides) | Shapes the decision space: tool count, description clarity (A4) |
+| Token efficiency | Small (inherent verbosity) | **Large** — tool output shape and round-trip count are harness decisions (A2, A4) |
+| Parallelism / latency | Model must *emit* parallel calls | Harness must *dispatch* them, *prompt* for them, and *respect* per-model capability (A1, A3) |
+
+### 10.2 Workstream A — tool use & efficiency
+
+**A1 — Prompt for parallel tool-call batching.** *Effort: XS (prompt only).*
+The loop already dispatches concurrent tool calls correctly via
+`asyncio.gather` (`loop.py`), but `_BASE_RULES` (`orchestrator.py`) never tells
+the model that batching independent calls is preferred. Add a rule: *emit all
+independent tool calls in one response; only serialize when one call's output
+feeds the next.* Pure prompt change, no code path affected.
+
+**A2 — Add a `python_exec` code-execution tool.** *Effort: M. Deferred to M8b —
+carries a live permission decision.* Today's compute primitives run one action
+per tool call; a *dependent* N-step operation costs N round-trips (independent
+steps can already batch — see A1). A sandboxed `python_exec` tool lets the model
+write code that loops, filters, and aggregates host-side in a single
+round-trip — replacing five *sequential* `bash` calls with one, and returning
+three grepped lines instead of a whole file. Keep `bash`/`read_file`/`edit_file`
+for cases where **per-step event-log legibility** matters: each `bash` call is
+one recorded, individually inspectable `tool_call`/`decision`/`tool_result`
+event, whereas a `python_exec` body that shells out several times collapses
+into one opaque event. (Note this is a *legibility* distinction, not a
+permission one — `bash` is `side_effect=False` and therefore already
+auto-allowed in gated mode, never ASK-gated; so is any per-step shell-out.)
+
+**Permission decision this forces (why A2 is M8b, not M8a):** §4.11 draws
+`side_effect=False` = "contained → auto-allow" carefully at *external* state.
+Auto-allowing arbitrary Python that can itself shell out to anything in the
+sandbox widens that auto-allow surface. `python_exec` must therefore get its
+**own `ToolMeta`**, not reuse `_NOT_SIDE_EFFECTING`, and §4.11 needs an explicit
+amendment deciding whether arbitrary in-sandbox code stays auto-allowed in gated
+mode or becomes ASK. The sandbox network policy (§4.7) is the outer bound, but
+allowlist-mode enforcement is itself still partial (§4.7), so it cannot be
+leaned on as the sole containment. This adds a coding *option*; it does not make
+the harness coding-first.
+
+**A3 — Wire up (or delete) the `parallel_tool_calls` capability.** *Effort: S.
+Removes dead code.* `Capabilities.parallel_tool_calls` is declared
+(`types.py`), its docstring claims the harness "serializes tool calls when
+False," yet all three adapters hardcode `True` and nothing ever reads the flag.
+It is dead code whose own documentation is false. Two acceptable resolutions:
+(a) **honor it** — when an adapter reports `False`, the loop dispatches that
+turn's tool calls sequentially and the context manager notes it; or (b)
+**delete it** and drop the false docstring. Pick (a) only if/when a real
+model that can't parallelize is added (§9.5); until then (b) is honest. Either
+way the current lying state is resolved.
+
+**A4 — Shape tool output, not just cap it.** *Effort: S.* Two content-blind
+truncations exist today and neither is a *design*: the sandbox caps `bash`
+stdout **and** stderr at 100 KB each (`sandbox/base.py`), and the tool registry
+head-truncates *every* result — including `read_file` — at 50 KB
+(`tools/registry.py`). So large-file reads are already silently cut mid-content.
+Give `read_file` a line-range / grep mode so whole-file reads stop being the
+default, and review each tool's result formatting for token waste. Complements
+A2.
+
+**A5 — Per-turn wall-clock instrumentation.** *Effort: S.* The `usage` table
+has a `created_at` timestamp but no per-turn **duration**. Add elapsed time per
+turn so "slow because the model was verbose" separates from "slow because the
+task needed more steps." Prerequisite for measuring A1's latency win at all
+(§10.6) — though note wall-clock is dominated by provider-side model latency, so
+tokens/turn stays the more robust signal.
+
+### 10.3 Workstream B — failure understanding & self-improvement
+
+The harness records *what happened* exhaustively (§4.10) but almost nothing
+about *whether it was right*. The costliest blind spot: a run that finishes
+cleanly, passes the diligence check, and returns `completed` — but an external
+verifier scores it wrong — is today indistinguishable from a success in every
+table the harness writes. B closes that gap as a pipeline:
+**capture → verify flaky vs real → classify → cluster → gate → promote.**
+
+**B1 — Harden diligence into self-verification.** *Effort: S. Highest
+value-per-effort; the one B item buildable now (no P1/P2 dependency).*
+`looks_unfinished()` (`diligence.py`) is a text heuristic scanning the model's
+prose for confidence. Harden the *existing* evidence intent (rule 2 of
+`_BASE_RULES` already says "claims get re-checked"; `task_update` already has an
+`evidence` field) into enforcement: require the model to **declare a
+verification command** for checkable claims (via the ledger's evidence field or
+a small tool), and have the loop **re-execute that declared command** before
+accepting `completed`. The mechanism sidesteps the hard "infer the check from a
+free-form goal" problem by making the model state the check, then holding it to
+its own claim. Bounded by the existing nudge cap.
+
+**B2 — Structured failure capture (`FailureRecord`).** *Effort: S. Blocked on
+P2 for its headline case.* Write a `FailureRecord` (task, run_id, status,
+verifier output if any, event references) into a new persistence table.
+On internal `status ∈ {error, paused_budget}` this works immediately. But the
+*costliest* case — `completed` yet `reward = 0` — can only fire once the
+**reward-ingestion path (P2)** exists; without it, B2 structurally cannot
+capture the blind spot B was built to close. Pure plumbing, no model call. New
+module (proposed `diagnostics.py`).
+
+**B3 — Flaky vs deterministic classification.** *Effort: S. Depends on P1.*
+Reruns are an *eval-runner* orchestration concern — `HarnessAgent.run` executes
+one trial and cannot re-invoke itself — so this lives in the M6 eval runner, not
+the loop. Rerun a failing trial K times; tag *flaky* only if it passes on a
+defined fraction (not merely "any rerun," which drops genuinely-nondeterministic
+failures from the taxonomy). K and the threshold are a policy to fix when P1 is
+built. Keeps B5 from learning patterns out of noise.
+
+**B4 — Post-mortem agent.** *Effort: M. Depends on B2. The one genuinely new
+agent role.* A dedicated prompt reads one `FailureRecord`'s full transcript and
+returns a root-cause tag with **cited event references** (evidence, not vibes),
+written as a tagged episode. **Schema note:** `MemoryStore.write_episode`
+currently has fixed frontmatter (slug/date/title/outcome) and **no
+category/tag field** — B4 requires extending the episode schema with a queryable
+`category` (and tool/task-type tags) and a list-by-category API, which B5 then
+queries. That schema extension is part of B4's scope, not a given. Deliberately
+a *fresh* read, not the call that ran the task. Proposed taxonomy:
+`misunderstood-goal`, `tool-misuse`, `environment-gap`, `premature-completion`,
+`context-loss`, `budget-exhaustion`, `harness-bug` — the last is first-class, so
+the loop can say a failure was *ours* rather than blame the model.
+
+**B5 — Cross-run failure clustering.** *Effort: M. Depends on B4's tag schema
+and P1.* After an eval suite, group failure episodes by category / tool /
+task type to surface patterns ("23% of failures are the same wrong flag on the
+same command"). One mistake is noise; the same mistake across runs is signal
+worth encoding once.
+
+**B6 — Eval-gated skill & anti-pattern promotion.** *Effort: M–L. Depends on
+B5, plus M7's consolidation loop and anti-pattern store (both unbuilt).*
+Consolidation drafts a skill or anti-pattern note from a cluster
+(provenance-linked to source episodes), but **auto-commits only if it improves
+pass rate on a held-out regression subset across two consecutive runs** —
+otherwise the draft waits for manual review. This makes unattended learning safe
+rather than a slow way to overfit a fix to a problem that wasn't really there.
+Resolves open question §9.6. Note this transitively pulls in most of M7 plus a
+defined held-out regression subset that does not exist yet.
+
+### 10.4 Anti-patterns store (procedural memory, failure side)
+
+B4/B5 produce not just "how to do X" skills but "what *not* to do" notes
+(§4.4.3's anti-patterns, still unbuilt). These load alongside the relevant
+skill so the agent sees the landmine before stepping on it. Distilled the same
+way and gated the same way (B6).
+
+### 10.5 Sequencing & dependencies
+
+**M8a — build now, one batch (all self-contained against the code as built):**
+A1, A3, A4, A5, B1. This is the changeset that lands right after the baseline
+run.
+
+**M8b — build after prerequisites:**
+- **A2** — needs the §4.11 permission-surface decision resolved first
+  (own `ToolMeta`, gated-mode policy for arbitrary in-sandbox code).
+- **P1, P2** (§10.0) — the M6 eval runner and the reward-ingestion path. Gate
+  the entire B chain.
+- **B2 → {B3, B4} → B5 → B6** is a strict dependency chain on top of P1/P2:
+  capture before classification, classification before clustering, clustering
+  before promotion. B4 also owns the episode-tag schema extension; B6 also pulls
+  in M7's consolidation loop and anti-pattern store.
+
+So "one shot after the baseline run" is accurate only for **M8a + the reward
+path is not yet available**; the honest sequence is *M8a now → build P1/P2 and
+resolve A2's permission question → M8b*.
+
+### 10.6 How we measure whether M8 helped
+
+The current Terminal-Bench run establishes the frozen baseline: **pass rate and
+tokens/task** for `agent-harness + Kimi K3` (plus wall-clock/task once A5 lands,
+treated as a soft signal — see below). Success criteria, stated in advance so
+they can't be rationalized after:
+
+- **M8a / A workstream:** tokens/task **down** at equal-or-better pass rate;
+  wall-clock/task **down** as a secondary signal. Tokens/task is the primary
+  metric — wall-clock is dominated by provider-side API latency (Kimi K3 jitter)
+  and must be read as a trend across enough trials to average that variance out,
+  not a single-run number.
+- **M8a / B1:** does self-verification *reduce* the completed-but-wrong rate?
+  This is only measurable once P2 gives us an external reward to compare against
+  — so B1 ships in M8a but its *evaluation* waits for the reward path. (B1 is
+  still worth shipping early; it just can't be scored until then.)
+- **M8b / B workstream:** measurable only after P1/P2, over *two* eval cycles —
+  cycle 1 produces classified failures and skill drafts; cycle 2 shows whether
+  eval-gated promotions (B6) moved pass rate. A B win is a pass-rate gain that
+  survives the held-out gate.
+
+### 10.7 M8 To-Do checklist
+
+Prerequisites (block M8b): **P1** internal eval runner (M6) · **P2**
+reward-ingestion path (new).
+
+| ID | Item | Phase | Effort | Blocked on | Touches |
+|----|------|-------|--------|-----------|---------|
+| A1 | Prompt for parallel batching | M8a | XS | — | `orchestrator.py` `_BASE_RULES` |
+| A3 | Honor or delete `parallel_tool_calls` (dead code) | M8a | S | — | `types.py`, adapters, `loop.py` |
+| A4 | `read_file` range/grep mode; output shaping | M8a | S | — | `tools/builtin.py` |
+| A5 | Per-turn duration instrumentation | M8a | S | — | `persistence.py`, `loop.py` |
+| B1 | Harden diligence into self-verification | M8a | S | — | `diligence.py`, `loop.py`, `tools/builtin.py` |
+| A2 | `python_exec` code-execution tool | M8b | M | §4.11 decision | `tools/builtin.py`, sandbox, `permissions.py` |
+| B2 | `FailureRecord` structured capture | M8b | S | P2 (for headline case) | new `diagnostics.py`, `persistence.py` |
+| B3 | Flaky vs deterministic classification | M8b | S | P1 | eval runner |
+| B4 | Post-mortem agent + episode-tag schema | M8b | M | B2 | new; `memory/store.py` (schema ext.) |
+| B5 | Cross-run failure clustering | M8b | M | B4, P1 | new; eval runner |
+| B6 | Eval-gated skill/anti-pattern promotion | M8b | M–L | B5, M7 | `memory` consolidation (§4.4.4) |
+
+**Landing plan:** M8a (A1, A3, A4, A5, B1) ships as the single batch after the
+current Terminal-Bench baseline run. M8b items land as their prerequisites
+(A2's permission decision; P1/P2; M7) are built.
