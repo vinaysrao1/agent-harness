@@ -112,7 +112,13 @@ Core rules, in priority order (harness rules > user instructions > all else):
    (host path: {workspace}). File paths passed to tools are relative to the
    workspace root; artifacts you write there survive the run.
 5. Permission mode: {mode}. Some tool calls may require user approval; a
-   denied call is an answer, not an obstacle to route around."""
+   denied call is an answer, not an obstacle to route around.
+6. Work through tools, not prose. Act — read, write, run — instead of
+   narrating what you are about to do. Keep any text you emit terse: no
+   step-by-step play-by-play, no restating tool output, no long plans or
+   preambles. Think only as much as the step needs, then take the action.
+   You are on a clock; tokens spent on commentary are tokens not spent
+   solving the task, and a slow model makes verbosity expensive."""
 
 #: System prompt for the (same-adapter, v1) compaction summarizer call.
 _SUMMARIZER_SYSTEM = (

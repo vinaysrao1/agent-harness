@@ -9,6 +9,7 @@ where a real sandbox tool is exercised — :class:`LocalSandbox` on
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,15 +44,24 @@ def resp(
     content: str | None = None,
     calls: list[ToolCall] | None = None,
     usage: Usage | None = None,
+    stop_reason: StopReason | None = None,
 ) -> ModelResponse:
-    """Build one scripted assistant response."""
+    """Build one scripted assistant response.
+
+    ``stop_reason`` defaults to TOOL_USE when there are tool calls else
+    END_TURN; pass it explicitly to script a truncated turn (MAX_TOKENS).
+    """
     tool_calls = calls or []
+    if stop_reason is None:
+        stop_reason = (
+            StopReason.TOOL_USE if tool_calls else StopReason.END_TURN
+        )
     return ModelResponse(
         message=Message(
             role=Role.ASSISTANT, content=content, tool_calls=tool_calls
         ),
         usage=usage or Usage(),
-        stop_reason=StopReason.TOOL_USE if tool_calls else StopReason.END_TURN,
+        stop_reason=stop_reason,
     )
 
 
@@ -119,6 +129,7 @@ def make_harness(
     budgets: Budgets | None = None,
     ask_answer: bool = True,
     context: ContextManager | None = None,
+    clock: "Callable[[], float] | None" = None,
 ) -> Harness:
     """Wire a full AgentLoop from real lower layers on ``tmp_path``."""
     store = RunStore(tmp_path / "state.db")
@@ -152,6 +163,7 @@ def make_harness(
         budgets or Budgets(),
         ask,
         model="fake-model",
+        **({"clock": clock} if clock is not None else {}),
     )
     return Harness(
         loop=loop,
@@ -835,3 +847,147 @@ class TestResultModel:
             AgentResult(
                 status="exploded", final_text=None, usage=Usage(), turns=0
             )
+
+
+# ---------------------------------------------------------------------------
+# Per-call output cap + wall-clock wind-down
+# ---------------------------------------------------------------------------
+
+
+class TestMaxOutputTokens:
+    async def test_cap_passed_through_as_max_tokens(
+        self, tmp_path: Path
+    ) -> None:
+        h = make_harness(
+            tmp_path,
+            [resp(CLEAN_FINISH)],
+            budgets=Budgets(max_output_tokens=1234),
+        )
+        await h.loop.run(GOAL)
+        assert h.adapter.calls[0].params == {"max_tokens": 1234}
+
+    async def test_no_cap_by_default(self, tmp_path: Path) -> None:
+        h = make_harness(tmp_path, [resp(CLEAN_FINISH)])
+        await h.loop.run(GOAL)
+        assert "max_tokens" not in h.adapter.calls[0].params
+
+
+class TestWallClockWindDown:
+    def _clock(self, values: list[float]) -> Callable[[], float]:
+        """A clock returning ``values`` in order, then repeating the last."""
+        it = iter(values)
+        last = values[-1]
+
+        def clock() -> float:
+            nonlocal last
+            last = next(it, last)
+            return last
+
+        return clock
+
+    async def test_reminder_injected_when_deadline_near_and_nudge_suppressed(
+        self, tmp_path: Path
+    ) -> None:
+        # start=0, then the turn-1 check reads 90 → 10s of a 100s budget left
+        # (below the 0.2 threshold), so wind-down fires. The final message
+        # "looks unfinished" (promises future work) but the nudge is suppressed
+        # once wound down, so the run completes on turn 1 rather than looping.
+        clock = self._clock([0.0, 90.0])
+        h = make_harness(
+            tmp_path,
+            [resp("I will keep going after this.")],
+            budgets=Budgets(wall_clock_seconds=100.0),
+            clock=clock,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 1
+        # The wind-down bookkeeping event landed once...
+        wind_downs = h.events("wind_down")
+        assert len(wind_downs) == 1
+        assert wind_downs[0]["remaining_seconds"] == pytest.approx(10.0)
+        # ...and the reminder reached the model on that turn's call.
+        turn1_texts = [
+            m.content for m in h.adapter.calls[0].messages if m.content
+        ]
+        assert any("approaching your hard time limit" in t for t in turn1_texts)
+        # No diligence nudge was injected (it was suppressed by wind-down).
+        assert h.events("nudge") == []
+
+    async def test_no_wind_down_when_budget_unset(self, tmp_path: Path) -> None:
+        # Even with a clock far past any deadline, no wall_clock_seconds means
+        # no wind-down event and normal behaviour.
+        clock = self._clock([0.0, 100_000.0])
+        h = make_harness(
+            tmp_path,
+            [resp(CLEAN_FINISH)],
+            clock=clock,
+        )
+        result = await h.loop.run(GOAL)
+        assert result.status == "completed"
+        assert h.events("wind_down") == []
+
+
+# ---------------------------------------------------------------------------
+# Truncated-turn continuation (output-token cap hit with no action)
+# ---------------------------------------------------------------------------
+
+
+class TestTruncationContinue:
+    async def test_truncated_actionless_turn_is_continued_not_finished(
+        self, tmp_path: Path
+    ) -> None:
+        # Turn 1 hit the output cap mid-thought (MAX_TOKENS) with no tool call
+        # and an empty message; the loop must re-prompt to act rather than
+        # accept the empty turn as the final answer.
+        script = [
+            resp(content=None, stop_reason=StopReason.MAX_TOKENS),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert result.turns == 2
+        assert len(h.events("truncation_continue")) == 1
+        # The reminder reached the model on the retry turn.
+        turn2_texts = [m.content for m in h.adapter.calls[1].messages if m.content]
+        assert any("cut off at the output-token limit" in t for t in turn2_texts)
+
+    async def test_truncation_continues_are_bounded(self, tmp_path: Path) -> None:
+        # A model that truncates every turn cannot loop forever: after
+        # MAX_TRUNCATION_CONTINUES the truncated turn is accepted as final.
+        from harness.loop import MAX_TRUNCATION_CONTINUES
+
+        script = [
+            resp(content="still thinking", stop_reason=StopReason.MAX_TOKENS)
+            for _ in range(MAX_TRUNCATION_CONTINUES + 1)
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == MAX_TRUNCATION_CONTINUES + 1
+        assert len(h.events("truncation_continue")) == MAX_TRUNCATION_CONTINUES
+
+    async def test_truncated_turn_with_tool_call_dispatches_normally(
+        self, tmp_path: Path
+    ) -> None:
+        # MAX_TOKENS but a complete tool call is present → the tool path runs;
+        # the truncation guard only fires when no action was produced.
+        script = [
+            resp(
+                content=None,
+                calls=[call("c1", "echo", text="hi")],
+                stop_reason=StopReason.MAX_TOKENS,
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.events("truncation_continue") == []
+        assert len(h.events("tool_result")) == 1

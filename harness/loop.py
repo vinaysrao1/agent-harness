@@ -36,6 +36,7 @@ Loop shape per turn:
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from typing import Literal
 
@@ -50,6 +51,7 @@ from harness.tools.registry import ToolRegistry
 from harness.types import (
     Message,
     Role,
+    StopReason,
     ToolCall,
     ToolResult,
     Usage,
@@ -73,14 +75,68 @@ _CLOSED_TASK_STATUSES = frozenset(
     {"done", "completed", "complete", "cancelled", "canceled", "closed"}
 )
 
+#: Max consecutive-independent times the loop re-prompts a turn that hit the
+#: output-token cap (``stop_reason == MAX_TOKENS``) without producing a tool
+#: call. Bounds a model that spends its whole per-call budget thinking and
+#: emits nothing actionable, so it cannot loop forever; after this many the
+#: truncated turn is accepted like any other final answer.
+MAX_TRUNCATION_CONTINUES: int = 3
+
+#: Injected when a turn is cut off at the output-token cap with no action taken
+#: (see :data:`MAX_TRUNCATION_CONTINUES`). Steers the model to act rather than
+#: keep thinking, since the cap means the previous turn produced nothing usable.
+TRUNCATION_REMINDER: str = (
+    "<system-reminder>\n"
+    "Your previous response was cut off at the output-token limit before you "
+    "produced a tool call or a complete answer — you spent the whole turn "
+    "thinking. Be decisive now: take the next concrete action with a tool "
+    "call (write the file, run the command), keeping any prose minimal.\n"
+    "</system-reminder>"
+)
+
+#: Fraction of ``wall_clock_seconds`` remaining at which the loop injects the
+#: one-time wind-down reminder (below): with 900s and 0.2, the reminder lands
+#: once ≤180s remain. Chosen to leave the agent one or two turns to land a
+#: best-effort answer on disk before an external deadline (e.g. a benchmark
+#: harness's per-agent timeout) kills the trial mid-turn.
+WIND_DOWN_FRACTION = 0.2
+
+#: Injected once as a user message when the wall-clock budget is nearly spent.
+#: Unlike the diligence nudge (which pushes the agent to keep working), this
+#: tells it to *stop* and finalize — a working partial answer on disk beats a
+#: perfect one that is never written before the deadline. Format with
+#: ``remaining=`` and ``budget=`` (whole seconds).
+WIND_DOWN_REMINDER: str = (
+    "<system-reminder>\n"
+    "You are approaching your hard time limit ({remaining}s of {budget}s "
+    "remain). Stop exploring and do not start new lines of work. Right now, "
+    "make sure your best current solution is fully written to the expected "
+    "output location(s) and can actually run — a working partial answer on "
+    "disk beats a perfect one you never finish. Do a quick sanity check, "
+    "then conclude.\n"
+    "</system-reminder>"
+)
+
 
 class Budgets(BaseModel):
-    """Per-run loop budgets (DESIGN.md §4.1). Hitting one pauses, not kills."""
+    """Per-run loop budgets (DESIGN.md §4.1). Hitting one pauses, not kills.
+
+    ``max_output_tokens`` caps the completion tokens of a *single* model call
+    (passed through as the provider ``max_tokens`` param): unlike the run-wide
+    ``max_tokens`` ceiling it bounds one turn, so a pathologically long single
+    generation cannot consume the whole wall-clock. ``None`` leaves it
+    unset. ``wall_clock_seconds`` enables the wind-down reminder (see
+    :data:`WIND_DOWN_REMINDER`) when a hard external deadline applies; ``None``
+    disables it. Both default off, so nothing changes for callers that do not
+    set them.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     max_turns: int = 50
     max_tokens: int = 1_000_000
+    max_output_tokens: int | None = None
+    wall_clock_seconds: float | None = None
 
 
 class AgentResult(BaseModel):
@@ -145,6 +201,7 @@ class AgentLoop:
         ask: AskCallable,
         *,
         model: str = "unknown",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -156,6 +213,9 @@ class AgentLoop:
         self.budgets = budgets
         self.ask = ask
         self.model = model
+        #: Monotonic clock for the wall-clock wind-down check; injectable so
+        #: tests can drive the deadline deterministically.
+        self.clock = clock
 
     # -- persistence helpers -------------------------------------------------
 
@@ -286,12 +346,43 @@ class AgentLoop:
         total_usage = Usage()
         turns = 0
         nudges = 0
+        truncation_continues = 0
+        wound_down = False
+        start = self.clock()
+        call_params: dict[str, object] = {}
+        if self.budgets.max_output_tokens is not None:
+            call_params["max_tokens"] = self.budgets.max_output_tokens
 
         while True:
             # 1. Budgets: pause resumably, never fail (§4.9).
             spent = total_usage.input_tokens + total_usage.output_tokens
             if turns >= self.budgets.max_turns or spent >= self.budgets.max_tokens:
                 return self._finish("paused_budget", None, total_usage, turns)
+
+            # 1b. Wall-clock wind-down: once the hard external deadline is near,
+            # inject a one-time reminder to stop exploring and land a working
+            # answer on disk (§4.9 land-early discipline). It rides the very
+            # next model call, so the agent sees it before acting. Diligence
+            # nudges are suppressed afterwards so it may actually conclude.
+            if not wound_down and self.budgets.wall_clock_seconds is not None:
+                remaining = self.budgets.wall_clock_seconds - (self.clock() - start)
+                threshold = self.budgets.wall_clock_seconds * WIND_DOWN_FRACTION
+                if remaining <= threshold:
+                    self._append_message(
+                        Message(
+                            role=Role.USER,
+                            content=WIND_DOWN_REMINDER.format(
+                                remaining=max(0, int(remaining)),
+                                budget=int(self.budgets.wall_clock_seconds),
+                            ),
+                        )
+                    )
+                    self.store.append_event(
+                        self.agent_id,
+                        "wind_down",
+                        {"remaining_seconds": max(0.0, remaining)},
+                    )
+                    wound_down = True
 
             try:
                 # 2. Compaction, run to fixpoint: one halving per turn may
@@ -327,7 +418,9 @@ class AgentLoop:
                 # with status 'error' — never an unhandled exception.
                 system, messages = self.context.assemble()
                 specs = self.registry.specs()
-                response = await self.adapter.complete(messages, specs, system)
+                response = await self.adapter.complete(
+                    messages, specs, system, **call_params
+                )
             except AdapterError as exc:
                 return self._finish("error", str(exc), total_usage, turns)
 
@@ -358,12 +451,34 @@ class AgentLoop:
                     )
                 continue
 
-            # 5. No tool calls: diligence stop-condition check (§4.9).
+            # 5a. Truncated turn with no action: the model hit the output-token
+            # cap before emitting a tool call (observed: a reasoning model that
+            # spent the whole cap thinking and returned an empty message).
+            # Accepting it would bank a non-answer as "done", so re-prompt it to
+            # act — bounded so a persistently-truncating turn cannot loop.
+            if (
+                response.stop_reason is StopReason.MAX_TOKENS
+                and truncation_continues < MAX_TRUNCATION_CONTINUES
+            ):
+                truncation_continues += 1
+                self._append_message(
+                    Message(role=Role.USER, content=TRUNCATION_REMINDER)
+                )
+                self.store.append_event(
+                    self.agent_id,
+                    "truncation_continue",
+                    {"count": truncation_continues},
+                )
+                continue
+
+            # 5b. No tool calls: diligence stop-condition check (§4.9).
             final_text = response.message.content
             unfinished, reason = looks_unfinished(
                 final_text, self._open_task_count()
             )
-            if unfinished and nudges < MAX_NUDGES:
+            # Once wound down, accept the final answer rather than nudging the
+            # agent back into work it no longer has time to finish.
+            if unfinished and nudges < MAX_NUDGES and not wound_down:
                 nudges += 1
                 reminder = CONTINUE_REMINDER.format(reason=reason)
                 # Persisted as a regular 'message' event (plus the 'nudge'
