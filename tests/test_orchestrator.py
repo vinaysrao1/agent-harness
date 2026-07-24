@@ -12,18 +12,29 @@ from pathlib import Path
 
 import pytest
 
+from collections.abc import Callable
+
 from harness.adapters.fake import FakeAdapter
 from harness.config import HarnessConfig, PermissionMode
+from harness.deadline import Deadline
 from harness.loop import Budgets
-from harness.orchestrator import Orchestrator, UnknownModelError, UnknownRunError
+from harness.orchestrator import (
+    Orchestrator,
+    ToolDeps,
+    UnknownModelError,
+    UnknownRunError,
+)
+from harness.permissions import ToolMeta
 from harness.persistence import RunStore
 from harness.sandbox.docker import DockerSandbox
+from harness.tools.registry import Tool
 from harness.types import (
     Message,
     ModelResponse,
     Role,
     StopReason,
     ToolCall,
+    ToolSpec,
     Usage,
 )
 
@@ -422,6 +433,51 @@ async def test_resume_task_exhausted_budget_pauses_again(
     )
     assert result.status == "paused_budget"
     assert second.calls == []  # no model call was made
+
+
+async def test_resume_carries_output_token_and_wall_clock_budgets(
+    orchestrator: Orchestrator,
+    store: RunStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: resume_task used to rebuild the remaining Budgets from
+    max_turns/max_tokens only, silently dropping ``max_output_tokens`` (a
+    per-call cap with nothing to subtract) and ``wall_clock_seconds`` (which
+    restarts fresh — the external deadline it mirrors is per-invocation).
+    Both must carry through to the resumed execution."""
+    first = FakeAdapter(
+        [resp(calls=[call("c1", "write_file", path="hello.txt", content="hi")])]
+    )
+    run_id, paused = await orchestrator.run_task(
+        GOAL, "fake-model", adapter_override=first, budgets=Budgets(max_turns=1)
+    )
+    assert paused.status == "paused_budget"
+
+    captured: dict[str, Budgets] = {}
+    real_execute = Orchestrator._execute
+
+    async def spy_execute(self, **kwargs):
+        captured["budgets"] = kwargs["budgets"]
+        return await real_execute(self, **kwargs)
+
+    monkeypatch.setattr(Orchestrator, "_execute", spy_execute)
+
+    second = FakeAdapter([resp(CLEAN_FINISH)])
+    result = await orchestrator.resume_task(
+        run_id,
+        adapter_override=second,
+        budgets=Budgets(
+            max_turns=3,
+            max_output_tokens=4096,
+            wall_clock_seconds=2400.0,
+        ),
+    )
+    assert result.status == "completed"
+
+    remaining = captured["budgets"]
+    assert remaining.max_turns == 2  # one turn already consumed
+    assert remaining.max_output_tokens == 4096  # carried, not dropped
+    assert remaining.wall_clock_seconds == 2400.0  # restarts fresh, full value
 
 
 # -- crash-resume: dangling tool calls ---------------------------------------
@@ -868,3 +924,152 @@ async def test_search_history_recovers_persisted_output(
     ]
     assert search_result["is_error"] is False
     assert "hello.txt" in search_result["content"]
+
+
+# -- wall-clock deadline seam (wind-down plan §2b/§2d) -------------------------
+
+
+def scripted_clock(values: list[float]) -> Callable[[], float]:
+    """A clock returning ``values`` in order, then repeating the last."""
+    it = iter(values)
+    last = values[-1]
+
+    def clock() -> float:
+        nonlocal last
+        last = next(it, last)
+        return last
+
+    return clock
+
+
+def spy_tool_factory(captured: dict) -> Callable[[ToolDeps], Tool]:
+    """A tool factory that records the ToolDeps bundle it is invoked with."""
+
+    def factory(deps: ToolDeps) -> Tool:
+        captured["deps"] = deps
+
+        async def handler(arguments: dict) -> str:
+            return "ok"
+
+        return Tool(
+            spec=ToolSpec(name="spy", description="records its deps"),
+            meta=ToolMeta(side_effect=False),
+            handler=handler,
+        )
+
+    return factory
+
+
+async def test_run_task_deadline_reaches_tool_factories(
+    orchestrator: Orchestrator,
+) -> None:
+    """Ordering regression (§2b blocker): the deadline must be resolved at
+    the top of _execute, BEFORE the registry/ToolDeps build — the ToolDeps
+    bundle every factory receives carries the very instance passed to
+    run_task, not None."""
+    captured: dict = {}
+    deadline = Deadline(3600.0)
+    run_id, result = await orchestrator.run_task(
+        GOAL,
+        "fake-model",
+        adapter_override=FakeAdapter([resp(CLEAN_FINISH)]),
+        tool_factories=[spy_tool_factory(captured)],
+        deadline=deadline,
+    )
+    assert result.status == "completed"
+    assert captured["deps"].deadline is deadline
+    # The lead loop shares the identical instance.
+    assert orchestrator._live_loops[0].deadline is deadline
+
+
+async def test_wall_clock_budget_builds_one_shared_deadline(
+    orchestrator: Orchestrator,
+) -> None:
+    """Back-compat path: no injected deadline but budgets.wall_clock_seconds
+    set — _execute constructs ONE Deadline from it (before the registry
+    build) and both the tool factories and the lead loop see that same
+    object."""
+    captured: dict = {}
+    run_id, result = await orchestrator.run_task(
+        GOAL,
+        "fake-model",
+        adapter_override=FakeAdapter([resp(CLEAN_FINISH)]),
+        tool_factories=[spy_tool_factory(captured)],
+        budgets=Budgets(wall_clock_seconds=3600.0),
+    )
+    assert result.status == "completed"
+    deadline = captured["deps"].deadline
+    assert deadline is not None
+    assert deadline.budget == 3600.0
+    assert orchestrator._live_loops[0].deadline is deadline
+
+
+async def test_late_spawned_subagent_shares_the_aged_deadline(
+    orchestrator: Orchestrator, store: RunStore
+) -> None:
+    """Subagent sharing (§2b): the run's ONE deadline is handed to every
+    loop, so a subagent whose first check is already inside the wind-down
+    band is born wound-down — the reminder lands on its turn 1."""
+    # Anchored at 0; every later read sees 700 → 200s of 900s remain:
+    # inside the clamped 300s wind-down band, above the 60s stop floor.
+    deadline = Deadline(900.0, scripted_clock([0.0, 700.0]))
+    lead_adapter = FakeAdapter(
+        [
+            resp(calls=[call("s1", "spawn_agent", prompt="Child work.")]),
+            resp(calls=[call("a1", "await_agents")]),
+            resp("Task complete. Verified."),
+        ]
+    )
+    child_adapter = FakeAdapter([resp("Child task complete.")])
+    adapters = iter([lead_adapter, child_adapter])
+
+    run_id, result = await orchestrator.run_task(
+        "Fan out late.",
+        "fake-model",
+        adapter_override=lambda: next(adapters),
+        deadline=deadline,
+    )
+    assert result.status == "completed"
+
+    lead, child = store.list_agents(run_id)
+    child_wind_downs = [
+        event.payload
+        for event in store.load_events(child.id)
+        if event.kind == "wind_down"
+    ]
+    assert len(child_wind_downs) == 1
+    assert child_wind_downs[0]["remaining_seconds"] == pytest.approx(200.0)
+    # The reminder reached the child on its very first model call.
+    turn1_texts = [
+        m.content for m in child_adapter.calls[0].messages if m.content
+    ]
+    assert any("approaching your hard time limit" in t for t in turn1_texts)
+
+
+async def test_hard_stopped_run_is_resumable(
+    orchestrator: Orchestrator, store: RunStore
+) -> None:
+    """Hard stop (§2d): an already-expired deadline pauses the run with
+    zero model calls and a persisted wall_clock_stop; a later resume (a
+    fresh invocation, no deadline) completes it."""
+    expired = Deadline(100.0, scripted_clock([0.0, 200.0]))
+    first = FakeAdapter([resp(CLEAN_FINISH)])
+    run_id, paused = await orchestrator.run_task(
+        GOAL, "fake-model", adapter_override=first, deadline=expired
+    )
+    assert paused.status == "paused_budget"
+    assert first.calls == []  # no model call was started
+    assert store.get_run(run_id).status == "paused_budget"
+    lead = store.list_agents(run_id)[0]
+    stops = [
+        event.payload
+        for event in store.load_events(lead.id)
+        if event.kind == "wall_clock_stop"
+    ]
+    assert len(stops) == 1
+    assert stops[0]["remaining_seconds"] == 0.0
+
+    second = FakeAdapter([resp(CLEAN_FINISH)])
+    result = await orchestrator.resume_task(run_id, adapter_override=second)
+    assert result.status == "completed"
+    assert store.get_run(run_id).status == "completed"

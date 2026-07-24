@@ -18,7 +18,8 @@ import pytest
 from harness.adapters.fake import FakeAdapter
 from harness.config import PermissionMode
 from harness.context import COMPACTION_SUMMARY_PREFIX, ContextManager
-from harness.loop import AgentLoop, AgentResult, Budgets
+from harness.deadline import Deadline
+from harness.loop import AgentLoop, AgentResult, Budgets, wind_down_threshold
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
 from harness.sandbox.local import LocalSandbox
@@ -131,6 +132,7 @@ def make_harness(
     context: ContextManager | None = None,
     clock: "Callable[[], float] | None" = None,
     sandbox: LocalSandbox | None = None,
+    deadline: Deadline | None = None,
 ) -> Harness:
     """Wire a full AgentLoop from real lower layers on ``tmp_path``."""
     store = RunStore(tmp_path / "state.db")
@@ -165,6 +167,7 @@ def make_harness(
         ask,
         model="fake-model",
         sandbox=sandbox,
+        deadline=deadline,
         **({"clock": clock} if clock is not None else {}),
     )
     return Harness(
@@ -893,15 +896,16 @@ class TestWallClockWindDown:
     async def test_reminder_injected_when_deadline_near_and_nudge_suppressed(
         self, tmp_path: Path
     ) -> None:
-        # start=0, then the turn-1 check reads 90 → 10s of a 100s budget left
-        # (below the 0.2 threshold), so wind-down fires. The final message
-        # "looks unfinished" (promises future work) but the nudge is suppressed
+        # Deadline anchored at 0, then the turn-1 check reads 700 → 200s of a
+        # 900s budget left (below the clamped 300s threshold but above the 60s
+        # hard-stop floor), so wind-down fires. The final message "looks
+        # unfinished" (promises future work) but the nudge is suppressed
         # once wound down, so the run completes on turn 1 rather than looping.
-        clock = self._clock([0.0, 90.0])
+        clock = self._clock([0.0, 700.0])
         h = make_harness(
             tmp_path,
             [resp("I will keep going after this.")],
-            budgets=Budgets(wall_clock_seconds=100.0),
+            budgets=Budgets(wall_clock_seconds=900.0),
             clock=clock,
         )
         result = await h.loop.run(GOAL)
@@ -911,7 +915,8 @@ class TestWallClockWindDown:
         # The wind-down bookkeeping event landed once...
         wind_downs = h.events("wind_down")
         assert len(wind_downs) == 1
-        assert wind_downs[0]["remaining_seconds"] == pytest.approx(10.0)
+        assert wind_downs[0]["remaining_seconds"] == pytest.approx(200.0)
+        assert wind_downs[0]["threshold"] == pytest.approx(300.0)
         # ...and the reminder reached the model on that turn's call.
         turn1_texts = [
             m.content for m in h.adapter.calls[0].messages if m.content
@@ -932,6 +937,114 @@ class TestWallClockWindDown:
         result = await h.loop.run(GOAL)
         assert result.status == "completed"
         assert h.events("wind_down") == []
+
+    async def test_injected_pre_aged_deadline_wins_over_budgets(
+        self, tmp_path: Path
+    ) -> None:
+        """An injected Deadline is the source of truth: a loop handed a
+        pre-aged shared deadline is born wound-down (the reminder lands on
+        its turn 1), even though budgets.wall_clock_seconds is unset —
+        the late-spawned-subagent shape."""
+        # Anchored at 0 elsewhere; every remaining() read sees 700 → 200s
+        # of 900s left, inside the clamped 300s band, above the 60s floor.
+        deadline = Deadline(900.0, self._clock([0.0, 700.0]))
+        h = make_harness(
+            tmp_path,
+            [resp("I will keep going after this.")],
+            deadline=deadline,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 1
+        (wind_down,) = h.events("wind_down")
+        assert wind_down["remaining_seconds"] == pytest.approx(200.0)
+        assert wind_down["threshold"] == pytest.approx(300.0)
+        turn1_texts = [
+            m.content for m in h.adapter.calls[0].messages if m.content
+        ]
+        assert any("approaching your hard time limit" in t for t in turn1_texts)
+
+
+class TestWindDownThreshold:
+    @pytest.mark.parametrize(
+        ("budget", "expected"),
+        [
+            (600.0, 300.0),  # 0.5 * budget beats the 300s floor
+            (900.0, 300.0),  # raw fraction (180s) raised to the floor
+            (2400.0, 480.0),  # raw fraction, inside the band
+            (3600.0, 600.0),  # raw fraction (720s) clamped to the ceiling
+            (12000.0, 600.0),  # ceiling: no 40-minute nudge-free tail
+        ],
+    )
+    def test_clamp_table(self, budget: float, expected: float) -> None:
+        assert wind_down_threshold(budget) == expected
+
+
+class TestWallClockHardStop:
+    def _clock(self, values: list[float]) -> Callable[[], float]:
+        """A clock returning ``values`` in order, then repeating the last."""
+        it = iter(values)
+        last = values[-1]
+
+        def clock() -> float:
+            nonlocal last
+            last = next(it, last)
+            return last
+
+        return clock
+
+    async def test_below_floor_pauses_before_any_model_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Remaining below WALL_CLOCK_STOP_FLOOR (60s): the loop refuses to
+        start a model call that cannot finish — zero adapter calls, a
+        persisted wall_clock_stop event, and a resumable paused_budget."""
+        # Anchor at 0; the turn-1 check reads 850 → 50s of 900s left.
+        clock = self._clock([0.0, 850.0])
+        h = make_harness(
+            tmp_path,
+            [resp(CLEAN_FINISH)],  # scripted but must never be consumed
+            budgets=Budgets(wall_clock_seconds=900.0),
+            clock=clock,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 0
+        assert result.final_text is None
+        assert h.adapter.calls == []  # zero model calls started
+        (stop,) = h.events("wall_clock_stop")
+        assert stop["remaining_seconds"] == pytest.approx(50.0)
+        # It stopped, it did not wind down: no reminder for a call that
+        # will never happen.
+        assert h.events("wind_down") == []
+
+    async def test_wind_down_fires_once_before_the_hard_stop(
+        self, tmp_path: Path
+    ) -> None:
+        """A clock passing through the band: turn 1 winds down (200s left),
+        turn 2 hard-stops (50s left) — exactly one wind_down, then the stop."""
+        # Reads: anchor 0; turn-1 check 650 (remaining 250 ≤ 300 →
+        # wind-down); call start/end 650/660; turn-2 check 850 (remaining
+        # 50 < 60 → hard stop).
+        clock = self._clock([0.0, 650.0, 650.0, 660.0, 850.0])
+        h = make_harness(
+            tmp_path,
+            [resp("working", [call("c1", "echo", text="x")])],
+            tools=[simple_tool("echo")],
+            budgets=Budgets(wall_clock_seconds=900.0),
+            clock=clock,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 1
+        assert len(h.adapter.calls) == 1
+        (wind_down,) = h.events("wind_down")
+        assert wind_down["remaining_seconds"] == pytest.approx(250.0)
+        (stop,) = h.events("wall_clock_stop")
+        assert stop["remaining_seconds"] == pytest.approx(50.0)
 
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1110,102 @@ class TestTruncationContinue:
         assert h.events("truncation_continue") == []
         assert len(h.events("tool_result")) == 1
 
+    async def test_provider_truncated_tool_call_survives_end_to_end(
+        self, tmp_path: Path
+    ) -> None:
+        """Pinned end-to-end regression (trial make-mips-interpreter__KSxCFCR):
+        a provider turn cut off at the output-token cap mid-tool-call used to
+        kill the run with a non-retryable AdapterError from the argument
+        parser. Through the real OpenAI-compat adapter, the malformed call is
+        dropped, the loop's truncation-continue path fires, and the run
+        completes."""
+        from types import SimpleNamespace
+
+        from harness.adapters.openai_compat import OpenAICompatAdapter
+
+        def sdk_response(
+            content: str | None, tool_calls: list | None, finish_reason: str
+        ) -> SimpleNamespace:
+            message = SimpleNamespace(content=content, tool_calls=tool_calls)
+            choice = SimpleNamespace(
+                message=message, finish_reason=finish_reason
+            )
+            return SimpleNamespace(
+                choices=[choice],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+            )
+
+        # A large inline write_file whose JSON arguments were cut mid-string
+        # at the cap — the real trial's failure shape.
+        truncated_call = SimpleNamespace(
+            id="c1",
+            function=SimpleNamespace(
+                name="write_file",
+                arguments='{"path": "interp.py", "content": "def main():',
+            ),
+        )
+
+        class FakeCompletions:
+            def __init__(self, results: list) -> None:
+                self.results = list(results)
+                self.calls: list[dict] = []
+
+            async def create(self, **kwargs: object) -> SimpleNamespace:
+                self.calls.append(kwargs)
+                return self.results.pop(0)
+
+        completions = FakeCompletions(
+            [
+                sdk_response(None, [truncated_call], "length"),
+                sdk_response(CLEAN_FINISH, None, "stop"),
+            ]
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        adapter = OpenAICompatAdapter("fake-model", client=client, stream=False)
+
+        store = RunStore(tmp_path / "state.db")
+        run_id = store.create_run(GOAL, "fake-model", "auto")
+        agent_id = store.create_agent(run_id, GOAL)
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=adapter.count_tokens,
+            max_context=adapter.capabilities.max_context,
+            summarize=stub_summarize,
+        )
+
+        async def ask(tool_name: str, arguments: dict, meta: ToolMeta) -> bool:
+            return True
+
+        loop = AgentLoop(
+            adapter,
+            ToolRegistry(),
+            Policy(mode=PermissionMode.AUTO),
+            store,
+            run_id,
+            agent_id,
+            context,
+            Budgets(),
+            ask,
+            model="fake-model",
+        )
+        result = await loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        kinds = [e.kind for e in store.load_events(agent_id)]
+        assert kinds.count("truncation_continue") == 1
+        # Turn 2's request replayed the transcript — the placeholder assistant
+        # message translated cleanly (no empty-message rejection) — and the
+        # reminder covering the cut-off-tool-call case reached the model.
+        assert len(completions.calls) == 2
+        turn2_contents = [
+            str(m.get("content") or "") for m in completions.calls[1]["messages"]
+        ]
+        assert any(
+            "truncated at the output-token limit" in c for c in turn2_contents
+        )
+        assert any("cut off mid-arguments" in c for c in turn2_contents)
+
 
 # ---------------------------------------------------------------------------
 # Per-turn duration recording (§10.2 A5)
@@ -1022,8 +1231,9 @@ class TestDurationRecording:
     ) -> None:
         """Each usage row records the wall-clock duration of exactly its
         model call, from the injected monotonic clock. Clock reads with no
-        wall-clock budget: run start, then (call start, call end) per turn."""
-        clock = scripted_clock([0.0, 10.0, 10.5, 20.0, 20.25])
+        wall-clock budget/deadline: (call start, call end) per turn — no
+        deadline means no per-turn remaining() read and no anchor read."""
+        clock = scripted_clock([10.0, 10.5, 20.0, 20.25])
         script = [
             resp(None, [call("c1", "echo", text="a")]),
             resp(CLEAN_FINISH),
@@ -1351,10 +1561,12 @@ class TestVerification:
         classification mines a corrupted audit signal."""
         from harness.tools.builtin import declare_verification_tool
 
-        # start=0; turn-1 checks read 0/0/1; the turn-2 check reads 90 →
-        # 10s of a 100s budget left, so wind-down fires before turn 2.
-        values = iter([0.0, 0.0, 0.0, 1.0, 90.0])
-        last = 90.0
+        # Deadline anchored at 0; turn-1 reads 0/0/1; the turn-2 check reads
+        # 700 → 200s of a 900s budget left (inside the clamped 300s wind-down
+        # band, above the 60s hard-stop floor), so wind-down fires before
+        # turn 2.
+        values = iter([0.0, 0.0, 0.0, 1.0, 700.0])
+        last = 700.0
 
         def clock() -> float:
             nonlocal last
@@ -1372,7 +1584,7 @@ class TestVerification:
             tmp_path,
             script,
             tools=[bash_tool(sandbox), declare_verification_tool()],
-            budgets=Budgets(wall_clock_seconds=100.0),
+            budgets=Budgets(wall_clock_seconds=900.0),
             clock=clock,
             sandbox=sandbox,
         )
@@ -1414,6 +1626,143 @@ class TestVerification:
         assert len(failures) == 3
         assert failures[0]["exit_code"] is None
         assert "failed to execute" in failures[0]["output"]
+
+
+class ScriptedTimeoutSandbox:
+    """Sandbox stub that records the ``timeout`` it received and returns a
+    scripted :class:`~harness.sandbox.base.ExecResult` -- lets §Fix 3b's
+    tests drive a verification timeout deterministically, with no real
+    sleep (mirrors :class:`ExplodingSandbox` above)."""
+
+    def __init__(self, result) -> None:
+        self.result = result
+        self.received_timeout: float | None = None
+
+    async def exec(self, command: str, timeout: float = 120):
+        self.received_timeout = timeout
+        return self.result
+
+
+class TestVerificationTimeoutCap:
+    """Wind-down plan §Fix 3b: the verification re-run's own timeout is
+    capped by the run's remaining wall-clock, and a timeout that only
+    happened *because* of that cap is inconclusive -- not a failure the
+    model could act on -- so it skips the nudge/reminder and is accepted."""
+
+    async def test_capped_timeout_is_inconclusive_and_skips_the_nudge(
+        self, tmp_path: Path
+    ) -> None:
+        from harness.diligence import VERIFICATION_TIMEOUT_SECONDS
+        from harness.sandbox.base import ExecResult
+        from harness.tools.builtin import declare_verification_tool
+
+        script = [
+            resp("declaring", [declare("v1", "pytest -q")]),
+            resp(CLEAN_FINISH),
+        ]
+        # remaining=100 throughout (fixed clock); 100 - EXEC_RESERVE(60) = 40,
+        # below VERIFICATION_TIMEOUT_SECONDS(300) -> capped to 40s. 100 is
+        # also above the wind-down threshold for a 100s "budget" (50s), so
+        # wind-down does not fire and cannot be confused with this path.
+        deadline = Deadline(100.0, clock=lambda: 0.0)
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[declare_verification_tool()],
+            deadline=deadline,
+        )
+        fake = ScriptedTimeoutSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+        h.loop.sandbox = fake  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert h.events("wind_down") == []
+        assert h.events("nudge") == []
+        (failed,) = h.events("verification_failed")
+        assert failed["timed_out"] is True
+        assert failed["timeout_capped"] is True
+        assert failed["inconclusive"] is True
+        assert failed["timeout_seconds"] == pytest.approx(40.0)
+        assert failed["timeout_seconds"] < VERIFICATION_TIMEOUT_SECONDS
+        assert "nudge_number" not in failed
+        assert "nudges_exhausted" not in failed
+        # No VERIFICATION_FAILED_REMINDER reached the model as a message.
+        assert not any(
+            payload["role"] == "user"
+            and "verification command failed" in (payload["content"] or "")
+            for payload in h.events("message")
+        )
+
+    async def test_uncapped_timeout_still_nudges_as_today(
+        self, tmp_path: Path
+    ) -> None:
+        """Contrast: with no deadline (so no cap applies), a verification
+        timeout keeps today's fail-and-nudge semantics exactly."""
+        from harness.diligence import MAX_NUDGES
+        from harness.sandbox.base import ExecResult
+        from harness.tools.builtin import declare_verification_tool
+
+        script = [
+            resp("declaring", [declare("v1", "pytest -q")]),
+            *[resp(CLEAN_FINISH) for _ in range(MAX_NUDGES + 1)],
+        ]
+        h = make_harness(tmp_path, script, tools=[declare_verification_tool()])
+        fake = ScriptedTimeoutSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+        h.loop.sandbox = fake  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        failures = h.events("verification_failed")
+        assert len(failures) == MAX_NUDGES + 1
+        assert all(f.get("timed_out") for f in failures)
+        assert all("timeout_capped" not in f for f in failures)
+        assert all("inconclusive" not in f for f in failures)
+        assert [f.get("nudge_number") for f in failures[:-1]] == list(
+            range(1, MAX_NUDGES + 1)
+        )
+        assert failures[-1]["nudges_exhausted"] is True
+        reminders = [
+            payload
+            for payload in h.events("message")
+            if payload["role"] == "user"
+            and "verification command failed" in (payload["content"] or "")
+        ]
+        assert len(reminders) == MAX_NUDGES
+
+    async def test_capped_but_passing_verification_still_counts_as_passed(
+        self, tmp_path: Path
+    ) -> None:
+        from harness.sandbox.base import ExecResult
+        from harness.tools.builtin import declare_verification_tool
+
+        script = [
+            resp("declaring", [declare("v1", "echo ok")]),
+            resp(CLEAN_FINISH),
+        ]
+        deadline = Deadline(100.0, clock=lambda: 0.0)  # forces a 40s cap
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[declare_verification_tool()],
+            deadline=deadline,
+        )
+        fake = ScriptedTimeoutSandbox(ExecResult(exit_code=0, stdout="ok", stderr=""))
+        h.loop.sandbox = fake  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert fake.received_timeout == pytest.approx(40.0)
+        (passed,) = h.events("verification_passed")
+        assert passed["exit_code"] == 0
+        assert passed["timeout_capped"] is True
+        assert passed["timeout_seconds"] == pytest.approx(40.0)
+        assert h.events("verification_failed") == []
+        assert h.events("nudge") == []
 
 
 class TestVerificationOrchestratorWiring:

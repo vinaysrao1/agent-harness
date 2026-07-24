@@ -13,7 +13,14 @@ Translation notes:
   format has no error flag, so ``is_error`` results are prefixed ``Error:``.
 - Tool-call ``arguments`` arrive as a JSON *string*; malformed JSON from a
   provider surfaces as a clear non-retryable
-  :class:`~harness.adapters.base.AdapterError`, never a raw crash.
+  :class:`~harness.adapters.base.AdapterError`, never a raw crash — *except*
+  when the turn was truncated at the output-token limit
+  (``finish_reason == "length"``): a tool call cut off mid-arguments is then
+  an expected casualty of truncation, so the malformed call is dropped and
+  the turn survives as a plain ``MAX_TOKENS`` response the agent loop's
+  truncation-continue path can re-prompt (see :func:`from_openai_response`).
+  TODO: the Anthropic adapter has no analogue of this truncated-tool-call
+  degradation (no current exposure); port it if truncation is observed there.
 - SDK failures are wrapped with ``retryable`` derived from HTTP status
   (429/5xx/timeouts retry; 400/401-class do not) and ``complete()`` runs
   under :func:`~harness.adapters.base.retry_with_backoff`.
@@ -275,6 +282,23 @@ def from_openai_response(response: Any) -> ModelResponse:
     Malformed tool-call JSON, by contrast, stays non-retryable (the payload is
     already consumed and will not change on retry).
 
+    Truncation graceful degradation: when ``finish_reason == "length"`` (the
+    turn hit the output-token limit) a tool call with malformed arguments is
+    almost certainly one cut off mid-JSON by the cap, not a provider fault.
+    Raising would kill the whole run non-retryably (observed on a real trial:
+    a large inline ``write_file`` truncated at the output cap), and retrying
+    cannot help — the payload is spent. So each such call is *dropped* from
+    the translated message instead, and the response reaches the agent loop
+    as ``stop_reason=MAX_TOKENS`` with the malformed calls gone, where the
+    existing truncation-continue path re-prompts the model to re-issue the
+    call. If dropping leaves the message with no content and no tool calls,
+    a placeholder content string is substituted, because
+    :func:`to_openai_messages` correctly rejects empty messages when the
+    transcript is replayed next turn (an assistant message must not dangle
+    without its tool calls). Any other ``finish_reason`` with malformed
+    arguments keeps the non-retryable :class:`AdapterError` — a genuine
+    provider fault, not truncation.
+
     Usage normalization: the OpenAI API's ``prompt_tokens`` *includes* cache
     traffic (``prompt_tokens_details`` fields are subsets of it), but
     :class:`~harness.types.Usage` defines ``input_tokens`` as *excluding*
@@ -298,15 +322,32 @@ def from_openai_response(response: Any) -> ModelResponse:
         )
     choice = choices[0]
     provider_message = choice.message
+    stop_reason = map_finish_reason(getattr(choice, "finish_reason", None))
+    truncated = stop_reason is StopReason.MAX_TOKENS
     tool_calls: list[ToolCall] = []
+    dropped_calls = 0
     for call in getattr(provider_message, "tool_calls", None) or []:
         function = call.function
+        try:
+            arguments = _parse_arguments(function.name, function.arguments)
+        except AdapterError:
+            if truncated:
+                # A tool call cut off mid-arguments at the output-token cap:
+                # drop it so the turn survives as MAX_TOKENS and the loop's
+                # truncation-continue path re-prompts (see docstring).
+                dropped_calls += 1
+                continue
+            raise
         tool_calls.append(
-            ToolCall(
-                id=call.id,
-                name=function.name,
-                arguments=_parse_arguments(function.name, function.arguments),
-            )
+            ToolCall(id=call.id, name=function.name, arguments=arguments)
+        )
+    content = getattr(provider_message, "content", None) or None
+    if dropped_calls and content is None and not tool_calls:
+        # Dropping left the assistant message empty; substitute a placeholder
+        # so next-turn transcript translation does not reject it.
+        content = (
+            "(response truncated at the output-token limit while emitting "
+            "a tool call)"
         )
     usage = getattr(response, "usage", None)
     details = getattr(usage, "prompt_tokens_details", None)
@@ -326,7 +367,7 @@ def from_openai_response(response: Any) -> ModelResponse:
     return ModelResponse(
         message=Message(
             role=Role.ASSISTANT,
-            content=getattr(provider_message, "content", None) or None,
+            content=content,
             tool_calls=tool_calls,
         ),
         usage=Usage(
@@ -335,7 +376,7 @@ def from_openai_response(response: Any) -> ModelResponse:
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
         ),
-        stop_reason=map_finish_reason(getattr(choice, "finish_reason", None)),
+        stop_reason=stop_reason,
         raw=raw,
     )
 
