@@ -40,7 +40,14 @@ Loop shape per turn:
    reminder and continues, consuming the same nudge budget — once nudges
    are exhausted the run completes anyway with the failure recorded
    (``verification_failed`` with ``nudges_exhausted``) so it stays
-   auditable. With no declaration, the heuristic alone decides, as before.
+   auditable. The verification's own timeout is capped by the run's
+   remaining wall-clock the same way the ``bash`` tool's is (§Fix 3b); a
+   timeout that only happened *because* of that cap is inconclusive, not a
+   failure the model could act on, so it skips the nudge and reminder
+   entirely and accepts the completion with ``verification_failed``
+   carrying ``timeout_capped``/``inconclusive`` for audit — an uncapped
+   timeout keeps the nudge-and-reminder semantics above unchanged. With no
+   declaration, the heuristic alone decides, as before.
 """
 
 from __future__ import annotations
@@ -54,6 +61,12 @@ from pydantic import BaseModel, ConfigDict
 
 from harness.adapters.base import AdapterError, ModelAdapter
 from harness.context import ContextManager
+from harness.deadline import (
+    EXEC_CAP_FLOOR_SECONDS,
+    EXEC_RESERVE_SECONDS,
+    WALL_CLOCK_STOP_FLOOR,
+    Deadline,
+)
 from harness.diligence import (
     CONTINUE_REMINDER,
     MAX_NUDGES,
@@ -81,6 +94,7 @@ __all__ = [
     "AgentResult",
     "AskCallable",
     "AgentLoop",
+    "wind_down_threshold",
 ]
 
 #: The approval callback for ASK decisions: called with
@@ -107,18 +121,49 @@ MAX_TRUNCATION_CONTINUES: int = 3
 TRUNCATION_REMINDER: str = (
     "<system-reminder>\n"
     "Your previous response was cut off at the output-token limit before you "
-    "produced a tool call or a complete answer — you spent the whole turn "
-    "thinking. Be decisive now: take the next concrete action with a tool "
-    "call (write the file, run the command), keeping any prose minimal.\n"
+    "produced a tool call or a complete answer — either you spent the whole "
+    "turn thinking, or your tool call was cut off mid-arguments at the "
+    "limit. Be decisive now: take the next concrete action with a tool "
+    "call (write the file, run the command), keeping any prose minimal. If "
+    "your tool call was cut off, re-issue it now; if you were writing a "
+    "large file, write it in smaller pieces across multiple calls.\n"
     "</system-reminder>"
 )
 
-#: Fraction of ``wall_clock_seconds`` remaining at which the loop injects the
-#: one-time wind-down reminder (below): with 900s and 0.2, the reminder lands
-#: once ≤180s remain. Chosen to leave the agent one or two turns to land a
-#: best-effort answer on disk before an external deadline (e.g. a benchmark
-#: harness's per-agent timeout) kills the trial mid-turn.
+#: Fraction of the wall-clock budget remaining at which the loop injects the
+#: one-time wind-down reminder (below), clamped by the two bounds that
+#: follow — see :func:`wind_down_threshold`. Chosen to leave the agent one
+#: or two turns to land a best-effort answer on disk before an external
+#: deadline (e.g. a benchmark harness's per-agent timeout) kills the trial
+#: mid-turn.
 WIND_DOWN_FRACTION = 0.2
+
+#: Floor on the wind-down threshold: single (slow-provider) model calls have
+#: been observed to run up to ~271s, so a raw 0.2 fraction of a 900s budget
+#: (180s) can vanish inside ONE call — the reminder would land with nothing
+#: left to act on.
+WIND_DOWN_MIN_REMAINING = 300.0
+
+#: Ceiling on the wind-down threshold: 0.2 of a 12000s budget would wind the
+#: run down with 2400s still left — disabling diligence nudges for 40
+#: minutes of perfectly usable time.
+WIND_DOWN_MAX_REMAINING = 600.0
+
+
+def wind_down_threshold(budget: float) -> float:
+    """The remaining-seconds threshold at which wind-down fires for ``budget``.
+
+    ``WIND_DOWN_FRACTION`` of the budget, clamped to the
+    [:data:`WIND_DOWN_MIN_REMAINING`, :data:`WIND_DOWN_MAX_REMAINING`] band —
+    and never more than half the budget, so degenerate tiny budgets still get
+    at least half the run before the reminder lands.
+    """
+    return min(
+        max(WIND_DOWN_FRACTION * budget, WIND_DOWN_MIN_REMAINING),
+        WIND_DOWN_MAX_REMAINING,
+        0.5 * budget,
+    )
+
 
 #: Injected once as a user message when the wall-clock budget is nearly spent.
 #: Unlike the diligence nudge (which pushes the agent to keep working), this
@@ -215,6 +260,19 @@ class AgentLoop:
         event is rehydrated here so an interrupted run keeps the promise
         that the check "will be re-run before your answer is accepted").
         ``None`` (the default) starts with no declaration, as before.
+    deadline:
+        The run's shared wall-clock :class:`~harness.deadline.Deadline`,
+        anchored by the caller where the external kill clock actually
+        starts (e.g. the Harbor bridge anchors at ``run()`` entry, before
+        sandbox startup). Drives both the one-shot wind-down reminder and
+        the hard stop (below). When ``None`` but
+        ``budgets.wall_clock_seconds`` is set, :meth:`run` constructs its
+        own deadline at entry on :attr:`clock` — the pre-seam behavior for
+        direct callers. Subagents share the lead's instance, so one
+        spawned late in the run sees only what is genuinely left; a
+        subagent whose *first* check is already past the wind-down
+        threshold is deliberately born wound-down (the reminder lands on
+        its turn 1).
     """
 
     def __init__(
@@ -233,6 +291,7 @@ class AgentLoop:
         clock: Callable[[], float] = time.monotonic,
         sandbox: Sandbox | None = None,
         declared_command: str | None = None,
+        deadline: Deadline | None = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -252,6 +311,10 @@ class AgentLoop:
         #: Rehydrated verification declaration (resume); ``run()`` seeds its
         #: loop-local ``declared_command`` from this.
         self.declared_command = declared_command
+        #: Shared wall-clock deadline (see the class docstring); ``run()``
+        #: falls back to a self-built one from ``budgets.wall_clock_seconds``
+        #: when this is None.
+        self.deadline = deadline
         #: Monotonic counter for synthetic verification-execution tool-call
         #: ids, so each execution's permission decision is auditable on its
         #: own row (§4.11: every decision is logged).
@@ -404,7 +467,9 @@ class AgentLoop:
         )
         return decision, decided_by
 
-    async def _run_verification(self, command: str) -> tuple[bool, dict]:
+    async def _run_verification(
+        self, command: str, deadline: Deadline | None = None
+    ) -> tuple[bool, dict]:
         """Execute the declared verification command in the sandbox (B1).
 
         Returns ``(passed, payload)`` where ``payload`` is the event body
@@ -412,13 +477,24 @@ class AgentLoop:
         its exit code (``None`` if it could not even execute), its combined
         output (tail-truncated via
         :func:`~harness.diligence.truncate_verification_output`), and
-        ``timed_out`` when the :data:`~harness.diligence.VERIFICATION_TIMEOUT_SECONDS`
-        bound was hit. A command that fails to *run* (sandbox error) is a
-        failed verification, never an exception out of the loop.
+        ``timed_out`` when the applied timeout bound was hit. A command that
+        fails to *run* (sandbox error) is a failed verification, never an
+        exception out of the loop.
 
         Execution is first gated through :meth:`_gate_verification`; a
         denied command never reaches the sandbox and yields a failed-not-run
         payload with ``denied: True``.
+
+        ``deadline`` (wind-down plan §Fix 3b), when given, caps
+        :data:`~harness.diligence.VERIFICATION_TIMEOUT_SECONDS` by what
+        wall-clock is actually left, mirroring the ``bash`` tool's cap
+        (:func:`~harness.tools.builtin.bash_tool`). When the cap bites,
+        ``payload["timeout_capped"]`` and ``payload["timeout_seconds"]``
+        (the timeout actually applied) are set regardless of whether the
+        run then times out or passes within the shorter window — the loop
+        uses ``timeout_capped`` together with ``timed_out`` to tell a
+        genuine failure from an inconclusive one cut short by the run's own
+        remaining time (§Fix 3b).
         """
         decision, decided_by = await self._gate_verification(command)
         if decision is not Decision.ALLOW:
@@ -431,25 +507,39 @@ class AgentLoop:
                 ),
                 "denied": True,
             }
-        try:
-            result = await self.sandbox.exec(
-                command, timeout=VERIFICATION_TIMEOUT_SECONDS
+        remaining = deadline.remaining() if deadline is not None else None
+        if remaining is None:
+            effective = VERIFICATION_TIMEOUT_SECONDS
+        else:
+            effective = min(
+                VERIFICATION_TIMEOUT_SECONDS,
+                max(EXEC_CAP_FLOOR_SECONDS, remaining - EXEC_RESERVE_SECONDS),
             )
+        timeout_capped = effective < VERIFICATION_TIMEOUT_SECONDS
+        try:
+            result = await self.sandbox.exec(command, timeout=effective)
         except Exception as exc:  # noqa: BLE001 - any sandbox failure is a
             # verification failure, not a crashed run
-            return False, {
+            payload: dict = {
                 "command": command,
                 "exit_code": None,
                 "output": f"verification command failed to execute: {exc}",
             }
+            if timeout_capped:
+                payload["timeout_capped"] = True
+                payload["timeout_seconds"] = effective
+            return False, payload
         parts = [part for part in (result.stdout, result.stderr) if part]
-        payload: dict = {
+        payload = {
             "command": command,
             "exit_code": result.exit_code,
             "output": truncate_verification_output("\n".join(parts).strip()),
         }
         if result.timed_out:
             payload["timed_out"] = True
+        if timeout_capped:
+            payload["timeout_capped"] = True
+            payload["timeout_seconds"] = effective
         return result.exit_code == 0 and not result.timed_out, payload
 
     def _open_task_count(self) -> int:
@@ -482,7 +572,13 @@ class AgentLoop:
         #: Seeded from the constructor so resume can re-arm a declaration
         #: replayed from the persisted event log.
         declared_command: str | None = self.declared_command
-        start = self.clock()
+        # The run's wall-clock deadline: the injected shared instance when
+        # the caller anchored one (the orchestrator seam), else a self-built
+        # one anchored here at run() entry from budgets.wall_clock_seconds —
+        # the pre-seam behavior for direct construction. None = no deadline.
+        deadline = self.deadline
+        if deadline is None and self.budgets.wall_clock_seconds is not None:
+            deadline = Deadline(self.budgets.wall_clock_seconds, self.clock)
         call_params: dict[str, object] = {}
         if self.budgets.max_output_tokens is not None:
             call_params["max_tokens"] = self.budgets.max_output_tokens
@@ -493,28 +589,48 @@ class AgentLoop:
             if turns >= self.budgets.max_turns or spent >= self.budgets.max_tokens:
                 return self._finish("paused_budget", None, total_usage, turns)
 
+            # 1a. Wall-clock hard stop: below the exec reserve, nothing new
+            # starts — a model call begun now cannot finish (and be acted
+            # on) before the external kill, so pause resumably instead of
+            # being cancelled mid-write. The wind-down reminder (fired well
+            # before this floor) is what pushes the answer to disk; this
+            # just refuses to start a call that cannot land.
+            remaining = deadline.remaining() if deadline is not None else None
+            if remaining is not None and remaining < WALL_CLOCK_STOP_FLOOR:
+                self.store.append_event(
+                    self.agent_id,
+                    "wall_clock_stop",
+                    {"remaining_seconds": remaining},
+                )
+                return self._finish("paused_budget", None, total_usage, turns)
+
             # 1b. Wall-clock wind-down: once the hard external deadline is near,
             # inject a one-time reminder to stop exploring and land a working
             # answer on disk (§4.9 land-early discipline). It rides the very
             # next model call, so the agent sees it before acting. Diligence
             # nudges are suppressed afterwards so it may actually conclude.
-            if not wound_down and self.budgets.wall_clock_seconds is not None:
-                remaining = self.budgets.wall_clock_seconds - (self.clock() - start)
-                threshold = self.budgets.wall_clock_seconds * WIND_DOWN_FRACTION
+            # With a shared (pre-aged) deadline, an agent whose first check
+            # is already past threshold is born wound-down: the reminder
+            # lands on its turn 1 — intended for late-spawned subagents.
+            if not wound_down and remaining is not None:
+                threshold = wind_down_threshold(deadline.budget)
                 if remaining <= threshold:
                     self._append_message(
                         Message(
                             role=Role.USER,
                             content=WIND_DOWN_REMINDER.format(
-                                remaining=max(0, int(remaining)),
-                                budget=int(self.budgets.wall_clock_seconds),
+                                remaining=int(remaining),
+                                budget=int(deadline.budget),
                             ),
                         )
                     )
                     self.store.append_event(
                         self.agent_id,
                         "wind_down",
-                        {"remaining_seconds": max(0.0, remaining)},
+                        {
+                            "remaining_seconds": remaining,
+                            "threshold": threshold,
+                        },
                     )
                     wound_down = True
 
@@ -669,7 +785,7 @@ class AgentLoop:
             # no declaration (or no sandbox), behavior is unchanged.
             if declared_command and self.sandbox is not None:
                 passed, payload = await self._run_verification(
-                    declared_command
+                    declared_command, deadline
                 )
                 if passed:
                     self.store.append_event(
@@ -680,6 +796,20 @@ class AgentLoop:
                     # run no matter what the model changes, so nudging would
                     # only burn budget re-hitting the same deny. Accept the
                     # answer with the not-run failure persisted for audit.
+                    self.store.append_event(
+                        self.agent_id, "verification_failed", payload
+                    )
+                elif payload.get("timed_out") and payload.get("timeout_capped"):
+                    # Wind-down-capped timeout (§Fix 3b): the shortened
+                    # timeout is a consequence of the run's own remaining
+                    # wall-clock, not evidence the check itself would fail —
+                    # nudging the model to "fix" it would just re-run the
+                    # same command into the same cap, burning a nudge (and
+                    # more wall-clock) on something it cannot act on. Skip
+                    # the nudge and accept the answer, with the inconclusive
+                    # verdict persisted for audit. An uncapped timeout falls
+                    # through to the branches below unchanged.
+                    payload["inconclusive"] = True
                     self.store.append_event(
                         self.agent_id, "verification_failed", payload
                     )

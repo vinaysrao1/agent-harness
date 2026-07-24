@@ -6,10 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from harness.deadline import (
+    EXEC_CAP_FLOOR_SECONDS,
+    EXEC_RESERVE_SECONDS,
+    Deadline,
+)
 from harness.memory.store import FactNotFoundError, MemoryStore
 from harness.permissions import ToolMeta
 from harness.persistence import RunStore
-from harness.sandbox.base import SandboxError
+from harness.sandbox.base import ExecResult, SandboxError
 from harness.sandbox.local import LocalSandbox
 from harness.skills import SkillLibrary
 from harness.context import ContextManager
@@ -123,6 +128,28 @@ def _make_context(reminder_interval: int = 1) -> ContextManager:
         summarize=summarize,
         reminder_interval=reminder_interval,
     )
+
+
+class FakeExecSandbox:
+    """A ``Sandbox`` stub that records the ``timeout`` it received from
+    ``bash_tool`` and returns a scripted :class:`ExecResult` -- used to test
+    the deadline-driven exec cap (wind-down plan §Fix 3a) without a real
+    subprocess or a real sleep."""
+
+    def __init__(self, result: ExecResult | None = None) -> None:
+        self.received_timeout: float | None = None
+        self._result = result or ExecResult(exit_code=0, stdout="ok", stderr="")
+
+    async def exec(self, command: str, timeout: float = 120) -> ExecResult:
+        self.received_timeout = timeout
+        return self._result
+
+
+def _fixed_deadline(budget: float) -> Deadline:
+    """A ``Deadline`` whose ``remaining()`` is always exactly ``budget`` --
+    a clock that never advances, so cap-math tests are exact and don't race
+    real wall-clock time."""
+    return Deadline(budget, clock=lambda: 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +318,80 @@ class TestBashTool:
         result = await registry.dispatch(_call("bash", {"command": "echo via-dispatch"}))
         assert result.is_error is False
         assert "via-dispatch" in result.content
+
+
+class TestBashToolDeadlineCap:
+    """Wind-down plan §Fix 3a: the ``bash`` tool caps its exec timeout by
+    the run's remaining wall-clock, using a fake sandbox that records the
+    timeout it actually received -- no real sleeps."""
+
+    async def test_no_deadline_is_a_pure_passthrough(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox)
+        await tool.handler({"command": "echo hi", "timeout": 45})
+        assert sandbox.received_timeout == 45
+
+    async def test_ample_remaining_leaves_requested_timeout_untouched(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(10_000.0))
+        await tool.handler({"command": "echo hi", "timeout": 45})
+        assert sandbox.received_timeout == 45
+
+    async def test_cap_applies_when_remaining_is_tight(self):
+        # remaining=100, reserve=60 -> allowed 40s, below the default 120s
+        # request.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(100.0))
+        await tool.handler({"command": "echo hi"})
+        assert sandbox.received_timeout == 40.0
+
+    async def test_floor_respected_when_remaining_minus_reserve_below_floor(
+        self,
+    ):
+        # remaining=70, reserve=60 -> 10s, below EXEC_CAP_FLOOR_SECONDS (30):
+        # the floor wins so trivial commands don't spuriously fail.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(70.0))
+        await tool.handler({"command": "echo hi", "timeout": 120})
+        assert sandbox.received_timeout == EXEC_CAP_FLOOR_SECONDS
+
+    async def test_requested_below_the_cap_is_left_untouched(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(100.0))  # allows 40s
+        await tool.handler({"command": "echo hi", "timeout": 10})
+        assert sandbox.received_timeout == 10.0
+
+    async def test_capped_timeout_result_names_both_values(self):
+        sandbox = FakeExecSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(100.0))  # allows 40s
+        output = await tool.handler({"command": "sleep 1000"})
+        assert "timed out after 40.0s" in output
+        assert "capped from your requested 120.0s" in output
+        assert "~100.0s of wall-clock remain" in output
+
+    async def test_capped_success_result_carries_a_note(self):
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="done", stderr=""))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(100.0))  # allows 40s
+        output = await tool.handler({"command": "echo hi", "timeout": 120})
+        assert "note: timeout was capped to 40.0s" in output
+        assert "exit code: 0" in output
+
+    async def test_uncapped_success_carries_no_note(self):
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="done", stderr=""))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(10_000.0))
+        output = await tool.handler({"command": "echo hi"})
+        assert "note: timeout was capped" not in output
+
+    async def test_description_mentions_the_cap(self):
+        assert "cap" in bash_tool(FakeExecSandbox()).spec.description.lower()
+
+    def test_exec_reserve_and_floor_constants_are_exported(self):
+        # Sanity: the constants this test module relies on actually live in
+        # harness.deadline (§Fix 3a: shared with the loop's hard stop).
+        assert EXEC_RESERVE_SECONDS == 60.0
+        assert EXEC_CAP_FLOOR_SECONDS == 30.0
 
 
 class TestReadWriteEditFileTools:

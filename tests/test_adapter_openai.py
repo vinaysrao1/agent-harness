@@ -410,6 +410,137 @@ class TestFromOpenAIResponse:
         assert map_finish_reason(provider) is ours
 
 
+# ------------------------- truncated tool calls (graceful degradation)
+
+
+#: The real failure shape (trial make-mips-interpreter__KSxCFCR): a large
+#: inline write_file whose JSON arguments were cut mid-string at the
+#: output-token cap. json.loads fails on it; the run must survive anyway.
+TRUNCATED_WRITE_FILE_ARGS = (
+    '{"path": "interp.py", "content": "def main():\\n    regs = [0] * 32\\n'
+    "    # ... hundreds of lines of interpreter code that hit the cap"
+)
+
+
+class TestTruncatedToolCallDegradation:
+    def test_length_truncated_malformed_call_dropped_not_raised(self) -> None:
+        # Pinned regression: finish_reason="length" + args cut mid-JSON must
+        # translate (call dropped, MAX_TOKENS), not raise a non-retryable
+        # AdapterError that kills the whole run.
+        resp = fake_response(
+            content=None,
+            tool_calls=[
+                fake_tool_call("c1", "write_file", TRUNCATED_WRITE_FILE_ARGS)
+            ],
+            finish_reason="length",
+        )
+        result = from_openai_response(resp)
+        assert result.stop_reason is StopReason.MAX_TOKENS
+        assert result.message.tool_calls == []
+
+    def test_all_calls_dropped_and_no_content_gets_placeholder(self) -> None:
+        # An empty assistant message would be rejected by to_openai_messages
+        # when the transcript is replayed next turn; the placeholder keeps the
+        # transcript translatable.
+        resp = fake_response(
+            content=None,
+            tool_calls=[
+                fake_tool_call("c1", "write_file", TRUNCATED_WRITE_FILE_ARGS)
+            ],
+            finish_reason="length",
+        )
+        result = from_openai_response(resp)
+        assert result.message.content == (
+            "(response truncated at the output-token limit while emitting "
+            "a tool call)"
+        )
+        # Next-turn translation of the transcript does not raise.
+        (entry,) = to_openai_messages([result.message])
+        assert entry["role"] == "assistant"
+        assert "truncated" in entry["content"]
+
+    def test_well_formed_calls_survive_alongside_dropped_one(self) -> None:
+        # The drop is per tool call: a complete parallel call is kept, and no
+        # placeholder is substituted since the message is not empty.
+        resp = fake_response(
+            content=None,
+            tool_calls=[
+                fake_tool_call("c1", "bash", '{"cmd": "ls"}'),
+                fake_tool_call("c2", "write_file", TRUNCATED_WRITE_FILE_ARGS),
+            ],
+            finish_reason="length",
+        )
+        result = from_openai_response(resp)
+        assert result.message.tool_calls == [
+            ToolCall(id="c1", name="bash", arguments={"cmd": "ls"})
+        ]
+        assert result.message.content is None
+
+    def test_existing_content_not_replaced_by_placeholder(self) -> None:
+        resp = fake_response(
+            content="Writing the interpreter now.",
+            tool_calls=[
+                fake_tool_call("c1", "write_file", TRUNCATED_WRITE_FILE_ARGS)
+            ],
+            finish_reason="length",
+        )
+        result = from_openai_response(resp)
+        assert result.message.content == "Writing the interpreter now."
+        assert result.message.tool_calls == []
+
+    def test_non_object_args_also_dropped_when_truncated(self) -> None:
+        # _parse_arguments rejects non-object payloads too; under truncation
+        # that is the same salvageable failure.
+        resp = fake_response(
+            content=None,
+            tool_calls=[fake_tool_call("c1", "bash", '"cut off mid')],
+            finish_reason="length",
+        )
+        result = from_openai_response(resp)
+        assert result.message.tool_calls == []
+        assert result.stop_reason is StopReason.MAX_TOKENS
+
+    def test_non_length_malformed_args_still_raise_non_retryable(self) -> None:
+        # A genuine provider fault (not truncation) keeps today's contract.
+        resp = fake_response(
+            content=None,
+            tool_calls=[fake_tool_call("c1", "bash", '{"cmd": ')],
+            finish_reason="stop",
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is False
+
+    def test_streaming_truncated_args_behave_identically(self) -> None:
+        # The same truncated arguments arriving as stream fragments fold into
+        # a length-finished response and degrade the same way.
+        resp = accumulate_stream_chunks(
+            [
+                stream_chunk(
+                    tool_calls=[
+                        tc_delta(
+                            0,
+                            id="c1",
+                            name="write_file",
+                            arguments='{"path": "interp.py", "content": "def ',
+                        )
+                    ]
+                ),
+                stream_chunk(
+                    tool_calls=[tc_delta(0, arguments="main():\\n    regs")]
+                ),
+                stream_chunk(finish_reason="length"),
+            ]
+        )
+        result = from_openai_response(resp)
+        assert result.stop_reason is StopReason.MAX_TOKENS
+        assert result.message.tool_calls == []
+        assert result.message.content == (
+            "(response truncated at the output-token limit while emitting "
+            "a tool call)"
+        )
+
+
 # ------------------------------------------------------------- error mapping
 
 

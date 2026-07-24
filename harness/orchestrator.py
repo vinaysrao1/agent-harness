@@ -50,6 +50,7 @@ from harness.adapters import get_adapter
 from harness.adapters.base import ModelAdapter
 from harness.config import HarnessConfig, PermissionMode
 from harness.context import ContextManager
+from harness.deadline import Deadline
 from harness.loop import AgentLoop, AgentResult, AskCallable, Budgets
 from harness.memory.store import MemoryStore
 from harness.permissions import Policy, ToolMeta
@@ -187,6 +188,11 @@ class ToolDeps:
     store: RunStore
     run_id: str
     context: ContextManager
+    #: The run's shared wall-clock deadline (``None`` = no deadline), so
+    #: deadline-aware tools (e.g. a bash exec cap) can consult the same
+    #: countdown as the loops. One instance per run: lead, subagents, and
+    #: every tool factory all see the identical object.
+    deadline: Deadline | None = None
 
 
 #: A tool factory: binds the live dependency bundle into a ready
@@ -199,7 +205,7 @@ ToolFactory = Callable[[ToolDeps], Tool]
 #: ``declare_verification`` (§10.3 B1 — the loop re-runs the declared
 #: command before accepting completion).
 CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
-    lambda deps: bash_tool(deps.sandbox),
+    lambda deps: bash_tool(deps.sandbox, deadline=deps.deadline),
     lambda deps: read_file_tool(deps.sandbox),
     lambda deps: write_file_tool(deps.sandbox),
     lambda deps: edit_file_tool(deps.sandbox),
@@ -374,6 +380,7 @@ class Orchestrator:
         domain_rules: str | None = None,
         tool_factories: Sequence[ToolFactory] | None = None,
         profile: Profile | None = None,
+        deadline: Deadline | None = None,
     ) -> tuple[str, AgentResult]:
         """Run one task end-to-end and return ``(run_id, lead result)``.
 
@@ -414,6 +421,16 @@ class Orchestrator:
         Subagents inherit the lead's factories and rules (v1, §11.4:
         heterogeneous subagents are deferred to M9b).
 
+        ``deadline``, when provided, is the run's shared wall-clock
+        :class:`~harness.deadline.Deadline`, anchored by the caller where
+        the external kill clock actually starts (the Harbor bridge anchors
+        at its ``run()`` entry, *before* sandbox startup, so setup time is
+        correctly counted against the budget). It is the single source of
+        truth for remaining time: lead loop, every subagent loop, and every
+        tool factory receive the same instance. When ``None`` but
+        ``budgets.wall_clock_seconds`` is set, :meth:`_execute` constructs
+        one from it — the pre-seam behavior for direct callers.
+
         Raises :class:`UnknownModelError` (before any rows are created) if
         ``model_name`` is not configured and no override is given.
         """
@@ -441,6 +458,7 @@ class Orchestrator:
             sandbox_override=sandbox,
             domain_rules=domain_rules,
             tool_factories=tool_factories,
+            deadline=deadline,
         )
         return run_id, result
 
@@ -451,6 +469,7 @@ class Orchestrator:
         *,
         adapter_override: ModelAdapter | AdapterFactory | None = None,
         budgets: Budgets | None = None,
+        deadline: Deadline | None = None,
     ) -> AgentResult:
         """Resume a persisted run (v1) and return the lead agent's result.
 
@@ -468,6 +487,13 @@ class Orchestrator:
           consumed — matching the live-run scoping, where every subagent
           gets its own fresh budget and spends nothing of the lead's. If
           nothing remains the loop pauses again immediately.
+          ``max_output_tokens`` and ``wall_clock_seconds`` carry through
+          unchanged: the former is a per-call cap with nothing to
+          subtract, and the wall clock restarts fresh on resume because
+          the external deadline it mirrors is per-invocation.
+          ``deadline`` (like :meth:`run_task`'s) is likewise
+          per-invocation: pass a freshly anchored one, or rely on
+          ``budgets.wall_clock_seconds`` for the self-built fallback.
         - The default run workspace ``<home>/runs/<run_id>/workspace`` is
           used — a custom workspace from the original invocation is not
           recorded in v1.
@@ -517,6 +543,12 @@ class Orchestrator:
         remaining = Budgets(
             max_turns=max(base.max_turns - turns_used, 0),
             max_tokens=max(base.max_tokens - tokens_used, 0),
+            # Carried through unchanged: max_output_tokens is a per-call cap
+            # (nothing to subtract), and wall_clock_seconds restarts fresh —
+            # the external deadline it mirrors is per-invocation, so the
+            # resumed invocation gets the full window again.
+            max_output_tokens=base.max_output_tokens,
+            wall_clock_seconds=base.wall_clock_seconds,
         )
         restored_grants = [
             event.payload["pattern"]
@@ -539,6 +571,7 @@ class Orchestrator:
             model_label=run.model,
             replay=True,
             grants=restored_grants,
+            deadline=deadline,
         )
 
     # -- construction helpers ------------------------------------------------
@@ -650,6 +683,7 @@ class Orchestrator:
         run_id: str,
         context: ContextManager,
         tool_factories: Sequence[ToolFactory] | None = None,
+        deadline: Deadline | None = None,
     ) -> ToolRegistry:
         """Build a registry from ``tool_factories`` bound to this run.
 
@@ -660,6 +694,9 @@ class Orchestrator:
         manager: ``load_skill`` splices bodies into its system prompt
         (§4.6), ``task_update`` refreshes its task-ledger snapshot (§4.9),
         and ``add_instruction`` feeds its instruction ledger (§4.5).
+        ``deadline`` is the run's shared wall-clock deadline (resolved at
+        the top of :meth:`_execute`, *before* any registry is built, so
+        every factory sees it).
 
         This is the **subagent-shaped** registry: it deliberately excludes
         ``spawn_agent``/``await_agents`` (depth cap 1); :meth:`_execute`
@@ -672,6 +709,7 @@ class Orchestrator:
             store=self.store,
             run_id=run_id,
             context=context,
+            deadline=deadline,
         )
         factories = (
             CODING_TOOL_FACTORIES if tool_factories is None else tool_factories
@@ -802,6 +840,7 @@ class Orchestrator:
         sandbox_override: Sandbox | None = None,
         domain_rules: str | None = None,
         tool_factories: Sequence[ToolFactory] | None = None,
+        deadline: Deadline | None = None,
     ) -> AgentResult:
         """Shared engine behind :meth:`run_task` and :meth:`resume_task`.
 
@@ -833,6 +872,14 @@ class Orchestrator:
         status is set from the outcome (the lead result's status, or
         ``error`` if the engine itself raised).
         """
+        # Resolve the run's shared wall-clock deadline FIRST — before any
+        # registry/ToolDeps construction below — so every tool factory and
+        # every loop (lead and subagents) receives the same instance. An
+        # injected deadline (anchored by the caller where the external kill
+        # clock starts) wins; otherwise budgets.wall_clock_seconds, when
+        # set, anchors one here — the pre-seam behavior for direct callers.
+        if deadline is None and budgets.wall_clock_seconds is not None:
+            deadline = Deadline(budgets.wall_clock_seconds)
         self._live_loops = []
         self._grants = list(grants)
         self._lead_agent_id = lead_agent_id
@@ -938,6 +985,9 @@ class Orchestrator:
                 # Re-arms the B1 gate on resume with the last persisted
                 # declaration (None for fresh runs and subagents).
                 declared_command=declared_command,
+                # The run's ONE shared deadline: a subagent spawned late
+                # in the run counts down from the same anchor as the lead.
+                deadline=deadline,
             )
             self._live_loops.append(loop)
             return loop
@@ -999,6 +1049,7 @@ class Orchestrator:
                             run_id,
                             child_context,
                             tool_factories,
+                            deadline,
                         )
                         child_loop = build_loop(
                             child_adapter,
@@ -1065,7 +1116,7 @@ class Orchestrator:
         lead_adapter = make_adapter()
         lead_context = build_context(lead_adapter)
         lead_registry = self._build_registry(
-            sandbox, memory, skills, run_id, lead_context, tool_factories
+            sandbox, memory, skills, run_id, lead_context, tool_factories, deadline
         )
         lead_registry.register(_spawn_agent_tool(spawn_handler))
         lead_registry.register(_await_agents_tool(await_handler))

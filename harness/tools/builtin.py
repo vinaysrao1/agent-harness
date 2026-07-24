@@ -42,6 +42,7 @@ import json
 import re
 from typing import TYPE_CHECKING
 
+from harness.deadline import EXEC_CAP_FLOOR_SECONDS, EXEC_RESERVE_SECONDS, Deadline
 from harness.diligence import VERIFICATION_TOOL_NAME
 from harness.memory.store import FactType, MemoryStore
 from harness.permissions import ToolMeta
@@ -106,7 +107,7 @@ def _require_str(tool_name: str, arguments: dict, key: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def bash_tool(sandbox: Sandbox) -> Tool:
+def bash_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
     """Build the ``bash`` tool: runs a shell command in ``sandbox``.
 
     Result is exit code + stdout + stderr formatted as plain text -- no
@@ -115,6 +116,16 @@ def bash_tool(sandbox: Sandbox) -> Tool:
     result-string boilerplate) rather than printed as empty headers -- most
     successful commands produce no stderr, and paying two boilerplate lines
     for that on every single `bash` call (the highest-volume tool) adds up.
+
+    ``deadline`` (wind-down plan §Fix 3a), when given, caps the requested
+    ``timeout`` by what wall-clock is actually left: a command allowed to
+    run past the run's own external kill would never get its result back to
+    the model at all. The requested timeout is honored as long as
+    ``remaining - EXEC_RESERVE_SECONDS`` covers it; otherwise it is shortened
+    to that (never below ``EXEC_CAP_FLOOR_SECONDS``, so even a nearly-spent
+    budget still gets a usable exec window rather than a spuriously-failing
+    one). ``deadline=None`` (the default) or an unset deadline budget is a
+    pure passthrough -- today's behavior, unchanged.
     """
 
     spec = ToolSpec(
@@ -122,7 +133,9 @@ def bash_tool(sandbox: Sandbox) -> Tool:
         description=(
             "Run a shell command in the sandbox workspace and return its "
             "exit code, stdout, and stderr. Times out after `timeout` "
-            "seconds (default 120)."
+            "seconds (default 120). Near the run's wall-clock deadline, "
+            "this timeout may be capped shorter to preserve time to land a "
+            "final answer."
         ),
         input_schema={
             "type": "object",
@@ -142,11 +155,32 @@ def bash_tool(sandbox: Sandbox) -> Tool:
 
     async def handler(arguments: dict) -> str:
         command = _require_str("bash", arguments, "command")
-        timeout = float(arguments.get("timeout", 120))
-        result = await sandbox.exec(command, timeout=timeout)
+        requested = float(arguments.get("timeout", 120))
+        remaining = deadline.remaining() if deadline is not None else None
+        if remaining is None:
+            effective = requested
+        else:
+            effective = min(
+                requested, max(EXEC_CAP_FLOOR_SECONDS, remaining - EXEC_RESERVE_SECONDS)
+            )
+        capped = effective < requested
+        result = await sandbox.exec(command, timeout=effective)
         lines = [f"exit code: {result.exit_code}"]
         if result.timed_out:
-            lines.append(f"(command timed out after {timeout}s)")
+            if capped:
+                lines.append(
+                    f"(command timed out after {effective}s — capped from "
+                    f"your requested {requested}s because only ~{remaining}s "
+                    "of wall-clock remain; do not re-run long commands, "
+                    "finalize your answer now)"
+                )
+            else:
+                lines.append(f"(command timed out after {effective}s)")
+        elif capped:
+            lines.append(
+                f"(note: timeout was capped to {effective}s to fit the "
+                "remaining time budget)"
+            )
         if result.stdout:
             lines.append("--- stdout ---")
             lines.append(result.stdout)

@@ -64,6 +64,32 @@ a warning (path-jailed but not isolated).
 | Memory & skills | `harness/memory/store.py`, `harness/skills.py` |
 | Persistence | `harness/persistence.py` (SQLite event log, resume) |
 
+## TB2 run playbook
+
+When running against Harbor trials:
+
+**Pre-build images** — Pre-pull images before a scored run to avoid EnvStart timeouts:
+```bash
+harbor run <config> ... --install-only   # Install/build, skip agent & verifier
+harbor run <config> ... [normal run]     # Reuses cached images
+```
+
+**Verifier and build headroom** — On contended hosts, add timeout multipliers:
+```bash
+--timeout-multiplier 1.2                        # Global (all timeouts)
+--verifier-timeout-multiplier 1.5               # Verifier only
+--environment-build-timeout-multiplier 1.5      # Docker build only
+```
+Multipliers override `--timeout-multiplier`. Do not bump `--agent-timeout-multiplier`
+on scored runs (changes the benchmark condition; if used, Fix 1's derivation reads
+it from `config.json` automatically).
+
+**Manual deadline overrides** — Set per-invocation:
+```bash
+export HARNESS_WALL_CLOCK_SECONDS=<seconds>     # Env override (highest priority)
+--agent-kwarg agent_timeout_sec=<seconds>       # Alternative: via agent kwarg
+```
+
 ## Status
 
 Milestones M1–M4 of DESIGN.md §7 are implemented (loop, durability, permissions,

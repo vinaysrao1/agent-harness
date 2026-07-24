@@ -25,6 +25,7 @@ Harbor code, so our test suite never needs Harbor installed.
 from __future__ import annotations
 
 import os
+import tomllib
 import warnings
 from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
@@ -32,6 +33,7 @@ from typing import Any
 
 try:
     from harbor.agents.base import BaseAgent
+    from harbor.models.trial.config import TrialConfig
 except ImportError as exc:  # pragma: no cover - exercised via stubs in tests
     raise ImportError(
         "harness.integrations.harbor_agent requires the 'harbor' package, "
@@ -50,6 +52,7 @@ from harness.config import (
     PermissionMode,
     load_config,
 )
+from harness.deadline import Deadline
 from harness.loop import AgentResult, Budgets
 from harness.orchestrator import Orchestrator
 from harness.permissions import ToolMeta
@@ -91,6 +94,64 @@ async def _never_ask(tool_name: str, arguments: dict, meta: ToolMeta) -> bool:
     denying is the only sane headless answer.
     """
     return False
+
+
+def _parse_timeout_seconds(raw: object, *, source: str) -> float | None:
+    """Defensively parse a timeout-in-seconds value; unusable input is ``None``.
+
+    Mirrors the tolerant spirit of Harbor's cline agent
+    (``_parse_timeout_seconds``): accepts positive ints/floats and numeric
+    strings; anything else — including booleans, non-positive numbers, and
+    garbage strings — warns and returns ``None`` rather than failing the
+    whole trial.
+    """
+    if raw is None:
+        return None
+    value = float("nan")
+    if isinstance(raw, bool):
+        pass  # bool is an int subclass but never a sane timeout
+    elif isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            pass
+    if not value > 0:  # also rejects the NaN sentinel
+        warnings.warn(
+            f"{source}={raw!r} is not a positive number of seconds; ignoring",
+            UserWarning,
+            stacklevel=3,
+        )
+        return None
+    return value
+
+
+def _resolve_deadline(
+    base: float | None,
+    override: float | None,
+    max_sec: float | None,
+    agent_multiplier: float | None,
+    global_multiplier: float,
+) -> float | None:
+    """Harbor's per-trial agent-timeout math, replicated exactly.
+
+    Pure function of its arguments (separately testable). Mirrors Harbor
+    0.20.0's ``Trial._compute_agent_timeout_sec`` + ``_resolve_timeout_sec``
+    (``harbor/trial/trial.py``): the trial config's
+    ``agent.override_timeout_sec`` wins over the task's ``timeout_sec``;
+    the result is clamped to ``agent.max_timeout_sec`` (when set) and scaled
+    by ``agent_timeout_multiplier``, falling back to the global
+    ``timeout_multiplier``. Returns ``None`` when neither the task nor the
+    trial config sets a timeout — Harbor then enforces no agent deadline.
+    """
+    effective_base = override or base
+    if effective_base is None:
+        return None
+    multiplier = (
+        agent_multiplier if agent_multiplier is not None else global_multiplier
+    )
+    return min(effective_base, max_sec or float("inf")) * multiplier
 
 
 def resolve_model(model_name: str | None, config: HarnessConfig) -> ModelConfig:
@@ -150,13 +211,39 @@ class HarnessAgent(BaseAgent):
     """Runs the agent harness as a Harbor custom agent.
 
     Harbor constructs one instance per trial with ``logs_dir`` /
-    ``model_name`` / assorted extras (``task_dir``, ``trial_paths``,
-    ``agent_timeout_sec``, ...); the base-class ``__init__`` accepts and
-    absorbs those, so no override is needed here. :meth:`run` drives one
+    ``model_name`` / assorted extras (``task_dir``, ``trial_paths``, ...);
+    the base-class ``__init__`` accepts and absorbs those.
+    ``agent_timeout_sec`` is declared explicitly here (see
+    :meth:`__init__`) because it feeds the wall-clock wind-down.
+    :meth:`run` drives one
     :meth:`~harness.orchestrator.Orchestrator.run_task` inside the Harbor
     task container and reports token usage back through Harbor's
     ``AgentContext``.
     """
+
+    def __init__(
+        self,
+        *args: Any,
+        agent_timeout_sec: float | int | str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Declare ``agent_timeout_sec``; forward everything else to Harbor.
+
+        Harbor 0.20.0 does **not** pass ``agent_timeout_sec`` to custom
+        import-path agents — only to its own Oracle agent
+        (``Trial._init_agent``, ``harbor/trial/trial.py``); custom agents
+        receive just ``logs_dir`` / ``model_name`` / ``extra_env`` /
+        ``config.kwargs`` (``harbor/agents/factory.py``). That gap is why
+        :meth:`_derive_harbor_deadline` exists. Declaring the kwarg anyway
+        (a) makes a manual ``--agent-kwarg agent_timeout_sec=N`` override
+        work today and (b) future-proofs for Harbor versions that pass it
+        to all agents. Parsed defensively: a garbage value warns and is
+        ignored rather than failing the trial.
+        """
+        super().__init__(*args, **kwargs)
+        self.agent_timeout_sec: float | None = _parse_timeout_seconds(
+            agent_timeout_sec, source="agent_timeout_sec"
+        )
 
     @staticmethod
     def name() -> str:
@@ -191,6 +278,16 @@ class HarnessAgent(BaseAgent):
         failed trial; the exception is re-raised so Harbor marks the
         failure.
         """
+        # Anchor the wall-clock deadline first: Harbor's kill clock
+        # (asyncio.wait_for around this coroutine, trial.py) starts at
+        # run() entry, so everything below — model resolution, RunStore
+        # open, sandbox start (a 120s worst case) — must consume the
+        # budget, not silently extend it. The Deadline object is the
+        # single source of truth on this path; Budgets.wall_clock_seconds
+        # is deliberately NOT set (it would re-anchor inside the loop and
+        # miss the pre-loop setup time).
+        deadline = Deadline(self._wall_clock_budget())
+
         harness_home = Path(self.logs_dir) / "harness-home"
         harness_home.mkdir(parents=True, exist_ok=True)
         # Deliberately NOT exported as $HARNESS_HOME: Harbor runs trials
@@ -210,7 +307,6 @@ class HarnessAgent(BaseAgent):
             max_output_tokens=self._int_setting(
                 "HARNESS_MAX_OUTPUT_TOKENS", _DEFAULT_MAX_OUTPUT_TOKENS
             ),
-            wall_clock_seconds=self._wall_clock_budget(),
         )
 
         sandbox = HarborSandbox(environment)
@@ -230,6 +326,7 @@ class HarnessAgent(BaseAgent):
                     adapter_override=adapter,
                     budgets=budgets,
                     sandbox=sandbox,
+                    deadline=deadline,
                 )
             except BaseException as exc:
                 error = exc
@@ -265,32 +362,92 @@ class HarnessAgent(BaseAgent):
     def _wall_clock_budget(self) -> float | None:
         """The per-trial wall-clock deadline that drives loop wind-down.
 
-        Prefers an explicit ``HARNESS_WALL_CLOCK_SECONDS`` override, then
-        Harbor's own per-trial ``agent_timeout_sec`` (the deadline after which
-        Harbor raises ``AgentTimeoutError`` and kills the trial mid-turn) — so
-        the loop can inject its wind-down reminder and land a best-effort
-        answer *before* that hard kill. Returns ``None`` (wind-down disabled)
-        when neither is available or the value is unusable, rather than
-        guessing a deadline that might not match Harbor's.
+        Resolution order:
+
+        1. An explicit ``HARNESS_WALL_CLOCK_SECONDS`` override (extra_env,
+           then the process environment) — the manual escape hatch. Parsed
+           with the same defensive contract as the kwarg path
+           (:func:`_parse_timeout_seconds`): non-positive or garbage values
+           warn and fall through rather than arming an instant hard stop.
+        2. The ``agent_timeout_sec`` constructor kwarg (``--agent-kwarg``),
+           parsed in :meth:`__init__`. Harbor 0.20.0 never passes it to
+           custom agents, so under a plain ``harbor run`` this is unset.
+        3. :meth:`_derive_harbor_deadline` — re-deriving the exact deadline
+           after which Harbor raises ``AgentTimeoutError`` and kills the
+           trial mid-turn, from the trial state Harbor writes to disk — so
+           the loop can inject its wind-down reminder and land a
+           best-effort answer *before* that hard kill.
+
+        Returns ``None`` (wind-down disabled) when none of these yields a
+        usable value, rather than guessing a deadline that might not match
+        Harbor's.
         """
         override = self.extra_env.get(
             "HARNESS_WALL_CLOCK_SECONDS",
             os.environ.get("HARNESS_WALL_CLOCK_SECONDS"),
         )
         if override is not None:
-            try:
-                return float(override)
-            except ValueError:
-                warnings.warn(
-                    f"HARNESS_WALL_CLOCK_SECONDS={override!r} is not a number; "
-                    "ignoring",
-                    UserWarning,
-                    stacklevel=2,
-                )
-        timeout = getattr(self, "agent_timeout_sec", None)
-        if isinstance(timeout, (int, float)) and timeout > 0:
-            return float(timeout)
-        return None
+            parsed = _parse_timeout_seconds(
+                override, source="HARNESS_WALL_CLOCK_SECONDS"
+            )
+            if parsed is not None:
+                return parsed
+        if self.agent_timeout_sec is not None:
+            return self.agent_timeout_sec
+        return self._derive_harbor_deadline()
+
+    def _derive_harbor_deadline(self) -> float | None:
+        """Derive Harbor's per-trial agent timeout from on-disk trial state.
+
+        Harbor 0.20.0 passes ``agent_timeout_sec`` only to its own Oracle
+        agent (``Trial._init_agent``), never to custom import-path agents —
+        yet it still enforces the deadline with ``asyncio.wait_for`` around
+        :meth:`run`. Everything needed to re-derive it deterministically is
+        on disk before the agent phase starts:
+
+        - ``<trial_dir>/config.json`` (written in ``Trial._init_result``),
+          parsed as :class:`harbor.models.trial.config.TrialConfig`;
+          ``logs_dir`` is ``<trial_dir>/agent`` (``TrialPaths.agent_dir``),
+          so the trial dir is its parent.
+        - the cached task directory, located via the public
+          ``config.task.get_task_id().get_local_path()``, whose
+          ``task.toml`` carries the task's ``[agent] timeout_sec``.
+
+        The math replicates ``Trial._compute_agent_timeout_sec`` exactly
+        (see :func:`_resolve_deadline`), so config-level overrides, clamps,
+        and ``--timeout-multiplier``/``--agent-timeout-multiplier`` are all
+        honored. Multi-step tasks (``[[steps]]`` in ``task.toml``) time out
+        per-step, not per-trial, so they return ``None`` explicitly (TB2
+        tasks are single-step). Any other miss — missing/moved files,
+        malformed TOML, Harbor model drift — warns and returns ``None``:
+        wind-down disabled, i.e. prior behavior, never an exception.
+        """
+        try:
+            trial_dir = Path(self.logs_dir).parent
+            trial_config = TrialConfig.model_validate_json(
+                (trial_dir / "config.json").read_text()
+            )
+            task_dir = trial_config.task.get_task_id().get_local_path()
+            task_config = tomllib.loads((task_dir / "task.toml").read_text())
+            if task_config.get("steps"):
+                return None  # multi-step: per-step timeouts, not derivable
+            timeout_sec = task_config.get("agent", {}).get("timeout_sec")
+            return _resolve_deadline(
+                base=timeout_sec,
+                override=trial_config.agent.override_timeout_sec,
+                max_sec=trial_config.agent.max_timeout_sec,
+                agent_multiplier=trial_config.agent_timeout_multiplier,
+                global_multiplier=trial_config.timeout_multiplier,
+            )
+        except Exception as exc:
+            warnings.warn(
+                "could not derive Harbor's per-trial agent timeout "
+                f"({type(exc).__name__}: {exc}); wall-clock wind-down "
+                "disabled for this trial",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
 
     def _int_setting(self, name: str, default: int) -> int:
         """Read an integer setting from ``extra_env`` then ``os.environ``.
