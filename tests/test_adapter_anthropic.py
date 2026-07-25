@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +11,8 @@ import pytest
 
 from harness.adapters.anthropic import (
     DEFAULT_MAX_TOKENS,
+    EMPTY_ASSISTANT_PLACEHOLDER,
+    EMPTY_MESSAGE_PLACEHOLDERS,
     AnthropicAdapter,
     from_anthropic_response,
     map_stop_reason,
@@ -19,6 +22,7 @@ from harness.adapters.anthropic import (
     wrap_anthropic_error,
 )
 from harness.adapters.base import AdapterError
+from harness.diligence import looks_unfinished
 from harness.types import (
     Message,
     Role,
@@ -169,6 +173,83 @@ class TestToAnthropicMessages:
         with pytest.raises(AdapterError, match="no tool_result"):
             to_anthropic_messages([Message(role=Role.TOOL)], cache=False)
 
+    def test_empty_assistant_message_gets_placeholder_not_error(self) -> None:
+        # C1 replay backstop, Anthropic parity: an assistant message with
+        # neither content nor tool calls must stay translatable.
+        with pytest.warns(UserWarning, match="neither content nor tool calls"):
+            out = to_anthropic_messages(
+                [Message(role=Role.ASSISTANT)], cache=False
+            )
+        assert out == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": EMPTY_ASSISTANT_PLACEHOLDER}
+                ],
+            }
+        ]
+
+    def test_empty_assistant_placeholder_is_diligence_safe(self) -> None:
+        assert not EMPTY_ASSISTANT_PLACEHOLDER.rstrip().endswith("?")
+        unfinished, _reason = looks_unfinished(EMPTY_ASSISTANT_PLACEHOLDER, 0)
+        assert unfinished is False
+
+    def test_empty_assistant_placeholder_not_written_back(self) -> None:
+        message = Message(role=Role.ASSISTANT)
+        with pytest.warns(UserWarning):
+            to_anthropic_messages([message], cache=False)
+        assert message.content is None
+        assert message.tool_calls == []
+
+    def test_empty_assistant_placeholder_takes_cache_breakpoint(self) -> None:
+        # The placeholder is a real block, so the trailing cache breakpoint
+        # still lands on it rather than on nothing.
+        with pytest.warns(UserWarning):
+            out = to_anthropic_messages(
+                [Message(role=Role.USER, content="go"), Message(role=Role.ASSISTANT)],
+                cache=True,
+            )
+        assert out[-1]["content"][-1] == {
+            "type": "text",
+            "text": EMPTY_ASSISTANT_PLACEHOLDER,
+            "cache_control": EPHEMERAL,
+        }
+
+    def test_empty_assistant_merges_into_preceding_assistant_turn(self) -> None:
+        with pytest.warns(UserWarning):
+            out = to_anthropic_messages(
+                [
+                    Message(role=Role.ASSISTANT, content="first"),
+                    Message(role=Role.ASSISTANT),
+                ],
+                cache=False,
+            )
+        assert out == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": EMPTY_ASSISTANT_PLACEHOLDER},
+                ],
+            }
+        ]
+
+    def test_assistant_tool_calls_without_content_emit_no_warning(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = to_anthropic_messages(
+                [
+                    Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[ToolCall(id="c1", name="bash", arguments={})],
+                    )
+                ],
+                cache=False,
+            )
+        assert out[0]["content"] == [
+            {"type": "tool_use", "id": "c1", "name": "bash", "input": {}}
+        ]
+
 
 class TestSystemAndTools:
     def test_system_none(self) -> None:
@@ -229,10 +310,17 @@ class TestFromAnthropicResponse:
         assert usage.cache_read_tokens == 0
         assert usage.cache_write_tokens == 0
 
-    def test_empty_content_is_none(self) -> None:
+    def test_empty_content_gets_a_placeholder_body(self) -> None:
+        # Parity with the OpenAI-compatible adapter: an assistant message with
+        # nothing in it must never be produced, because replaying one forces
+        # the translator to invent a body (and a real run died at turn 1 that
+        # way). stop_reason="end_turn" is recognised, so this is NOT incomplete
+        # — the M1 gate confines re-prompting to unrecognised stop reasons.
         result = from_anthropic_response(fake_response(content=[]))
-        assert result.message.content is None
+        assert result.message.content == EMPTY_MESSAGE_PLACEHOLDERS[None]
         assert result.message.tool_calls == []
+        assert result.incomplete is False
+        assert result.incomplete_reason is None
 
     def test_round_trip_ours_to_provider_to_ours(self) -> None:
         resp = fake_response(
@@ -278,6 +366,147 @@ class TestFromAnthropicResponse:
     ) -> None:
         assert map_stop_reason(provider) is ours
 
+    @pytest.mark.parametrize(
+        ("provider", "ours"),
+        [
+            ("end_turn", StopReason.END_TURN),
+            ("tool_use", StopReason.TOOL_USE),
+            ("max_tokens", StopReason.MAX_TOKENS),
+            ("some_new_reason", StopReason.ERROR),
+            (None, StopReason.ERROR),
+        ],
+    )
+    def test_provider_stop_reason_carried_through_verbatim(
+        self, provider: str | None, ours: StopReason
+    ) -> None:
+        """§C2 parity with the OpenAI adapter: the API's raw stop_reason
+        survives translation untouched while stop_reason maps as before.
+        The last two rows are the point — mapping alone cannot distinguish
+        an unmapped provider string from a missing one."""
+        result = from_anthropic_response(fake_response(stop_reason=provider))
+        assert result.provider_stop_reason == provider
+        assert result.stop_reason is ours
+
+    def test_provider_stop_reason_absent_attribute_is_none(self) -> None:
+        """A response object with no stop_reason attribute at all (not
+        merely None) must not raise; provenance is best-effort."""
+        response = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="hi")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+        result = from_anthropic_response(response)
+        assert result.provider_stop_reason is None
+        assert result.stop_reason is StopReason.ERROR
+
+
+# ------------------------------- incomplete-turn parity with openai_compat
+
+
+class TestIncompleteDerivation:
+    """§C4 parity. Anthropic delivers ``tool_use`` inputs pre-parsed, so this
+    adapter has no malformed-arguments case and never drops a call; it mirrors
+    the other two precedence rows and the empty-message placeholder table."""
+
+    def test_max_tokens_is_incomplete(self) -> None:
+        result = from_anthropic_response(
+            fake_response(content=[], stop_reason="max_tokens")
+        )
+        assert result.incomplete is True
+        assert result.incomplete_reason == "max_tokens"
+        assert result.message.content == EMPTY_MESSAGE_PLACEHOLDERS[
+            "max_tokens"
+        ]
+
+    def test_max_tokens_with_content_is_still_incomplete(self) -> None:
+        # max_tokens is unconditional per the precedence table.
+        result = from_anthropic_response(
+            fake_response(
+                content=[SimpleNamespace(type="text", text="half a thou")],
+                stop_reason="max_tokens",
+            )
+        )
+        assert result.incomplete_reason == "max_tokens"
+        assert result.message.content == "half a thou"
+
+    def test_missing_stop_reason_with_empty_message_is_no_finish_reason(
+        self,
+    ) -> None:
+        result = from_anthropic_response(
+            fake_response(content=[], stop_reason=None)
+        )
+        assert result.incomplete_reason == "no_finish_reason"
+        assert result.message.content == EMPTY_MESSAGE_PLACEHOLDERS[
+            "no_finish_reason"
+        ]
+
+    def test_missing_stop_reason_with_content_is_not_incomplete(self) -> None:
+        """The M1 gate, mirrored: an unmapped or absent stop reason on a
+        response that still said something useful must not earn re-prompts."""
+        result = from_anthropic_response(
+            fake_response(
+                content=[SimpleNamespace(type="text", text="The answer is 42.")],
+                stop_reason="some_future_reason",
+            )
+        )
+        assert result.stop_reason is StopReason.ERROR
+        assert result.incomplete is False
+        assert result.incomplete_reason is None
+
+    def test_unmapped_stop_reason_with_only_a_tool_use_is_not_incomplete(
+        self,
+    ) -> None:
+        result = from_anthropic_response(
+            fake_response(
+                content=[
+                    SimpleNamespace(
+                        type="tool_use", id="c1", name="bash", input={"cmd": "ls"}
+                    )
+                ],
+                stop_reason=None,
+            )
+        )
+        assert result.incomplete is False
+
+    def test_clean_end_turn_is_not_incomplete(self) -> None:
+        result = from_anthropic_response(
+            fake_response(
+                content=[SimpleNamespace(type="text", text="done")],
+                stop_reason="end_turn",
+            )
+        )
+        assert result.incomplete is False
+        assert result.dropped_tool_calls == []
+
+    @pytest.mark.parametrize(
+        "reason", ["max_tokens", "no_finish_reason", None]
+    )
+    def test_placeholders_replay_and_do_not_look_unfinished(
+        self, reason: str | None
+    ) -> None:
+        # Each placeholder becomes assistant content, so it must survive
+        # re-translation without the C1 warning and must not read as promised
+        # future work if it reaches the diligence check.
+        text = EMPTY_MESSAGE_PLACEHOLDERS[reason]
+        message = Message(role=Role.ASSISTANT, content=text)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            (entry,) = to_anthropic_messages([message], cache=False)
+        assert entry["content"][0]["text"] == text
+        assert looks_unfinished(text, 0)[0] is False
+
+    def test_placeholder_table_matches_the_openai_adapter_verbatim(
+        self,
+    ) -> None:
+        # Kept textually identical on purpose (same rationale as
+        # EMPTY_ASSISTANT_PLACEHOLDER): a transcript must read the same
+        # whichever provider produced it.
+        from harness.adapters.openai_compat import (
+            EMPTY_MESSAGE_PLACEHOLDERS as OPENAI_PLACEHOLDERS,
+        )
+
+        for reason, text in EMPTY_MESSAGE_PLACEHOLDERS.items():
+            assert OPENAI_PLACEHOLDERS[reason] == text
+
 
 # ------------------------------------------------------------- error mapping
 
@@ -322,6 +551,58 @@ class TestWrapAnthropicError:
     def test_adapter_error_passthrough(self) -> None:
         original = AdapterError("already wrapped", retryable=True)
         assert wrap_anthropic_error(original) is original
+
+
+class _FakeStatusErrorWithBody(Exception):
+    """A status error whose str() carries the provider's error body."""
+
+    def __init__(self, status_code: int, body: str) -> None:
+        super().__init__(body)
+        self.status_code = status_code
+
+
+class TestWrapAnthropicErrorFault:
+    """Provider-fault classification must be identical across adapters.
+
+    Both wrappers delegate to the one shared
+    :func:`~harness.adapters.base.classify_http_fault` rule precisely so the
+    taxonomy cannot drift between providers; these are the parity tests.
+    """
+
+    @pytest.mark.parametrize(
+        "status,want",
+        [
+            (401, "auth"),
+            (402, "quota"),
+            (429, "rate_limit"),
+            (500, "server"),
+            (529, "server"),  # Anthropic's overloaded_error
+            (400, None),
+            (404, None),
+            (422, None),
+        ],
+    )
+    def test_status_classification(self, status: int, want: str | None) -> None:
+        assert wrap_anthropic_error(FakeStatusError(status)).fault == want
+
+    def test_403_quota_body(self) -> None:
+        exc = _FakeStatusErrorWithBody(403, "Your credit balance is too low")
+        assert wrap_anthropic_error(exc).fault == "quota"
+
+    def test_403_non_quota_stays_a_scored_failure(self) -> None:
+        exc = _FakeStatusErrorWithBody(403, "request blocked in your region")
+        assert wrap_anthropic_error(exc).fault is None
+
+    def test_timeout_and_connection_are_transport_faults(self) -> None:
+        class APIConnectionError(Exception):
+            pass
+
+        assert wrap_anthropic_error(TimeoutError()).fault == "transport"
+        assert wrap_anthropic_error(FakeAPITimeoutError("slow")).fault == "transport"
+        assert wrap_anthropic_error(APIConnectionError("nope")).fault == "transport"
+
+    def test_unknown_error_unclassified(self) -> None:
+        assert wrap_anthropic_error(ValueError("bad input")).fault is None
 
 
 # ------------------------------------------------------------------ complete
@@ -420,6 +701,28 @@ class TestComplete:
         assert excinfo.value.retryable is True
         assert "hard timeout" in str(excinfo.value)
         assert HungAPI.calls == 1
+
+    async def test_hard_timeout_is_a_transport_fault_after_retries(self) -> None:
+        # Parity with the OpenAI adapter: complete()'s own timeout branch runs
+        # instead of wrap_anthropic_error, so it must carry the fault itself,
+        # and the classification has to survive an exhausted retry budget —
+        # that is the AdapterError the loop reads exc.fault off.
+        class HungAPI:
+            async def create(self, **kwargs: Any) -> Any:
+                await asyncio.sleep(10.0)
+
+        async def fake_sleep(delay: float) -> None:
+            return None
+
+        adapter = AnthropicAdapter(
+            "m",
+            client=SimpleNamespace(messages=HungAPI()),
+            request_timeout=0.02,
+            retry={"max_attempts": 3, "sleep": fake_sleep, "jitter": lambda: 0.0},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.fault == "transport"
 
     def test_capabilities(self) -> None:
         adapter = AnthropicAdapter("m", client=fake_client([]))

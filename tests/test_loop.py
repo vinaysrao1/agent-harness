@@ -19,13 +19,20 @@ from harness.adapters.fake import FakeAdapter
 from harness.config import PermissionMode
 from harness.context import COMPACTION_SUMMARY_PREFIX, ContextManager
 from harness.deadline import Deadline
-from harness.loop import AgentLoop, AgentResult, Budgets, wind_down_threshold
+from harness.loop import (
+    DROPPED_ARGUMENTS_PREFIX_CHARS,
+    AgentLoop,
+    AgentResult,
+    Budgets,
+    wind_down_threshold,
+)
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
 from harness.sandbox.local import LocalSandbox
 from harness.tools.builtin import bash_tool
 from harness.tools.registry import Tool, ToolRegistry
 from harness.types import (
+    DroppedToolCall,
     Message,
     ModelResponse,
     Role,
@@ -46,23 +53,55 @@ def resp(
     calls: list[ToolCall] | None = None,
     usage: Usage | None = None,
     stop_reason: StopReason | None = None,
+    provider_stop_reason: str | None = None,
+    dropped: list[DroppedToolCall] | None = None,
+    incomplete_reason: str | None = None,
 ) -> ModelResponse:
     """Build one scripted assistant response.
 
     ``stop_reason`` defaults to TOOL_USE when there are tool calls else
     END_TURN; pass it explicitly to script a truncated turn (MAX_TOKENS).
+    ``provider_stop_reason`` scripts the provider's verbatim stop string
+    (what the loop records on its ``model_turn`` event); ``None`` — the
+    default — models a provider that sent none.
+
+    ``incomplete``/``incomplete_reason`` are *derived* here using the same
+    precedence the real adapters apply (dropped_calls > max_tokens), so a
+    scripted response cannot claim a combination no adapter would produce.
+    Pass ``incomplete_reason`` explicitly for the ``no_finish_reason`` case,
+    which depends on the translated message being empty.
     """
     tool_calls = calls or []
     if stop_reason is None:
         stop_reason = (
             StopReason.TOOL_USE if tool_calls else StopReason.END_TURN
         )
+    if incomplete_reason is None:
+        if dropped:
+            incomplete_reason = "dropped_calls"
+        elif stop_reason is StopReason.MAX_TOKENS:
+            incomplete_reason = "max_tokens"
     return ModelResponse(
         message=Message(
             role=Role.ASSISTANT, content=content, tool_calls=tool_calls
         ),
         usage=usage or Usage(),
         stop_reason=stop_reason,
+        provider_stop_reason=provider_stop_reason,
+        incomplete=incomplete_reason is not None,
+        incomplete_reason=incomplete_reason,
+        dropped_tool_calls=dropped or [],
+    )
+
+
+def drop(
+    tool_name: str = "write_file", arguments: str = '{"path": "a.py", "c'
+) -> DroppedToolCall:
+    """One scripted dropped tool call, as an adapter would report it."""
+    return DroppedToolCall(
+        tool_name=tool_name,
+        raw_arguments_prefix=arguments,
+        raw_arguments_len=len(arguments),
     )
 
 
@@ -433,6 +472,7 @@ class TestBudgets:
         assert h.store.get_agent(h.agent_id).status == "paused_budget"
         assert h.event_kinds() == [
             "message",  # goal
+            "model_turn",  # turn 1 provenance (§C2)
             "message",  # assistant turn 1
             "tool_call",
             "decision",
@@ -550,23 +590,25 @@ class TestEventLog:
         events = h.store.load_events(h.agent_id)
         assert [e.kind for e in events] == [
             "message",  # goal (user)
+            "model_turn",  # turn 1 provenance (§C2)
             "message",  # assistant with tool call
             "tool_call",
             "decision",
             "tool_result",
+            "model_turn",  # turn 2 provenance (§C2)
             "message",  # final assistant
         ]
-        assert [e.seq for e in events] == list(range(1, 7))
+        assert [e.seq for e in events] == list(range(1, 9))
         assert events[0].payload["role"] == "user"
         assert events[0].payload["content"] == GOAL
-        assert events[1].payload["role"] == "assistant"
-        assert events[2].payload == {
+        assert events[2].payload["role"] == "assistant"
+        assert events[3].payload == {
             "id": "c1",
             "name": "echo",
             "arguments": {"text": "x"},
         }
-        assert events[4].payload["content"] == "echo:x"
-        assert events[5].payload["content"] == CLEAN_FINISH
+        assert events[5].payload["content"] == "echo:x"
+        assert events[7].payload["content"] == CLEAN_FINISH
 
     async def test_usage_recorded_per_model_call(self, tmp_path: Path) -> None:
         script = [
@@ -752,8 +794,9 @@ class TestAdapterError:
         assert result.turns == 0
         assert "exhausted" in (result.final_text or "")
         assert h.store.get_agent(h.agent_id).status == "error"
-        # The goal was still persisted before the failure.
-        assert h.event_kinds() == ["message"]
+        # The goal was still persisted before the failure, and the failure
+        # itself is on the record (§C2) — not only in the returned result.
+        assert h.event_kinds() == ["message", "run_error"]
 
     async def test_error_after_successful_turns_keeps_usage(
         self, tmp_path: Path
@@ -813,6 +856,162 @@ class TestAdapterError:
         assert result.status == "error"
         assert "throttled" in (result.final_text or "")
         assert adapter.attempts == 1  # exactly one complete() per turn
+
+
+class TestProviderFaultKind:
+    """AgentResult.error_kind carries the adapter's provider-fault
+    classification out of the loop, and the run_error event records it.
+
+    This is what lets an embedding benchmark harness tell an infrastructure
+    outage (an exhausted key killed 7 of 22 trials in one real run) apart
+    from an agent capability failure — without it, both look like a clean
+    completion with reward 0.
+    """
+
+    @staticmethod
+    def _failing_loop(h, fault: str | None, message: str = "provider died"):
+        """Point ``h``'s loop at an adapter that always raises with ``fault``."""
+        from typing import Any
+
+        from harness.adapters.base import AdapterError, ModelAdapter
+        from harness.types import Capabilities, ToolSpec
+
+        class FaultingAdapter(ModelAdapter):
+            @property
+            def capabilities(self) -> Capabilities:
+                return Capabilities(
+                    max_context=1_000_000, supports_cache_control=False
+                )
+
+            async def complete(
+                self,
+                messages: list[Message],
+                tools: list[ToolSpec],
+                system: str | None = None,
+                **params: Any,
+            ) -> ModelResponse:
+                raise AdapterError(message, fault=fault)
+
+        h.loop.adapter = FaultingAdapter()
+        return h
+
+    @pytest.mark.parametrize(
+        "fault",
+        ["quota", "auth", "rate_limit", "server", "transport"],
+    )
+    async def test_fault_becomes_error_kind(
+        self, tmp_path: Path, fault: str
+    ) -> None:
+        h = self._failing_loop(make_harness(tmp_path, []), fault)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.error_kind == fault
+
+    async def test_run_error_event_carries_error_kind(
+        self, tmp_path: Path
+    ) -> None:
+        """The classification must survive on disk, not only in the returned
+        object: post-hoc triage reads the transcript."""
+        h = self._failing_loop(
+            make_harness(tmp_path, []),
+            "quota",
+            "openai-compatible API error (HTTP 403): Key limit exceeded",
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.error_kind == "quota"
+        events = h.events("run_error")
+        assert len(events) == 1
+        assert events[0]["error_kind"] == "quota"
+        assert "Key limit exceeded" in events[0]["message"]
+        assert events[0]["turns"] == 0
+
+    async def test_unclassified_adapter_error_has_no_error_kind(
+        self, tmp_path: Path
+    ) -> None:
+        """An adapter that could not classify the failure leaves error_kind
+        None, so the run stays an ordinary scored failure. This is the
+        default and covers every pre-taxonomy AdapterError construction
+        site — including FakeAdapter's script-exhausted error."""
+        h = make_harness(tmp_path, [])  # empty script -> plain AdapterError
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.error_kind is None
+        assert h.events("run_error")[0]["error_kind"] is None
+
+    async def test_completed_run_has_no_error_kind(self, tmp_path: Path) -> None:
+        h = make_harness(tmp_path, [resp(CLEAN_FINISH)])
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.error_kind is None
+
+    async def test_budget_pause_has_no_error_kind(self, tmp_path: Path) -> None:
+        h = make_harness(
+            tmp_path,
+            [resp(None, [call("c1", "echo", text="x")])],
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=1),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.error_kind is None
+
+    async def test_fault_after_real_work_keeps_usage_and_turns(
+        self, tmp_path: Path
+    ) -> None:
+        """The case that matters most: a trial that did real work before the
+        provider died still reports what it accrued, alongside the fault."""
+        h = make_harness(
+            tmp_path,
+            [
+                resp(
+                    None,
+                    [call("c1", "echo", text="x")],
+                    usage=Usage(input_tokens=5, output_tokens=2),
+                )
+            ],
+            tools=[simple_tool("echo")],
+        )
+        # First call succeeds from the script; the adapter faults afterwards.
+        original = h.loop.adapter
+
+        from typing import Any
+
+        from harness.adapters.base import AdapterError, ModelAdapter
+        from harness.types import Capabilities, ToolSpec
+
+        class FaultAfterScript(ModelAdapter):
+            @property
+            def capabilities(self):
+                return original.capabilities
+
+            async def complete(
+                self,
+                messages: list[Message],
+                tools: list[ToolSpec],
+                system: str | None = None,
+                **params: Any,
+            ) -> ModelResponse:
+                try:
+                    return await original.complete(
+                        messages, tools, system, **params
+                    )
+                except AdapterError:
+                    raise AdapterError(
+                        "Key limit exceeded (total limit)", fault="quota"
+                    ) from None
+
+        h.loop.adapter = FaultAfterScript()
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.error_kind == "quota"
+        assert result.turns == 1
+        assert result.usage == Usage(input_tokens=5, output_tokens=2)
 
 
 class TestNudgePersistence:
@@ -1194,17 +1393,375 @@ class TestTruncationContinue:
         assert result.final_text == CLEAN_FINISH
         kinds = [e.kind for e in store.load_events(agent_id)]
         assert kinds.count("truncation_continue") == 1
-        # Turn 2's request replayed the transcript — the placeholder assistant
-        # message translated cleanly (no empty-message rejection) — and the
-        # reminder covering the cut-off-tool-call case reached the model.
+        # Turn 2's request replayed the transcript — the assistant message
+        # carrying the drop notice translated cleanly (no empty-message
+        # rejection) — and the dropped-call reminder reached the model.
         assert len(completions.calls) == 2
         turn2_contents = [
             str(m.get("content") or "") for m in completions.calls[1]["messages"]
         ]
-        assert any(
-            "truncated at the output-token limit" in c for c in turn2_contents
-        )
+        assert any("tool call was dropped" in c for c in turn2_contents)
         assert any("cut off mid-arguments" in c for c in turn2_contents)
+        # The drop is on the record, with the cut point visible.
+        (dropped,) = [
+            e.payload
+            for e in store.load_events(agent_id)
+            if e.kind == "tool_call_dropped"
+        ]
+        assert dropped["tool_name"] == "write_file"
+        assert dropped["raw_arguments_prefix"].startswith('{"path": "interp.py"')
+
+
+# ---------------------------------------------------------------------------
+# Incomplete-turn degradation (§C4)
+# ---------------------------------------------------------------------------
+
+
+class TestIncompleteTurnReminders:
+    """The continue now fires on ``incomplete``, not on MAX_TOKENS alone, and
+    the re-prompt names the actual cause. One text for three causes was
+    factually wrong for two of them, and a false diagnosis steers the model
+    away from the one action that would fix the turn."""
+
+    @pytest.mark.parametrize(
+        ("incomplete_reason", "phrase", "dropped"),
+        [
+            ("dropped_calls", "cut off mid-arguments", [drop()]),
+            ("max_tokens", "cut off at the output-token limit", None),
+            ("no_finish_reason", "ended without completing", None),
+        ],
+    )
+    async def test_reminder_text_matches_the_reason(
+        self,
+        tmp_path: Path,
+        incomplete_reason: str,
+        phrase: str,
+        dropped: list[DroppedToolCall] | None,
+    ) -> None:
+        script = [
+            resp(
+                content="(placeholder)",
+                incomplete_reason=incomplete_reason,
+                dropped=dropped,
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        (event,) = h.events("truncation_continue")
+        assert event["incomplete_reason"] == incomplete_reason
+        turn2 = [m.content for m in h.adapter.calls[1].messages if m.content]
+        assert any(phrase in text for text in turn2)
+        # Exactly one reminder text is used — no cross-contamination.
+        assert sum(phrase in text for text in turn2) == 1
+
+    async def test_no_finish_reason_incomplete_is_continued(
+        self, tmp_path: Path
+    ) -> None:
+        # A turn that ended with nothing usable and no recognised stop reason
+        # used to be banked as a clean final answer.
+        script = [
+            resp(
+                content="(provider response ended without completing)",
+                stop_reason=StopReason.ERROR,
+                incomplete_reason="no_finish_reason",
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert len(h.events("truncation_continue")) == 1
+
+    async def test_complete_turn_with_unmapped_stop_reason_is_not_continued(
+        self, tmp_path: Path
+    ) -> None:
+        """The M1 gate at the loop's end of the wire: an adapter that reports
+        StopReason.ERROR but ``incomplete=False`` (a real answer arrived, the
+        gateway just omitted its finish reason) must be accepted as final. The
+        alternative is three spurious re-prompts at the end of every run."""
+        script = [resp(CLEAN_FINISH, stop_reason=StopReason.ERROR)]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert result.turns == 1
+        assert h.events("truncation_continue") == []
+
+    async def test_incomplete_with_a_surviving_tool_call_dispatches(
+        self, tmp_path: Path
+    ) -> None:
+        """Sibling-survivor: one call ran, one was dropped. The tool branch
+        wins (no re-prompt, no continue consumed) and the drop is still on the
+        record — otherwise the vanished call leaves no trace at all."""
+        script = [
+            resp(
+                content="running one of two",
+                calls=[call("c1", "echo", text="a")],
+                dropped=[drop()],
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert [r["content"] for r in h.events("tool_result")] == ["echo:a"]
+        assert h.events("truncation_continue") == []
+        assert [d["tool_name"] for d in h.events("tool_call_dropped")] == [
+            "write_file"
+        ]
+
+
+class TestTruncationExhaustion:
+    """C2-of-review: exhausting the continue budget on nothing but unparseable
+    provider replies is a provider failure, and must not be laundered into a
+    clean completion carrying a placeholder for an answer."""
+
+    async def test_all_continues_dropping_calls_ends_as_error(
+        self, tmp_path: Path
+    ) -> None:
+        from harness.loop import MAX_TRUNCATION_CONTINUES
+
+        script = [
+            resp(content="(1 tool call was dropped)", dropped=[drop()])
+            for _ in range(MAX_TRUNCATION_CONTINUES + 1)
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.error_kind == "malformed_response"
+        assert "unparseable tool-call arguments" in result.final_text
+        assert result.turns == MAX_TRUNCATION_CONTINUES + 1
+        assert len(h.events("truncation_continue")) == MAX_TRUNCATION_CONTINUES
+        # Every drop is auditable — the only thing that makes this diagnosable.
+        assert len(h.events("tool_call_dropped")) == (
+            MAX_TRUNCATION_CONTINUES + 1
+        )
+        (run_error,) = h.events("run_error")
+        assert run_error["error_kind"] == "malformed_response"
+
+    async def test_max_tokens_exhaustion_without_drops_still_completes(
+        self, tmp_path: Path
+    ) -> None:
+        # Unchanged from before C4: a model that merely thinks itself out of
+        # budget every turn is a capability failure, not a provider one.
+        from harness.loop import MAX_TRUNCATION_CONTINUES
+
+        script = [
+            resp(content="still thinking", stop_reason=StopReason.MAX_TOKENS)
+            for _ in range(MAX_TRUNCATION_CONTINUES + 1)
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.error_kind is None
+        assert h.events("run_error") == []
+
+    async def test_a_single_clean_continue_prevents_the_error(
+        self, tmp_path: Path
+    ) -> None:
+        """"Every continue dropped calls" is literal: one continue spent on a
+        plain truncation means the provider was not uniformly broken, so the
+        run is accepted rather than failed."""
+        from harness.loop import MAX_TRUNCATION_CONTINUES
+
+        script = [resp(content="thinking", stop_reason=StopReason.MAX_TOKENS)]
+        script += [
+            resp(content="(dropped)", dropped=[drop()])
+            for _ in range(MAX_TRUNCATION_CONTINUES)
+        ]
+        h = make_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.error_kind is None
+
+
+class TestTruncationDeadlineSkip:
+    """M4a. A re-prompt is only worth its cost if the answer it provokes can
+    arrive *and* be acted on. gpt2-codegolf: one 8192-token reasoning call
+    cost 299s of a 900s budget, so 3 more continues would guarantee a
+    wall-clock kill with an empty workspace — turning a fast death into a slow
+    one that also loses the budget the continue exists to protect."""
+
+    async def test_continue_is_skipped_when_two_calls_will_not_fit(
+        self, tmp_path: Path
+    ) -> None:
+        # gpt2-codegolf's numbers exactly. Clock reads, in order: deadline
+        # anchor, the turn's remaining() check, call_started, call end, then
+        # step 5a's fresh remaining(). So the call cost 300s and 200s remain —
+        # less than the 600s two more calls at that price would need.
+        clock = scripted_clock([0.0, 0.0, 0.0, 300.0, 700.0])
+        deadline = Deadline(900.0, clock)
+        script = [
+            resp(content="(truncated)", stop_reason=StopReason.MAX_TOKENS),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, clock=clock, deadline=deadline)
+        result = await h.loop.run(GOAL)
+
+        # Paused resumably — every event is already on disk — not "completed"
+        # with a placeholder banked as the answer.
+        assert result.status == "paused_budget"
+        assert result.final_text is None
+        (event,) = h.events("truncation_continue_skipped")
+        assert event["reason"] == "deadline"
+        assert event["last_call_seconds"] == pytest.approx(300.0)
+        assert event["remaining_seconds"] == pytest.approx(200.0)
+        assert event["incomplete_reason"] == "max_tokens"
+        # No continue fired, and crucially no further model call was made.
+        assert h.events("truncation_continue") == []
+        assert len(h.adapter.calls) == 1
+
+    async def test_continue_proceeds_when_the_budget_can_fund_it(
+        self, tmp_path: Path
+    ) -> None:
+        # Same shape, cheap call (1s) against a 900s budget: the re-prompt
+        # comfortably fits, so nothing is skipped.
+        clock = scripted_clock([0.0, 10.0, 11.0, 12.0])
+        deadline = Deadline(900.0, clock)
+        script = [
+            resp(content="(truncated)", stop_reason=StopReason.MAX_TOKENS),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, clock=clock, deadline=deadline)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert h.events("truncation_continue_skipped") == []
+        assert len(h.events("truncation_continue")) == 1
+
+    async def test_no_deadline_means_no_skip(self, tmp_path: Path) -> None:
+        # Deadline-free runs (the default for direct callers) keep the
+        # pre-C4 behaviour exactly: the guard is inert without a budget.
+        clock = scripted_clock([0.0, 10.0, 1000.0, 2000.0])
+        script = [
+            resp(content="(truncated)", stop_reason=StopReason.MAX_TOKENS),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, clock=clock)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.events("truncation_continue_skipped") == []
+
+
+class TestIncompleteTurnEndToEnd:
+    async def test_reasoning_only_turn_replays_with_its_placeholder(
+        self, tmp_path: Path
+    ) -> None:
+        """The gpt2-codegolf reproduction, through the real OpenAI-compat
+        adapter: turn 1 spent its whole 8192-token cap on hidden reasoning and
+        returned ``content=null, tool_calls=[]``. That empty assistant message
+        was persisted and then rejected on the *next* turn's translation,
+        killing the run at turn 1. It must now carry a placeholder and replay
+        cleanly. Fails on main."""
+        from types import SimpleNamespace
+
+        from harness.adapters.openai_compat import (
+            EMPTY_MESSAGE_PLACEHOLDERS,
+            OpenAICompatAdapter,
+        )
+
+        def sdk_response(
+            content: str | None,
+            tool_calls: list | None,
+            finish_reason: str,
+            completion_tokens: int = 5,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=content, tool_calls=tool_calls
+                        ),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=10, completion_tokens=completion_tokens
+                ),
+            )
+
+        real_call = SimpleNamespace(
+            id="c1",
+            function=SimpleNamespace(
+                name="echo", arguments='{"text": "hello"}'
+            ),
+        )
+
+        class FakeCompletions:
+            def __init__(self, results: list) -> None:
+                self.results = list(results)
+                self.calls: list[dict] = []
+
+            async def create(self, **kwargs: object) -> SimpleNamespace:
+                self.calls.append(kwargs)
+                return self.results.pop(0)
+
+        completions = FakeCompletions(
+            [
+                # Turn 1: the whole cap spent thinking, nothing emitted.
+                sdk_response(None, None, "length", completion_tokens=8192),
+                sdk_response(None, [real_call], "tool_calls"),
+                sdk_response(CLEAN_FINISH, None, "stop"),
+            ]
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        adapter = OpenAICompatAdapter("fake-model", client=client, stream=False)
+
+        store = RunStore(tmp_path / "state.db")
+        run_id = store.create_run(GOAL, "fake-model", "auto")
+        agent_id = store.create_agent(run_id, GOAL)
+        registry = ToolRegistry()
+        registry.register(simple_tool("echo"))
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=adapter.count_tokens,
+            max_context=adapter.capabilities.max_context,
+            summarize=stub_summarize,
+        )
+
+        async def ask(tool_name: str, arguments: dict, meta: ToolMeta) -> bool:
+            return True
+
+        loop = AgentLoop(
+            adapter,
+            registry,
+            Policy(mode=PermissionMode.AUTO),
+            store,
+            run_id,
+            agent_id,
+            context,
+            Budgets(),
+            ask,
+            model="fake-model",
+        )
+        result = await loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert len(completions.calls) == 3
+        # The replayed transcript carried the placeholder, not an empty
+        # assistant message — this is the assertion that fails on main.
+        turn2_contents = [
+            str(m.get("content") or "") for m in completions.calls[1]["messages"]
+        ]
+        assert EMPTY_MESSAGE_PLACEHOLDERS["max_tokens"] in turn2_contents
+        assert "" not in [
+            c
+            for c, m in zip(turn2_contents, completions.calls[1]["messages"])
+            if m["role"] == "assistant" and not m.get("tool_calls")
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1804,238 @@ class TestDurationRecording:
         records = h.store.list_usage(h.run_id)
         assert [record.duration_ms for record in records] == [500, 250]
         assert h.store.total_usage(h.run_id)["duration_ms"] == 750
+
+
+# ---------------------------------------------------------------------------
+# Turn provenance and drop auditability (§C2)
+# ---------------------------------------------------------------------------
+
+
+class TestTurnProvenance:
+    async def test_one_model_turn_event_per_call_in_order(
+        self, tmp_path: Path
+    ) -> None:
+        """§C2: every model call leaves exactly one model_turn event, in
+        order, carrying the provider's verbatim stop string, the normalized
+        one, the turn's output tokens, and the same duration the usage row
+        got (from the injected clock). This is the record that made the
+        make-mips post-mortem impossible: today nothing on disk says why a
+        turn ended."""
+        clock = scripted_clock([10.0, 10.5, 20.0, 20.25])
+        script = [
+            resp(
+                "working",
+                [call("c1", "echo", text="a")],
+                usage=Usage(input_tokens=7, output_tokens=3),
+                provider_stop_reason="tool_calls",
+            ),
+            resp(
+                CLEAN_FINISH,
+                usage=Usage(input_tokens=11, output_tokens=4),
+                provider_stop_reason="stop",
+            ),
+        ]
+        h = make_harness(
+            tmp_path, script, tools=[simple_tool("echo")], clock=clock
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        turns = h.events("model_turn")
+        assert turns == [
+            {
+                "turn": 1,
+                "provider_stop_reason": "tool_calls",
+                "stop_reason": "tool_use",
+                "output_tokens": 3,
+                "duration_ms": 500,
+                "tool_call_count": 1,
+                "content_chars": len("working"),
+            },
+            {
+                "turn": 2,
+                "provider_stop_reason": "stop",
+                "stop_reason": "end_turn",
+                "output_tokens": 4,
+                "duration_ms": 250,
+                "tool_call_count": 0,
+                "content_chars": len(CLEAN_FINISH),
+            },
+        ]
+        # The event's duration agrees with the usage row's by construction —
+        # one clock read feeds both.
+        assert [r.duration_ms for r in h.store.list_usage(h.run_id)] == [
+            500,
+            250,
+        ]
+
+    async def test_unmapped_and_missing_stop_reasons_stay_distinguishable(
+        self, tmp_path: Path
+    ) -> None:
+        """The whole point of §C2: both turns normalize to ``error``, but
+        the persisted provenance still tells "the provider sent a value we
+        do not map" apart from "the stream ended with nothing terminal"."""
+        script = [
+            resp(
+                "still going",
+                [call("c1", "echo", text="a")],
+                stop_reason=StopReason.ERROR,
+                provider_stop_reason="weird_reason",
+            ),
+            resp(
+                CLEAN_FINISH,
+                stop_reason=StopReason.ERROR,
+                provider_stop_reason=None,
+            ),
+        ]
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        await h.loop.run(GOAL)
+
+        turns = h.events("model_turn")
+        assert [t["stop_reason"] for t in turns] == ["error", "error"]
+        assert [t["provider_stop_reason"] for t in turns] == [
+            "weird_reason",
+            None,
+        ]
+
+    async def test_model_response_raw_is_never_persisted(
+        self, tmp_path: Path
+    ) -> None:
+        """Deliberate scope limit: raw is the whole response body per turn.
+        The targeted provenance fields are recorded; raw is not."""
+        response = resp(CLEAN_FINISH, provider_stop_reason="stop")
+        response.raw = {"secret": "the entire provider response body"}
+        h = make_harness(tmp_path, [response])
+        await h.loop.run(GOAL)
+
+        dumped = [
+            e.payload for e in h.store.load_events(h.agent_id)
+        ]
+        assert not any("secret" in str(payload) for payload in dumped)
+        assert h.events("model_turn")[0]["provider_stop_reason"] == "stop"
+
+    async def test_adapter_error_persists_a_run_error_event(
+        self, tmp_path: Path
+    ) -> None:
+        """§C2: a run that dies on an adapter failure says so in the
+        transcript. Previously the only on-disk trace was the agent-status
+        row, so triaging one meant crawling the caller's result.json."""
+        script = [resp(None, [call("c1", "echo", text="a")])]
+        h = make_harness(tmp_path, script, tools=[simple_tool("echo")])
+        result = await h.loop.run(GOAL)  # second call exhausts the script
+
+        assert result.status == "error"
+        (event,) = h.events("run_error")
+        assert "exhausted" in event["message"]
+        assert event["turns"] == 1
+        # error_kind is populated by the provider-fault taxonomy change;
+        # until it lands the field is present and None, never missing.
+        assert event["error_kind"] is None
+        # It is written before the run ends, and it is the last event.
+        assert h.event_kinds()[-1] == "run_error"
+
+    async def test_no_run_error_event_on_success_or_budget_pause(
+        self, tmp_path: Path
+    ) -> None:
+        h = make_harness(tmp_path, [resp(CLEAN_FINISH)])
+        assert (await h.loop.run(GOAL)).status == "completed"
+        assert h.events("run_error") == []
+
+        h2 = make_harness(
+            tmp_path / "b",
+            [resp(CLEAN_FINISH)],
+            budgets=Budgets(max_turns=0),
+        )
+        assert (await h2.loop.run(GOAL)).status == "paused_budget"
+        assert h2.events("run_error") == []
+
+    async def test_dropped_tool_calls_are_persisted_with_a_capped_prefix(
+        self, tmp_path: Path
+    ) -> None:
+        """§C2 defines the emission site and schema so the degradation
+        change that starts *reporting* drops is pure behaviour. The prefix
+        is capped at 512 chars: an observed truncated write_file fragment
+        was ~21 KB, and state.db must not swallow whole file bodies."""
+        huge = "x" * 21_000
+        response = ModelResponse(
+            message=Message(
+                role=Role.ASSISTANT, content="(a tool call was dropped)"
+            ),
+            usage=Usage(output_tokens=8192),
+            stop_reason=StopReason.MAX_TOKENS,
+            provider_stop_reason="length",
+            incomplete=True,
+            incomplete_reason="dropped_calls",
+            dropped_tool_calls=[
+                DroppedToolCall(
+                    tool_name="write_file",
+                    raw_arguments_prefix=huge,
+                    raw_arguments_len=len(huge),
+                )
+            ],
+        )
+        h = make_harness(tmp_path, [response, resp(CLEAN_FINISH)])
+        await h.loop.run(GOAL)
+
+        (dropped,) = h.events("tool_call_dropped")
+        assert dropped["turn"] == 1
+        assert dropped["tool_name"] == "write_file"
+        assert dropped["provider_stop_reason"] == "length"
+        assert dropped["raw_arguments_len"] == 21_000
+        assert dropped["raw_arguments_prefix"] == "x" * 512
+        assert len(dropped["raw_arguments_prefix"]) == (
+            DROPPED_ARGUMENTS_PREFIX_CHARS
+        )
+        # Recorded with, and immediately after, its turn's provenance.
+        kinds = h.event_kinds()
+        assert kinds[1:3] == ["model_turn", "tool_call_dropped"]
+
+    async def test_dropped_calls_recorded_when_a_sibling_call_survives(
+        self, tmp_path: Path
+    ) -> None:
+        """The drop must be on the record even on the tool-call branch —
+        that branch dispatches and continues, so a turn where one call ran
+        and another vanished would otherwise leave no trace at all."""
+        response = ModelResponse(
+            message=Message(
+                role=Role.ASSISTANT,
+                content="running one of two",
+                tool_calls=[call("c1", "echo", text="a")],
+            ),
+            usage=Usage(),
+            stop_reason=StopReason.TOOL_USE,
+            provider_stop_reason="tool_calls",
+            incomplete=True,
+            incomplete_reason="dropped_calls",
+            dropped_tool_calls=[
+                DroppedToolCall(
+                    tool_name="write_file",
+                    raw_arguments_prefix='{"path": "a.py", "content": "def ',
+                    raw_arguments_len=33,
+                )
+            ],
+        )
+        h = make_harness(
+            tmp_path,
+            [response, resp(CLEAN_FINISH)],
+            tools=[simple_tool("echo")],
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert [r["content"] for r in h.events("tool_result")] == ["echo:a"]
+        (dropped,) = h.events("tool_call_dropped")
+        assert dropped["tool_name"] == "write_file"
+        assert dropped["raw_arguments_len"] == 33
+
+    async def test_no_dropped_events_when_the_adapter_reports_none(
+        self, tmp_path: Path
+    ) -> None:
+        """No drops reported, no events written — the common case must stay
+        free of noise."""
+        h = make_harness(tmp_path, [resp(CLEAN_FINISH)])
+        await h.loop.run(GOAL)
+        assert h.events("tool_call_dropped") == []
 
 
 # ---------------------------------------------------------------------------

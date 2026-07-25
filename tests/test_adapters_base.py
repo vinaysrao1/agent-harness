@@ -2,7 +2,12 @@
 
 import pytest
 
-from harness.adapters.base import AdapterError, ModelAdapter, retry_with_backoff
+from harness.adapters.base import (
+    AdapterError,
+    ModelAdapter,
+    classify_http_fault,
+    retry_with_backoff,
+)
 from harness.types import (
     Capabilities,
     Message,
@@ -82,6 +87,94 @@ class TestAdapterError:
 
     def test_message_preserved(self):
         assert str(AdapterError("boom")) == "boom"
+
+    def test_fault_defaults_none(self):
+        """Unclassified is the default, so every pre-taxonomy construction
+        site keeps meaning 'an ordinary failure, score it as one'."""
+        assert AdapterError("boom").fault is None
+
+    @pytest.mark.parametrize(
+        "fault",
+        ["auth", "quota", "rate_limit", "server", "transport", "malformed_response"],
+    )
+    def test_fault_round_trips(self, fault):
+        assert AdapterError("boom", fault=fault).fault == fault
+
+    def test_fault_is_orthogonal_to_retryable(self):
+        """The two flags answer different questions: retryable governs the
+        adapter's own bounded retry loop, fault describes the surviving
+        failure for whoever is above the harness."""
+        exc = AdapterError("throttled", retryable=True, fault="rate_limit")
+        assert (exc.retryable, exc.fault) == (True, "rate_limit")
+
+
+#: Verbatim OpenRouter 403 body captured from a real Terminal-Bench run in
+#: which an exhausted key killed 7 of 22 trials (the workspace-URL key id is
+#: redacted; nothing in the classifier reads it). This is the exact text the
+#: quota classification has to recognise.
+QUOTA_403_BODY = (
+    "Error code: 403 - {'error': {'message': 'Key limit exceeded (total "
+    "limit). Manage it using https://openrouter.ai/workspaces/default/keys/"
+    "<redacted>', 'code': 403}}"
+)
+
+
+class TestClassifyHTTPFault:
+    """The single shared HTTP-status -> Fault rule, used by every adapter."""
+
+    @pytest.mark.parametrize(
+        "status,want",
+        [
+            (401, "auth"),
+            (402, "quota"),
+            (429, "rate_limit"),
+            (500, "server"),
+            (502, "server"),
+            (529, "server"),  # Anthropic's overloaded_error
+            (400, None),
+            (404, None),
+            (409, None),
+            (None, None),
+        ],
+    )
+    def test_status_table(self, status, want):
+        assert classify_http_fault(status, "some body") == want
+
+    def test_403_quota_body_from_real_run(self):
+        assert classify_http_fault(403, QUOTA_403_BODY) == "quota"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "insufficient_quota",
+            "You have exceeded your monthly QUOTA",
+            "Your credit balance is too low",
+            "Rate limit exceeded for this key",
+        ],
+    )
+    def test_403_quota_markers_case_insensitive(self, body):
+        assert classify_http_fault(403, body) == "quota"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "This model is not permitted in your region",
+            "Your request was blocked by our moderation system",
+            "Your key may not use this model",
+            "",
+        ],
+    )
+    def test_403_non_quota_stays_unclassified(self, body):
+        """403 alone is over-broad. A region block, a moderation refusal, or
+        a model-permission denial is a genuine scored failure and must NOT be
+        laundered into an infrastructure fault — mis-classifying it would
+        hide a real capability/config problem AND (for a benchmark harness
+        keyed on the exception type) silently retry something that will never
+        succeed."""
+        assert classify_http_fault(403, body) is None
+
+    def test_403_body_defaults_to_empty(self):
+        assert classify_http_fault(403) is None
 
 
 class TestRetryWithBackoff:

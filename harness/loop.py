@@ -22,13 +22,32 @@ Loop shape per turn:
    :func:`~harness.adapters.base.retry_with_backoff` themselves — so the
    loop calls ``complete`` once; an :class:`AdapterError` that survives the
    adapter's retries (from the model call *or* from the compaction
-   summarizer, which uses the same adapter) ends the run with ``error``.
+   summarizer, which uses the same adapter) ends the run with ``error``
+   *and* a persisted ``run_error`` event carrying the adapter's provider-
+   fault classification (:attr:`AgentResult.error_kind`), so an
+   infrastructure outage is distinguishable from a capability failure
+   after the fact. Each completed call also writes a
+   ``model_turn`` event recording why the turn ended — including the
+   provider's verbatim stop string, which the normalized
+   :class:`~harness.types.StopReason` throws away — plus one
+   ``tool_call_dropped`` event per tool call the adapter had to discard.
+   Together these make a dead or degraded turn diagnosable from the
+   transcript alone (§C2).
 4. If the response carries tool calls: gate each through
    :func:`harness.permissions.evaluate` (ASK defers to the injected ``ask``
    callable, once per call), dispatch every allowed call **concurrently**,
    and append all results in the original tool-call order — deterministic
    regardless of completion order.
-5. If it carries none: run :func:`harness.diligence.looks_unfinished`; an
+5. If it carries none but the response is ``incomplete`` (nothing usable came
+   back — a cap-truncated turn, a dropped tool call, a response that just
+   ended), re-prompt with wording matching the cause, up to
+   :data:`MAX_TRUNCATION_CONTINUES` times. Two guards bound the cost: a
+   re-prompt the remaining wall-clock cannot fund is skipped
+   (``truncation_continue_skipped``, pausing resumably), and a budget spent
+   entirely on unparseable provider replies ends the run as ``error`` with
+   ``malformed_response`` rather than banking a placeholder as a clean
+   completion.
+6. Otherwise: run :func:`harness.diligence.looks_unfinished`; an
    unfinished-looking answer earns a continue-reminder nudge (bounded by
    :data:`~harness.diligence.MAX_NUDGES`). Then, if the model declared a
    verification command (DESIGN.md §10.3 B1, via the
@@ -81,9 +100,10 @@ from harness.persistence import RunStore
 from harness.sandbox.base import Sandbox
 from harness.tools.registry import ToolRegistry
 from harness.types import (
+    DROPPED_ARGUMENTS_PREFIX_CHARS,
     Message,
+    ModelResponse,
     Role,
-    StopReason,
     ToolCall,
     ToolResult,
     Usage,
@@ -108,27 +128,50 @@ _CLOSED_TASK_STATUSES = frozenset(
     {"done", "completed", "complete", "cancelled", "canceled", "closed"}
 )
 
-#: Max consecutive-independent times the loop re-prompts a turn that hit the
-#: output-token cap (``stop_reason == MAX_TOKENS``) without producing a tool
-#: call. Bounds a model that spends its whole per-call budget thinking and
-#: emits nothing actionable, so it cannot loop forever; after this many the
-#: truncated turn is accepted like any other final answer.
+#: Max times the loop re-prompts a turn that ended incomplete (see
+#: :attr:`~harness.types.ModelResponse.incomplete`) without producing a tool
+#: call. Bounds a model that spends its whole per-call budget thinking, and a
+#: provider that keeps truncating tool arguments, so neither can loop forever.
+#: Once spent, an incomplete turn is either accepted like any other final
+#: answer or — when *every* continue was spent on unparseable tool calls —
+#: failed loudly (see :meth:`AgentLoop.run` step 5a).
 MAX_TRUNCATION_CONTINUES: int = 3
 
-#: Injected when a turn is cut off at the output-token cap with no action taken
-#: (see :data:`MAX_TRUNCATION_CONTINUES`). Steers the model to act rather than
-#: keep thinking, since the cap means the previous turn produced nothing usable.
-TRUNCATION_REMINDER: str = (
-    "<system-reminder>\n"
-    "Your previous response was cut off at the output-token limit before you "
-    "produced a tool call or a complete answer — either you spent the whole "
-    "turn thinking, or your tool call was cut off mid-arguments at the "
-    "limit. Be decisive now: take the next concrete action with a tool "
-    "call (write the file, run the command), keeping any prose minimal. If "
-    "your tool call was cut off, re-issue it now; if you were writing a "
-    "large file, write it in smaller pieces across multiple calls.\n"
-    "</system-reminder>"
-)
+#: Re-prompts for an incomplete turn, keyed by
+#: :data:`~harness.types.IncompleteReason`. Three texts rather than one
+#: because the wording is the model's only evidence about what went wrong, and
+#: a factually false diagnosis is worse than none: telling a model whose tool
+#: call was dropped that it "spent the whole turn thinking" steers it away
+#: from the one action that would fix the turn. Each avoids
+#: :data:`harness.diligence._PROMISE_PATTERNS` phrasing so it cannot make the
+#: turn it provokes look unfinished.
+TRUNCATION_REMINDERS: dict[str, str] = {
+    "dropped_calls": (
+        "<system-reminder>\n"
+        "Your tool call was cut off mid-arguments and could not be executed. "
+        "Re-issue it now; if you were writing a large file, write it in "
+        "smaller pieces across multiple calls.\n"
+        "</system-reminder>"
+    ),
+    "max_tokens": (
+        "<system-reminder>\n"
+        "Your previous response was cut off at the output-token limit before "
+        "you produced a tool call or a complete answer — either you spent the "
+        "whole turn thinking, or your tool call was cut off mid-arguments at "
+        "the limit. Be decisive now: take the next concrete action with a "
+        "tool call (write the file, run the command), keeping any prose "
+        "minimal. If your tool call was cut off, re-issue it now; if you were "
+        "writing a large file, write it in smaller pieces across multiple "
+        "calls.\n"
+        "</system-reminder>"
+    ),
+    "no_finish_reason": (
+        "<system-reminder>\n"
+        "Your previous response ended without completing. Re-issue your "
+        "intended action.\n"
+        "</system-reminder>"
+    ),
+}
 
 #: Fraction of the wall-clock budget remaining at which the loop injects the
 #: one-time wind-down reminder (below), clamped by the two bounds that
@@ -212,6 +255,16 @@ class AgentResult(BaseModel):
     the model's final message on completion, the adapter's error message on
     error, and ``None`` on a budget pause. ``usage`` and ``turns`` cover
     every model call made by this invocation.
+
+    ``error_kind`` classifies an ``"error"`` status into the provider-fault
+    taxonomy (:data:`~harness.adapters.base.Fault`) when the adapter supplied
+    one: ``"quota"``, ``"rate_limit"``, ``"transport"``, ... It is ``None``
+    for every non-error status, and also for an error the adapter did not
+    classify — an unclassified error is an ordinary failure and must stay
+    scored as one. Callers embedding the harness in a benchmark harness use
+    it to raise that harness's *own* infrastructure-error type, so a provider
+    outage is audited as infrastructure rather than as an agent capability
+    failure; every other consumer may ignore it.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -220,6 +273,7 @@ class AgentResult(BaseModel):
     final_text: str | None
     usage: Usage
     turns: int
+    error_kind: str | None = None
 
 
 class AgentLoop:
@@ -354,18 +408,103 @@ class AgentLoop:
             decided_by,
         )
 
+    def _record_turn_provenance(
+        self, response: ModelResponse, turn: int, duration_ms: int
+    ) -> None:
+        """Persist why one model turn ended, and what it cost (§C2).
+
+        Emits one ``model_turn`` event per model call — the *only* durable
+        record of the provider's verbatim stop string. ``stop_reason`` alone
+        is lossy (every unknown or missing finish reason normalizes to
+        ``error``), the usage row carries tokens and duration but no reason
+        at all, and ``ModelResponse.raw`` is deliberately not persisted (it
+        is the whole response body, per turn). Without this event a turn that
+        dies mid-generation is indistinguishable after the fact from one that
+        ended cleanly.
+
+        Then emits one ``tool_call_dropped`` event per entry in
+        ``response.dropped_tool_calls`` — tool calls the adapter discarded
+        because their arguments could not be parsed. Translation is
+        side-effect-free by module contract, so the adapter only *reports*
+        drops on the response; persisting them is the loop's job. Emitting
+        here — before the turn branches on whether any tool call survived —
+        is what puts a drop on the record in *both* cases, including the one
+        where a sibling call ran normally and the vanished call would
+        otherwise leave no trace.
+        """
+        self.store.append_event(
+            self.agent_id,
+            "model_turn",
+            {
+                "turn": turn,
+                # Verbatim, untranslated; None when the provider sent none.
+                "provider_stop_reason": response.provider_stop_reason,
+                "stop_reason": response.stop_reason.value,
+                "output_tokens": response.usage.output_tokens,
+                "duration_ms": duration_ms,
+                "tool_call_count": len(response.message.tool_calls),
+                "content_chars": len(response.message.content or ""),
+            },
+        )
+        for dropped in getattr(response, "dropped_tool_calls", None) or []:
+            prefix = getattr(dropped, "raw_arguments_prefix", "") or ""
+            self.store.append_event(
+                self.agent_id,
+                "tool_call_dropped",
+                {
+                    "turn": turn,
+                    "tool_name": getattr(dropped, "tool_name", None),
+                    "provider_stop_reason": response.provider_stop_reason,
+                    # Capped: enough to see where the payload was cut without
+                    # bloating state.db (an observed fragment was ~21 KB).
+                    "raw_arguments_prefix": prefix[
+                        :DROPPED_ARGUMENTS_PREFIX_CHARS
+                    ],
+                    "raw_arguments_len": getattr(
+                        dropped, "raw_arguments_len", len(prefix)
+                    ),
+                },
+            )
+
     def _finish(
         self,
         status: Literal["completed", "paused_budget", "error"],
         final_text: str | None,
         usage: Usage,
         turns: int,
+        *,
+        error_kind: str | None = None,
     ) -> AgentResult:
-        """Persist the terminal agent status and build the result."""
-        self.store.set_agent_status(self.agent_id, status)
-        return AgentResult(
-            status=status, final_text=final_text, usage=usage, turns=turns
+        """Persist the terminal agent status and build the result.
+
+        An ``error`` finish additionally appends a ``run_error`` event, so a
+        failed run is diagnosable from the transcript alone: previously the
+        only trace was the agent-status row, and the message itself lived
+        only in the caller's result object. ``error_kind`` is the provider-
+        fault classification (see :attr:`AgentResult.error_kind`); it rides
+        on both the result and that event, so post-hoc triage can tell an
+        infrastructure fault from a capability failure without crawling the
+        enclosing harness's own output.
+        """
+        result = AgentResult(
+            status=status,
+            final_text=final_text,
+            usage=usage,
+            turns=turns,
+            error_kind=error_kind if status == "error" else None,
         )
+        if status == "error":
+            self.store.append_event(
+                self.agent_id,
+                "run_error",
+                {
+                    "error_kind": result.error_kind,
+                    "message": final_text,
+                    "turns": turns,
+                },
+            )
+        self.store.set_agent_status(self.agent_id, status)
+        return result
 
     # -- tool handling -------------------------------------------------------
 
@@ -566,6 +705,14 @@ class AgentLoop:
         turns = 0
         nudges = 0
         truncation_continues = 0
+        # How many of those continues were spent on a turn whose tool calls the
+        # adapter had to drop. When the two counters agree at exhaustion, every
+        # re-prompt hit an unparseable provider reply and the run failed for
+        # provider reasons, not the model's (step 5a).
+        truncation_continues_with_drops = 0
+        # Wall-clock cost of the most recent model call, used to decide whether
+        # another re-prompt can still fit in the remaining budget (step 5a).
+        last_call_seconds = 0.0
         wound_down = False
         #: The model's currently declared verification command (§10.3 B1);
         #: set/replaced by successful ``declare_verification`` tool calls.
@@ -673,20 +820,30 @@ class AgentLoop:
                     messages, specs, system, **call_params
                 )
             except AdapterError as exc:
-                return self._finish("error", str(exc), total_usage, turns)
+                # exc.fault is the adapter's provider-fault classification
+                # (None when it could not classify the failure, which keeps
+                # the run an ordinary scored failure).
+                return self._finish(
+                    "error", str(exc), total_usage, turns, error_kind=exc.fault
+                )
 
             turns += 1
             total_usage = total_usage + response.usage
+            # Wall-clock duration of this model call (§10.2 A5), measured on
+            # the same injectable monotonic clock as the wind-down check so
+            # tests stay deterministic. Read once and shared by the usage row,
+            # the model_turn event, and step 5a's deadline check, so none of
+            # the three can disagree about what this call cost.
+            last_call_seconds = self.clock() - call_started
+            duration_ms = int(last_call_seconds * 1000)
             self.store.record_usage(
                 self.run_id,
                 self.agent_id,
                 self.model,
                 response.usage,
-                # Wall-clock duration of this model call (§10.2 A5),
-                # measured on the same injectable monotonic clock as the
-                # wind-down check so tests stay deterministic.
-                duration_ms=int((self.clock() - call_started) * 1000),
+                duration_ms=duration_ms,
             )
+            self._record_turn_provenance(response, turns, duration_ms)
             self._append_message(response.message)
 
             # 4. Tool calls: gate, dispatch concurrently, append in order.
@@ -734,25 +891,84 @@ class AgentLoop:
                         )
                 continue
 
-            # 5a. Truncated turn with no action: the model hit the output-token
-            # cap before emitting a tool call (observed: a reasoning model that
-            # spent the whole cap thinking and returned an empty message).
-            # Accepting it would bank a non-answer as "done", so re-prompt it to
-            # act — bounded so a persistently-truncating turn cannot loop.
-            if (
-                response.stop_reason is StopReason.MAX_TOKENS
-                and truncation_continues < MAX_TRUNCATION_CONTINUES
-            ):
-                truncation_continues += 1
-                self._append_message(
-                    Message(role=Role.USER, content=TRUNCATION_REMINDER)
-                )
-                self.store.append_event(
-                    self.agent_id,
-                    "truncation_continue",
-                    {"count": truncation_continues},
-                )
-                continue
+            # 5a. Incomplete turn with no action: the turn produced nothing the
+            # loop can act on — the model hit the output-token cap mid-thought,
+            # its only tool call was dropped as unparseable, or the response
+            # ended with neither a stop reason nor any content. Accepting it
+            # would bank a non-answer as "done", so re-prompt it to act, with
+            # wording matching the actual cause — bounded so a persistently
+            # incomplete turn cannot loop.
+            if response.incomplete:
+                if truncation_continues < MAX_TRUNCATION_CONTINUES:
+                    # Deadline-aware skip: a re-prompt is only worth its cost if
+                    # the answer it provokes can arrive *and* be acted on. Model
+                    # calls are the dominant cost here — one observed
+                    # cap-truncated reasoning turn burned 299s of a 900s budget
+                    # — so once the remaining wall-clock cannot fund two more
+                    # calls at the last one's price, continuing just converts a
+                    # fast failure into a slow one that also loses the budget
+                    # the continue exists to protect.
+                    remaining_now = (
+                        deadline.remaining() if deadline is not None else None
+                    )
+                    if (
+                        remaining_now is not None
+                        and remaining_now < 2 * last_call_seconds
+                    ):
+                        self.store.append_event(
+                            self.agent_id,
+                            "truncation_continue_skipped",
+                            {
+                                "reason": "deadline",
+                                "remaining_seconds": remaining_now,
+                                "last_call_seconds": last_call_seconds,
+                                "incomplete_reason": response.incomplete_reason,
+                            },
+                        )
+                        return self._finish(
+                            "paused_budget", None, total_usage, turns
+                        )
+
+                    truncation_continues += 1
+                    if response.dropped_tool_calls:
+                        truncation_continues_with_drops += 1
+                    reminder = TRUNCATION_REMINDERS.get(
+                        response.incomplete_reason or "",
+                        TRUNCATION_REMINDERS["max_tokens"],
+                    )
+                    self._append_message(
+                        Message(role=Role.USER, content=reminder)
+                    )
+                    self.store.append_event(
+                        self.agent_id,
+                        "truncation_continue",
+                        {
+                            "count": truncation_continues,
+                            "incomplete_reason": response.incomplete_reason,
+                        },
+                    )
+                    continue
+
+                # Budget spent. If *every* continue went on a turn whose tool
+                # calls were unparseable, the run never had a working provider
+                # to begin with: finishing "completed" here would hand the
+                # enclosing harness a clean completion with a placeholder for
+                # an answer — a loud infrastructure failure laundered into a
+                # silent scored one. Fail with a fault the C3 bridge maps to
+                # the harness's own API-error type instead. A mix of causes
+                # (or none) falls through and is accepted as before.
+                if (
+                    truncation_continues > 0
+                    and truncation_continues_with_drops == truncation_continues
+                ):
+                    return self._finish(
+                        "error",
+                        f"{truncation_continues} consecutive turns had "
+                        "unparseable tool-call arguments from the provider",
+                        total_usage,
+                        turns,
+                        error_kind="malformed_response",
+                    )
 
             # 5b. No tool calls: diligence stop-condition check (§4.9).
             final_text = response.message.content

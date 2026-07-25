@@ -164,6 +164,30 @@ class TestModelResponse:
         )
         assert resp.raw is None
 
+    def test_provider_stop_reason_defaults_to_none(self):
+        """Every pre-existing construction site stays valid (§C2)."""
+        resp = ModelResponse(
+            message=Message(role=Role.ASSISTANT, content="x"),
+            usage=Usage(),
+            stop_reason=StopReason.TOOL_USE,
+        )
+        assert resp.provider_stop_reason is None
+
+    def test_provider_stop_reason_round_trips_verbatim(self):
+        """The provider's untranslated string survives serialization even
+        when the normalized stop_reason collapses it to ERROR — that
+        collapse is exactly what this field exists to undo (§C2)."""
+        resp = ModelResponse(
+            message=Message(role=Role.ASSISTANT, content="x"),
+            usage=Usage(),
+            stop_reason=StopReason.ERROR,
+            provider_stop_reason="weird_new_reason",
+        )
+        restored = ModelResponse.model_validate_json(resp.model_dump_json())
+        assert restored == resp
+        assert restored.provider_stop_reason == "weird_new_reason"
+        assert restored.stop_reason is StopReason.ERROR
+
 
 class TestCapabilities:
     def test_fields_required(self):

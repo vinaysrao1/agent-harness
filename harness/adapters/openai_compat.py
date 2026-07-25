@@ -11,16 +11,14 @@ Translation notes:
 - The system prompt rides as a leading ``role="system"`` message.
 - Tool results ride as ``role="tool"`` messages with ``tool_call_id``; the
   format has no error flag, so ``is_error`` results are prefixed ``Error:``.
-- Tool-call ``arguments`` arrive as a JSON *string*; malformed JSON from a
-  provider surfaces as a clear non-retryable
-  :class:`~harness.adapters.base.AdapterError`, never a raw crash — *except*
-  when the turn was truncated at the output-token limit
-  (``finish_reason == "length"``): a tool call cut off mid-arguments is then
-  an expected casualty of truncation, so the malformed call is dropped and
-  the turn survives as a plain ``MAX_TOKENS`` response the agent loop's
-  truncation-continue path can re-prompt (see :func:`from_openai_response`).
-  TODO: the Anthropic adapter has no analogue of this truncated-tool-call
-  degradation (no current exposure); port it if truncation is observed there.
+- Tool-call ``arguments`` arrive as a JSON *string*. A call whose arguments
+  cannot be parsed is **dropped** rather than raised on, and reported on the
+  response as a :class:`~harness.types.DroppedToolCall` — the payload is
+  already spent, so raising would kill a whole run non-retryably over a
+  fragment no retry can repair (see :func:`from_openai_response`). The Anthropic
+  adapter needs no analogue: its tool inputs arrive pre-parsed, so there is no
+  malformed-arguments case to degrade — it mirrors only the empty-message and
+  ``incomplete`` halves of this contract.
 - SDK failures are wrapped with ``retryable`` derived from HTTP status
   (429/5xx/timeouts retry; 400/401-class do not) and ``complete()`` runs
   under :func:`~harness.adapters.base.retry_with_backoff`.
@@ -43,12 +41,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from types import SimpleNamespace
 from typing import Any
 
-from harness.adapters.base import AdapterError, ModelAdapter, retry_with_backoff
+from harness.adapters.base import (
+    AdapterError,
+    ModelAdapter,
+    classify_http_fault,
+    retry_with_backoff,
+)
 from harness.types import (
+    DROPPED_ARGUMENTS_PREFIX_CHARS,
     Capabilities,
+    DroppedToolCall,
+    IncompleteReason,
     Message,
     ModelResponse,
     Role,
@@ -60,6 +67,9 @@ from harness.types import (
 
 __all__ = [
     "OpenAICompatAdapter",
+    "EMPTY_ASSISTANT_PLACEHOLDER",
+    "EMPTY_MESSAGE_PLACEHOLDERS",
+    "drop_notice",
     "to_openai_messages",
     "to_openai_tools",
     "from_openai_response",
@@ -67,6 +77,62 @@ __all__ = [
     "map_finish_reason",
     "wrap_openai_error",
 ]
+
+#: Stand-in body emitted at translation time for an assistant message that
+#: carries neither content nor tool calls. Such a message is a provider (or
+#: producer-side adapter) defect, but refusing to translate it makes every
+#: transcript that already contains one permanently unreplayable — including
+#: persisted ``state.db`` transcripts a resume must walk. The text is
+#: deliberately free of :data:`harness.diligence._PROMISE_PATTERNS` phrasing
+#: and of a trailing ``?`` so it cannot make a turn look unfinished if it
+#: ever reaches the diligence check. It is *never* written back into the
+#: transcript: the persisted event log stays a faithful record of what the
+#: provider actually returned.
+EMPTY_ASSISTANT_PLACEHOLDER = (
+    "(no content: the provider returned an empty assistant message)"
+)
+
+#: Producer-side stand-ins, keyed by
+#: :data:`~harness.types.IncompleteReason` (``None`` = no diagnosed cause),
+#: substituted by :func:`from_openai_response` whenever the *translated*
+#: assistant message would carry neither content nor tool calls. Unlike
+#: :data:`EMPTY_ASSISTANT_PLACEHOLDER` — the replay-time backstop for a message
+#: already recorded empty — these are written into the message the loop
+#: persists, so they are cause-specific: the model reads them back as its own
+#: prior turn and the text is the only clue it gets about what happened. Like
+#: every other injected string they avoid
+#: :data:`harness.diligence._PROMISE_PATTERNS` phrasing and a trailing ``?``,
+#: so they cannot make a turn look unfinished.
+EMPTY_MESSAGE_PLACEHOLDERS: dict[IncompleteReason | None, str] = {
+    "max_tokens": (
+        "(response truncated at the output-token limit before producing "
+        "any output)"
+    ),
+    "no_finish_reason": "(provider response ended without completing)",
+    None: "(provider returned an empty assistant message)",
+}
+
+
+def drop_notice(count: int) -> str:
+    """The text appended to a turn's content when tool calls were dropped.
+
+    Appended **always** — not only when the message would otherwise be empty.
+    A turn can lose one call and keep another, in which case the agent loop
+    takes its tool-call branch and never consults ``incomplete`` at all; the
+    notice is then the *only* way the model learns that its second call
+    vanished, since it reads the notice back as its own prior assistant text
+    on the next turn. Wording is deliberately mechanical (no promised future
+    work, no trailing question) so it cannot trip the diligence check.
+    """
+    subject = (
+        "1 tool call was dropped"
+        if count == 1
+        else f"{count} tool calls were dropped"
+    )
+    return (
+        f"({subject}: the provider's arguments were cut off mid-JSON and "
+        "could not be parsed)"
+    )
 
 #: Default per-request SDK timeout (seconds): bounds one hung call so it
 #: surfaces as a retryable timeout instead of blocking. Overridable per adapter.
@@ -121,9 +187,18 @@ def to_openai_messages(
     Assistant tool calls are serialized with JSON-string ``arguments``; tool
     results become ``role="tool"`` messages with ``tool_call_id``, with
     ``is_error`` results prefixed ``Error:`` since the format has no flag.
-    A non-tool message with neither ``content`` nor ``tool_calls`` raises
-    :class:`AdapterError` at translation time (mirroring the Anthropic
-    adapter) instead of silently emitting ``content: null``.
+
+    An *assistant* message with neither ``content`` nor ``tool_calls`` is
+    translated with the :data:`EMPTY_ASSISTANT_PLACEHOLDER` body and a
+    :class:`UserWarning`, rather than raising: refusing it would make any
+    transcript already holding one — including a persisted one being
+    resumed — permanently unreplayable. The warning is the only channel
+    available here (these functions are pure and have no store access) and
+    exists so a future producer-side adapter bug is not silently masked.
+    Every other role with neither ``content`` nor ``tool_calls`` (and a
+    ``tool``-role message with no ``tool_result``) is a caller bug and still
+    raises :class:`AdapterError` at translation time instead of silently
+    emitting ``content: null``.
     """
     out: list[dict[str, Any]] = []
     if system is not None:
@@ -147,14 +222,25 @@ def to_openai_messages(
                 }
             )
             continue
+        content = message.content
         if not message.content and not message.tool_calls:
-            raise AdapterError(
-                f"message with role {message.role.value!r} has no content "
-                "or tool calls; cannot translate"
+            if message.role is not Role.ASSISTANT:
+                raise AdapterError(
+                    f"message with role {message.role.value!r} has no content "
+                    "or tool calls; cannot translate"
+                )
+            warnings.warn(
+                "assistant message has neither content nor tool calls; "
+                "translating it with a placeholder body so the transcript "
+                "stays replayable — this indicates a provider or "
+                "producer-side adapter defect",
+                UserWarning,
+                stacklevel=2,
             )
+            content = EMPTY_ASSISTANT_PLACEHOLDER
         entry: dict[str, Any] = {
             "role": message.role.value,
-            "content": message.content,
+            "content": content,
         }
         if message.tool_calls:
             if message.role is not Role.ASSISTANT:
@@ -196,9 +282,12 @@ def _parse_arguments(name: str, raw: Any) -> dict:
     """Parse a tool call's JSON-string arguments defensively.
 
     Providers occasionally emit malformed JSON; that must surface as a clear
-    :class:`AdapterError` (non-retryable — the payload is already consumed),
-    not a raw ``json`` crash. ``None``/empty means no arguments, and a
-    non-object payload is likewise rejected.
+    :class:`AdapterError`, not a raw ``json`` crash. ``None``/empty means no
+    arguments, and a non-object payload is likewise rejected.
+
+    The error is an *internal, per-call signal*: :func:`from_openai_response`
+    catches it and drops the offending call. It is not a run-killer — the
+    arguments are already consumed, so no retry can repair them.
     """
     if raw is None or raw == "":
         return {}
@@ -279,25 +368,63 @@ def from_openai_response(response: Any) -> ModelResponse:
     **retryable** :class:`AdapterError`, because these signal a transient
     upstream fault rather than a malformed reply. :meth:`OpenAICompatAdapter.complete`
     runs this translation inside its retried call, so such faults are retried.
-    Malformed tool-call JSON, by contrast, stays non-retryable (the payload is
-    already consumed and will not change on retry).
+    Malformed tool-call JSON, by contrast, is not raised at all — it is
+    degraded in place (below), since the payload is already consumed and no
+    retry would change it. An inline error also
+    carries the provider-fault classification of its ``code`` (see
+    :func:`~harness.adapters.base.classify_http_fault`), so a gateway that
+    reports quota exhaustion as an HTTP 200 body is classified identically to
+    one that reports it as an HTTP status.
 
-    Truncation graceful degradation: when ``finish_reason == "length"`` (the
-    turn hit the output-token limit) a tool call with malformed arguments is
-    almost certainly one cut off mid-JSON by the cap, not a provider fault.
-    Raising would kill the whole run non-retryably (observed on a real trial:
-    a large inline ``write_file`` truncated at the output cap), and retrying
-    cannot help — the payload is spent. So each such call is *dropped* from
-    the translated message instead, and the response reaches the agent loop
-    as ``stop_reason=MAX_TOKENS`` with the malformed calls gone, where the
-    existing truncation-continue path re-prompts the model to re-issue the
-    call. If dropping leaves the message with no content and no tool calls,
-    a placeholder content string is substituted, because
-    :func:`to_openai_messages` correctly rejects empty messages when the
-    transcript is replayed next turn (an assistant message must not dangle
-    without its tool calls). Any other ``finish_reason`` with malformed
-    arguments keeps the non-retryable :class:`AdapterError` — a genuine
-    provider fault, not truncation.
+    Malformed tool-call arguments are **dropped, never raised on**, whatever
+    the finish reason. Keying the degradation on ``finish_reason == "length"``
+    was wrong: the arguments of a call cut off mid-JSON are equally spent when
+    the stream simply ended, and a real trial died non-retryably on exactly
+    that (a ~21 KB inline ``write_file`` fragment arriving under a *missing*
+    finish reason). Retrying cannot repair a consumed payload, so each
+    unparseable call is discarded, reported on
+    :attr:`~harness.types.ModelResponse.dropped_tool_calls` for the loop to
+    persist, and announced to the model in the message content via
+    :func:`drop_notice`.
+
+    Incompleteness: the response is marked ``incomplete`` — with
+    ``incomplete_reason`` chosen by strict precedence — when the turn produced
+    nothing the loop can act on:
+
+    ==================================================  ====================
+    Condition                                           ``incomplete_reason``
+    ==================================================  ====================
+    at least one dropped call                           ``dropped_calls``
+    else ``finish_reason == "length"``                  ``max_tokens``
+    else finish reason missing/unmapped **and** the
+    translated message is empty                         ``no_finish_reason``
+    otherwise                                           ``None``
+    ==================================================  ====================
+
+    The "and the message is empty" clause on the last row is load-bearing.
+    Every unknown or missing finish reason normalizes to
+    :attr:`StopReason.ERROR`, so treating that alone as incomplete would hand
+    any gateway that merely omits ``finish_reason`` three spurious re-prompts
+    at the end of *every* run — each one telling a model that had just
+    answered correctly that it was cut off, which is factually false and, at
+    17-40 s a turn, fatal once the run has wound down. Requiring an empty
+    message confines the branch to responses with nothing usable in them.
+
+    Empty messages: whenever the translated message would carry neither
+    content nor tool calls, a cause-specific placeholder from
+    :data:`EMPTY_MESSAGE_PLACEHOLDERS` is substituted. An empty assistant
+    message is not merely useless — :func:`to_openai_messages` has to invent a
+    body for it when the transcript is replayed next turn, and a real run died
+    at turn 1 that way.
+
+    Provenance: the provider's raw ``finish_reason`` is carried through
+    verbatim on :attr:`~harness.types.ModelResponse.provider_stop_reason`
+    (``None`` when absent), *in addition to* the lossy
+    :func:`map_finish_reason` normalization — every unknown or missing value
+    maps to :attr:`StopReason.ERROR`, which erases the distinction between a
+    stream that ended with no terminal chunk and a provider emitting a stop
+    string we do not map. The loop persists it per turn so that distinction
+    survives on disk.
 
     Usage normalization: the OpenAI API's ``prompt_tokens`` *includes* cache
     traffic (``prompt_tokens_details`` fields are subsets of it), but
@@ -314,6 +441,11 @@ def from_openai_response(response: Any) -> ModelResponse:
         raise AdapterError(
             f"provider returned an inline error{suffix}: {message}",
             retryable=_code_retryable(code),
+            # Gateways that report faults as HTTP 200 bodies still put an
+            # HTTP-shaped status in ``code``, so the same classification
+            # applies — a 403 "Key limit exceeded" is the same quota
+            # exhaustion whether it arrives as a status or as a body.
+            fault=classify_http_fault(code, message),
         )
     choices = getattr(response, "choices", None)
     if not choices:
@@ -322,33 +454,67 @@ def from_openai_response(response: Any) -> ModelResponse:
         )
     choice = choices[0]
     provider_message = choice.message
-    stop_reason = map_finish_reason(getattr(choice, "finish_reason", None))
-    truncated = stop_reason is StopReason.MAX_TOKENS
+    finish_reason = getattr(choice, "finish_reason", None)
+    # Verbatim provenance: str() is identity for the strings providers
+    # actually send, and keeps a non-string oddity from turning into a
+    # ValidationError that would kill the turn.
+    provider_stop_reason = (
+        None if finish_reason is None else str(finish_reason)
+    )
+    stop_reason = map_finish_reason(finish_reason)
     tool_calls: list[ToolCall] = []
-    dropped_calls = 0
+    dropped: list[DroppedToolCall] = []
     for call in getattr(provider_message, "tool_calls", None) or []:
         function = call.function
         try:
             arguments = _parse_arguments(function.name, function.arguments)
         except AdapterError:
-            if truncated:
-                # A tool call cut off mid-arguments at the output-token cap:
-                # drop it so the turn survives as MAX_TOKENS and the loop's
-                # truncation-continue path re-prompts (see docstring).
-                dropped_calls += 1
-                continue
-            raise
+            # The arguments are unparseable and already spent — no retry can
+            # repair them — so drop the call rather than kill the run, and
+            # report it for the loop to persist (see docstring). AdapterError
+            # stays the internal signal from _parse_arguments; it is caught
+            # here per call instead of escaping as a run-killer.
+            raw_arguments = getattr(function, "arguments", None)
+            text = raw_arguments if isinstance(raw_arguments, str) else repr(
+                raw_arguments
+            )
+            dropped.append(
+                DroppedToolCall(
+                    tool_name=getattr(function, "name", "") or "",
+                    raw_arguments_prefix=text[:DROPPED_ARGUMENTS_PREFIX_CHARS],
+                    raw_arguments_len=len(text),
+                )
+            )
+            continue
         tool_calls.append(
             ToolCall(id=call.id, name=function.name, arguments=arguments)
         )
     content = getattr(provider_message, "content", None) or None
-    if dropped_calls and content is None and not tool_calls:
-        # Dropping left the assistant message empty; substitute a placeholder
-        # so next-turn transcript translation does not reject it.
-        content = (
-            "(response truncated at the output-token limit while emitting "
-            "a tool call)"
+    if dropped:
+        # Appended unconditionally (not only when the message would be empty):
+        # on the sibling-survivor path the loop takes its tool-call branch and
+        # never consults ``incomplete``, so this notice is the model's only
+        # notification that a call vanished.
+        notice = drop_notice(len(dropped))
+        content = f"{content}\n\n{notice}" if content else notice
+
+    # Precedence: dropped_calls > max_tokens > no_finish_reason. The last is
+    # gated on an empty message; see the docstring for why that matters.
+    incomplete_reason: IncompleteReason | None = None
+    if dropped:
+        incomplete_reason = "dropped_calls"
+    elif stop_reason is StopReason.MAX_TOKENS:
+        incomplete_reason = "max_tokens"
+    elif stop_reason is StopReason.ERROR and not content and not tool_calls:
+        # Missing or unmapped finish reason *and* nothing usable in the turn.
+        incomplete_reason = "no_finish_reason"
+    if not content and not tool_calls:
+        # ``dropped_calls`` cannot reach here (its notice is always content),
+        # so fall back to the undiagnosed text rather than assume a key.
+        content = EMPTY_MESSAGE_PLACEHOLDERS.get(
+            incomplete_reason, EMPTY_MESSAGE_PLACEHOLDERS[None]
         )
+
     usage = getattr(response, "usage", None)
     details = getattr(usage, "prompt_tokens_details", None)
     cache_read_tokens = getattr(details, "cached_tokens", 0) or 0
@@ -377,6 +543,10 @@ def from_openai_response(response: Any) -> ModelResponse:
             cache_write_tokens=cache_write_tokens,
         ),
         stop_reason=stop_reason,
+        provider_stop_reason=provider_stop_reason,
+        incomplete=incomplete_reason is not None,
+        incomplete_reason=incomplete_reason,
+        dropped_tool_calls=dropped,
         raw=raw,
     )
 
@@ -505,6 +675,15 @@ def wrap_openai_error(exc: Exception) -> AdapterError:
     — connection errors, timeouts, and mid-stream read/protocol errors (see
     :data:`_TRANSIENT_ERROR_MARKERS`) — are retryable. Anything else is
     non-retryable.
+
+    Independently of ``retryable``, the error is classified into the
+    provider-fault taxonomy (:data:`~harness.adapters.base.Fault`) via
+    :func:`~harness.adapters.base.classify_http_fault`, matched against the
+    exception's *text* as well as its status so a 403 quota exhaustion is
+    distinguished from a 403 region block or moderation refusal. By the time
+    this error survives to a caller the adapter's retries are already spent,
+    so the classification describes a *final* fault. A statusless transport
+    fault is ``transport``; an unrecognised SDK error stays unclassified.
     """
     if isinstance(exc, AdapterError):
         return exc
@@ -514,13 +693,16 @@ def wrap_openai_error(exc: Exception) -> AdapterError:
         return AdapterError(
             f"openai-compatible API error (HTTP {status}): {exc}",
             retryable=retryable,
+            fault=classify_http_fault(status, str(exc)),
         )
     name = type(exc).__name__
     if isinstance(exc, TimeoutError) or any(
         marker in name for marker in _TRANSIENT_ERROR_MARKERS
     ):
         return AdapterError(
-            f"openai-compatible transport error ({name}): {exc}", retryable=True
+            f"openai-compatible transport error ({name}): {exc}",
+            retryable=True,
+            fault="transport",
         )
     return AdapterError(f"openai SDK error: {name}: {exc}", retryable=False)
 
@@ -612,14 +794,15 @@ class OpenAICompatAdapter(ModelAdapter):
         """Run one chat.completions call with retry and translation.
 
         Extra ``params`` (temperature, max_tokens, ...) pass through to
-        ``chat.completions.create``. Raises :class:`AdapterError` on
-        failure, including malformed tool-call JSON from the provider.
+        ``chat.completions.create``. Raises :class:`AdapterError` on failure.
+        Malformed tool-call JSON is *not* a failure: the offending call is
+        dropped and reported on the response (see :func:`from_openai_response`).
 
         Both the network call *and* response translation run inside the
         retried body, so a transient reply (an inline gateway error or an
         empty ``choices`` list — see :func:`from_openai_response`) is retried
-        rather than propagated. Non-retryable translation errors (malformed
-        tool JSON) still surface immediately: the retry helper only retries
+        rather than propagated. Non-retryable translation errors still
+        surface immediately: the retry helper only retries
         :class:`AdapterError`\\ s flagged ``retryable``.
         """
         kwargs: dict[str, Any] = {
@@ -647,6 +830,14 @@ class OpenAICompatAdapter(ModelAdapter):
                 # Streaming: no chunk arrived within the idle window (a stall on
                 # a live socket). Non-streaming: the whole call outlived the
                 # hard timeout. Both are transient — retry on a fresh call.
+                #
+                # This branch — not :func:`wrap_openai_error` — is what every
+                # timeout raised by our own ``asyncio.wait_for`` takes (on
+                # 3.11+ ``asyncio.TimeoutError is TimeoutError``), so it must
+                # carry the ``transport`` fault itself. Without it the single
+                # most common statusless failure on the streaming path (death
+                # mid-stream) escapes the taxonomy and is scored as a
+                # capability failure instead of an infrastructure one.
                 detail = (
                     f"stalled: no data for {self._stream_idle_timeout}s"
                     if self._stream
@@ -654,7 +845,7 @@ class OpenAICompatAdapter(ModelAdapter):
                     "(no response)"
                 )
                 raise AdapterError(
-                    f"model call {detail}", retryable=True
+                    f"model call {detail}", retryable=True, fault="transport"
                 ) from exc
             except Exception as exc:
                 raise wrap_openai_error(exc) from exc

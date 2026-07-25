@@ -160,6 +160,100 @@ class _StubTrialConfig(BaseModel):
     agent: _StubTrialAgentConfig = Field(default_factory=_StubTrialAgentConfig)
 
 
+# -- stub harbor.agents.installed.base exception hierarchy -------------------
+#
+# Mirrors the real parenting exactly (verified against Harbor 0.20.0's
+# harbor/agents/installed/base.py): every class the bridge maps to descends
+# from NonZeroAgentExitCodeError, which is the *only* reason Harbor's
+# SingleStepTrial._run_agent catches it and still goes on to run the
+# verifier. See test_every_mapped_class_keeps_the_verifier_alive.
+
+
+class _StubNonZeroAgentExitCodeError(RuntimeError):
+    pass
+
+
+class _StubApiError(_StubNonZeroAgentExitCodeError):
+    pass
+
+
+class _StubApiRateLimitError(_StubApiError):
+    pass
+
+
+class _StubApiUsageLimitError(_StubApiError):
+    pass
+
+
+class _StubApiInternalServerError(_StubApiError):
+    pass
+
+
+class _StubUnknownApiError(_StubApiError):
+    pass
+
+
+class _StubAgentAuthenticationError(_StubNonZeroAgentExitCodeError):
+    pass
+
+
+class _StubNetworkConnectionError(_StubNonZeroAgentExitCodeError):
+    pass
+
+
+def _installed_base_module(*, with_errors: bool = True) -> types.ModuleType:
+    """Build the stub ``harbor.agents.installed.base`` module.
+
+    ``with_errors=False`` stands in for Harbor version drift: the module
+    exists but no longer exports the classes the bridge imports.
+    """
+    module = types.ModuleType("harbor.agents.installed.base")
+    if with_errors:
+        module.NonZeroAgentExitCodeError = _StubNonZeroAgentExitCodeError
+        module.ApiError = _StubApiError
+        module.ApiRateLimitError = _StubApiRateLimitError
+        module.ApiUsageLimitError = _StubApiUsageLimitError
+        module.ApiInternalServerError = _StubApiInternalServerError
+        module.UnknownApiError = _StubUnknownApiError
+        module.AgentAuthenticationError = _StubAgentAuthenticationError
+        module.NetworkConnectionError = _StubNetworkConnectionError
+    return module
+
+
+def _install_stub_harbor(
+    monkeypatch: pytest.MonkeyPatch, *, with_errors: bool = True
+) -> None:
+    """Inject the stub ``harbor`` package tree into ``sys.modules``."""
+    harbor = types.ModuleType("harbor")
+    agents = types.ModuleType("harbor.agents")
+    agents_base = types.ModuleType("harbor.agents.base")
+    agents_base.BaseAgent = _StubBaseAgent
+    agents_installed = types.ModuleType("harbor.agents.installed")
+    agents_installed_base = _installed_base_module(with_errors=with_errors)
+    harbor.agents = agents
+    agents.base = agents_base
+    agents.installed = agents_installed
+    agents_installed.base = agents_installed_base
+    models = types.ModuleType("harbor.models")
+    models_trial = types.ModuleType("harbor.models.trial")
+    models_trial_config = types.ModuleType("harbor.models.trial.config")
+    models_trial_config.TrialConfig = _StubTrialConfig
+    harbor.models = models
+    models.trial = models_trial
+    models_trial.config = models_trial_config
+    for name, module in [
+        ("harbor", harbor),
+        ("harbor.agents", agents),
+        ("harbor.agents.base", agents_base),
+        ("harbor.agents.installed", agents_installed),
+        ("harbor.agents.installed.base", agents_installed_base),
+        ("harbor.models", models),
+        ("harbor.models.trial", models_trial),
+        ("harbor.models.trial.config", models_trial_config),
+    ]:
+        monkeypatch.setitem(sys.modules, name, module)
+
+
 @pytest.fixture
 def harbor_agent(monkeypatch: pytest.MonkeyPatch):
     """Import the module under test against stub ``harbor`` modules.
@@ -168,27 +262,7 @@ def harbor_agent(monkeypatch: pytest.MonkeyPatch):
     module itself is imported fresh and evicted afterwards so no other
     test sees a harbor_agent bound to the stubs.
     """
-    harbor = types.ModuleType("harbor")
-    agents = types.ModuleType("harbor.agents")
-    agents_base = types.ModuleType("harbor.agents.base")
-    agents_base.BaseAgent = _StubBaseAgent
-    harbor.agents = agents
-    agents.base = agents_base
-    models = types.ModuleType("harbor.models")
-    models_trial = types.ModuleType("harbor.models.trial")
-    models_trial_config = types.ModuleType("harbor.models.trial.config")
-    models_trial_config.TrialConfig = _StubTrialConfig
-    harbor.models = models
-    models.trial = models_trial
-    models_trial.config = models_trial_config
-    monkeypatch.setitem(sys.modules, "harbor", harbor)
-    monkeypatch.setitem(sys.modules, "harbor.agents", agents)
-    monkeypatch.setitem(sys.modules, "harbor.agents.base", agents_base)
-    monkeypatch.setitem(sys.modules, "harbor.models", models)
-    monkeypatch.setitem(sys.modules, "harbor.models.trial", models_trial)
-    monkeypatch.setitem(
-        sys.modules, "harbor.models.trial.config", models_trial_config
-    )
+    _install_stub_harbor(monkeypatch)
     sys.modules.pop(_MODULE, None)
     try:
         yield importlib.import_module(_MODULE)
@@ -425,6 +499,39 @@ def _agent_context() -> SimpleNamespace:
     )
 
 
+#: The verbatim provider text from the real run whose exhausted key killed 7
+#: of 22 trials — Harbor recorded every one of them as a clean completion.
+FAULT_TEXT = (
+    "openai-compatible API error (HTTP 403): Error code: 403 - "
+    "{'error': {'message': 'Key limit exceeded (total limit).', 'code': 403}}"
+)
+
+
+def _run_task_returning(error_kind: str | None):
+    """A stub ``Orchestrator.run_task`` yielding a result with ``error_kind``.
+
+    The usage is non-zero on purpose: it stands for the work a trial did
+    before the provider died, which must still reach Harbor's AgentContext.
+    """
+    from harness.loop import AgentResult
+
+    async def run_task(self, goal, model_name, **kwargs):
+        return "run-1", AgentResult(
+            status="error" if error_kind else "completed",
+            final_text=FAULT_TEXT,
+            usage=Usage(
+                input_tokens=11,
+                output_tokens=5,
+                cache_read_tokens=3,
+                cache_write_tokens=4,
+            ),
+            turns=7,
+            error_kind=error_kind,
+        )
+
+    return run_task
+
+
 @pytest.fixture
 def isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point HOME (and any pre-set HARNESS_HOME) away from the real user."""
@@ -614,6 +721,107 @@ class TestHarnessAgentRun:
         assert context.metadata["error"] == "RuntimeError: provider melted"
         assert context.n_input_tokens is None  # no result to report
 
+    @pytest.mark.parametrize(
+        "error_kind,exc_attr",
+        [
+            ("auth", "AgentAuthenticationError"),
+            ("quota", "ApiUsageLimitError"),
+            ("rate_limit", "ApiRateLimitError"),
+            ("server", "ApiInternalServerError"),
+            ("transport", "NetworkConnectionError"),
+            ("malformed_response", "UnknownApiError"),
+        ],
+    )
+    async def test_provider_fault_raises_mapped_harbor_exception(
+        self,
+        harbor_agent,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        error_kind: str,
+        exc_attr: str,
+    ):
+        """A provider fault must surface to Harbor as Harbor's *own* error
+        type — otherwise the trial is recorded as a clean completion and the
+        fault masquerades as an agent capability failure."""
+        expected = getattr(
+            sys.modules["harbor.agents.installed.base"], exc_attr
+        )
+        monkeypatch.setattr(
+            harbor_agent, "get_adapter", lambda config: FakeAdapter([])
+        )
+        monkeypatch.setattr(
+            Orchestrator, "run_task", _run_task_returning(error_kind)
+        )
+
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+        )
+        context = _agent_context()
+        with pytest.raises(expected) as excinfo:
+            await agent.run("goal", StubEnvironment(), context)
+        # The provider's own message rides along, so exception_info is
+        # actionable without opening the harness home.
+        assert "Key limit exceeded" in str(excinfo.value)
+
+    async def test_fault_raise_still_populates_context(
+        self,
+        harbor_agent,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The raise happens *inside* the existing try, so the finally still
+        lands the tokens and metadata the run accrued before the provider
+        died. Losing those would make the fault undiagnosable and would drop
+        real usage from Harbor's accounting."""
+        monkeypatch.setattr(
+            harbor_agent, "get_adapter", lambda config: FakeAdapter([])
+        )
+        monkeypatch.setattr(Orchestrator, "run_task", _run_task_returning("quota"))
+
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+        )
+        context = _agent_context()
+        with pytest.raises(Exception):
+            await agent.run("goal", StubEnvironment(), context)
+
+        # Usage accrued before the fault (input 11 + cache read 3 + write 4).
+        assert context.n_input_tokens == 18
+        assert context.n_output_tokens == 5
+        assert context.n_cache_tokens == 3
+        assert context.metadata["status"] == "error"
+        assert context.metadata["turns"] == 7
+        assert "Key limit exceeded" in context.metadata["final_text"]
+        assert context.metadata["run_id"] == "run-1"
+        # The exception recorded is the mapped Harbor class, not a bare one.
+        assert "ApiUsageLimitError" in context.metadata["error"]
+
+    @pytest.mark.parametrize("error_kind", [None, "", "something_unmapped"])
+    async def test_unmapped_error_kind_returns_normally(
+        self,
+        harbor_agent,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        error_kind: str | None,
+    ):
+        """No behaviour change for anything the taxonomy does not claim:
+        clean finishes, budget pauses, and unclassified errors all return."""
+        monkeypatch.setattr(
+            harbor_agent, "get_adapter", lambda config: FakeAdapter([])
+        )
+        monkeypatch.setattr(
+            Orchestrator, "run_task", _run_task_returning(error_kind)
+        )
+
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+        )
+        context = _agent_context()
+        await agent.run("goal", StubEnvironment(), context)  # no raise
+
+        assert "error" not in context.metadata
+        assert context.n_output_tokens == 5
+
     async def test_budgets_read_from_extra_env(
         self, harbor_agent, isolated_home: Path
     ):
@@ -667,6 +875,113 @@ class TestHarnessAgentRun:
         assert harbor_agent.HarnessAgent.name() == "agent-harness"
         agent = harbor_agent.HarnessAgent(logs_dir=Path("/tmp/x"))
         assert isinstance(agent.version(), str)
+
+
+# -- provider-fault -> Harbor exception mapping ------------------------------
+
+
+class TestFaultExceptionMap:
+    def test_covers_every_fault_in_the_taxonomy(self, harbor_agent):
+        """Every harness fault kind must map to something, or a provider
+        outage silently keeps masquerading as a capability failure."""
+        from typing import get_args
+
+        from harness.adapters.base import Fault
+
+        assert set(harbor_agent._FAULT_EXCEPTIONS) == set(get_args(Fault))
+
+    def test_every_mapped_class_keeps_the_verifier_alive(self, harbor_agent):
+        """THE load-bearing invariant.
+
+        Harbor's ``SingleStepTrial._run_agent`` catches only
+        ``(AgentTimeoutError, NonZeroAgentExitCodeError)``; after that catch
+        ``_run()`` continues to ``_collect_artifacts()`` and
+        ``_run_verifier()``. Anything *not* under that base escapes to
+        ``Trial.run``'s ``except Exception``, which runs ``_recover_outputs()``
+        **instead of** the verifier — so a trial that did real work before the
+        provider died would lose all chance of reward.
+
+        Three trials in the run that motivated this change (18, 26, and 3
+        turns of work respectively) are verified today *despite* their 403.
+        If a Harbor upgrade re-parents any of these classes out of the
+        ``NonZeroAgentExitCodeError`` tree, this test is what says so —
+        loudly — instead of the next benchmark run quietly losing reward.
+        """
+        base = sys.modules["harbor.agents.installed.base"].NonZeroAgentExitCodeError
+        for fault, exc_type in harbor_agent._FAULT_EXCEPTIONS.items():
+            assert issubclass(exc_type, base), (
+                f"{fault} -> {exc_type.__name__} is not a "
+                f"NonZeroAgentExitCodeError subclass; Harbor would skip the "
+                f"verifier for this fault"
+            )
+
+    def test_real_harbor_classes_are_still_parented_correctly(self):
+        """The same invariant against the *real* Harbor, when importable.
+
+        The stub above mirrors Harbor 0.20.0's hierarchy, so on its own it
+        can only catch a mistake in our map. This one catches a mistake in
+        Harbor — it is skipped in the project venv (Harbor lives in its own
+        uv-tool venv) and runs where the bridge actually executes.
+        """
+        installed = pytest.importorskip("harbor.agents.installed.base")
+        for name in (
+            "AgentAuthenticationError",
+            "ApiUsageLimitError",
+            "ApiRateLimitError",
+            "ApiInternalServerError",
+            "NetworkConnectionError",
+            "UnknownApiError",
+        ):
+            assert issubclass(
+                getattr(installed, name), installed.NonZeroAgentExitCodeError
+            ), f"harbor's {name} is no longer a NonZeroAgentExitCodeError"
+
+    def test_version_drift_degrades_to_todays_behaviour(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """If a Harbor upgrade moves or renames the error classes, the bridge
+        must fall back to the pre-taxonomy behaviour with a warning — never
+        raise something Harbor does not catch, which would cost the trial its
+        verifier run for the sake of a nicer label."""
+        _install_stub_harbor(monkeypatch, with_errors=False)
+        sys.modules.pop(_MODULE, None)
+        try:
+            with pytest.warns(RuntimeWarning, match="error classes"):
+                module = importlib.import_module(_MODULE)
+            assert module._FAULT_EXCEPTIONS == {}
+        finally:
+            sys.modules.pop(_MODULE, None)
+
+    async def test_version_drift_run_returns_normally_on_fault(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        isolated_home: Path,
+    ):
+        """End of that fallback: a faulting run still completes and is scored,
+        exactly as it did before this change."""
+        _install_stub_harbor(monkeypatch, with_errors=False)
+        sys.modules.pop(_MODULE, None)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                module = importlib.import_module(_MODULE)
+            monkeypatch.setattr(
+                module, "get_adapter", lambda config: FakeAdapter([])
+            )
+            monkeypatch.setattr(
+                Orchestrator, "run_task", _run_task_returning("quota")
+            )
+            agent = module.HarnessAgent(
+                logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+            )
+            context = _agent_context()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                await agent.run("goal", StubEnvironment(), context)  # no raise
+            assert context.metadata["status"] == "error"
+            assert "error" not in context.metadata  # no exception recorded
+        finally:
+            sys.modules.pop(_MODULE, None)
 
 
 # -- wall-clock deadline derivation ------------------------------------------
