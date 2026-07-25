@@ -18,7 +18,7 @@ import pytest
 from harness.adapters.fake import FakeAdapter
 from harness.config import PermissionMode
 from harness.context import COMPACTION_SUMMARY_PREFIX, ContextManager
-from harness.deadline import Deadline
+from harness.deadline import WALL_CLOCK_STOP_FLOOR, Deadline
 from harness.loop import (
     DROPPED_ARGUMENTS_PREFIX_CHARS,
     AgentLoop,
@@ -1246,6 +1246,166 @@ class TestWallClockHardStop:
         assert stop["remaining_seconds"] == pytest.approx(50.0)
 
 
+class _MovableClock:
+    """A monotonic clock the test moves by hand — no real sleeps."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _TimedFakeAdapter(FakeAdapter):
+    """A :class:`FakeAdapter` whose calls cost wall-clock on a fake clock,
+    so the loop's model-call observations are exercised deterministically."""
+
+    def __init__(
+        self,
+        script: list[ModelResponse],
+        clock: _MovableClock,
+        seconds_per_call: float,
+    ) -> None:
+        super().__init__(script)
+        self._clock = clock
+        self._seconds_per_call = seconds_per_call
+
+    async def complete(  # type: ignore[no-untyped-def]
+        self, messages, tools, system=None, **params
+    ):
+        self._clock.advance(self._seconds_per_call)
+        return await super().complete(messages, tools, system, **params)
+
+
+class _BurnsItsWindowSandbox:
+    """A sandbox stub whose ``exec`` consumes exactly its ``timeout``.
+
+    The worst case for the exec cap: a command that runs until it is
+    killed, so what is left when it returns is exactly what the cap
+    reserved.
+    """
+
+    def __init__(self, clock: _MovableClock) -> None:
+        self._clock = clock
+        self.received_timeout: float | None = None
+
+    async def exec(  # type: ignore[no-untyped-def]
+        self, command: str, timeout: float = 120
+    ):
+        from harness.sandbox.base import ExecResult
+
+        self.received_timeout = timeout
+        self._clock.advance(timeout)
+        return ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+
+
+class TestLandingReserveLeavesATurn:
+    """Change 0: the exec reserve funds a landing turn, not just a clean stop.
+
+    Before the split, ``EXEC_RESERVE_SECONDS == WALL_CLOCK_STOP_FLOOR ==
+    60``, so an exec capped at ``remaining - 60`` returned with *exactly*
+    the hard-stop floor left: step 1a fired, the run paused, and the agent
+    that had just been told to "finalize your answer now" never got the
+    turn to do it.
+    """
+
+    async def test_capped_exec_is_followed_by_another_model_turn(
+        self, tmp_path: Path
+    ) -> None:
+        # The write-compressor shape: at remaining=336 of a 900s budget the
+        # model asks for a 300s command that runs until killed.
+        clock = _MovableClock()
+        deadline = Deadline(900.0, clock)
+        clock.now = 564.0  # remaining 336
+
+        sandbox = _BurnsItsWindowSandbox(clock)
+        script = [
+            resp(
+                "compressing",
+                [call("c1", "bash", command="./compress", timeout=300)],
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox, deadline=deadline)],  # type: ignore[arg-type]
+            clock=clock,
+            deadline=deadline,
+        )
+        result = await h.loop.run(GOAL)
+
+        # The cap: reserve = 60 floor + 15 allowance (a fake clock makes the
+        # scripted model calls cost 0s, so the allowance clamps to its
+        # minimum) -> 336 - 75 = 261s, not the old 336 - 60 = 276s.
+        assert sandbox.received_timeout == pytest.approx(261.0)
+        # ...which is the whole point: the exec returns above the floor.
+        assert deadline.remaining() == pytest.approx(75.0)
+        assert deadline.remaining() > WALL_CLOCK_STOP_FLOOR
+        # So the run gets its landing turn instead of a wall_clock_stop.
+        assert h.events("wall_clock_stop") == []
+        assert len(h.events("model_turn")) == 2
+        assert len(h.adapter.calls) == 2
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        # And the landing turn carries the wind-down reminder (it is now
+        # reachable, where before step 1a returned ahead of it).
+        assert len(h.events("wind_down")) == 1
+
+    async def test_loop_feeds_the_deadlines_model_call_window(
+        self, tmp_path: Path
+    ) -> None:
+        """The allowance is adaptive because the loop reports every call."""
+        clock = _MovableClock()
+        deadline = Deadline(1800.0, clock)
+        script = [
+            resp("thinking", [call(f"c{i}", "echo", text="x")]) for i in range(3)
+        ] + [resp(CLEAN_FINISH)]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("echo")],
+            clock=clock,
+            deadline=deadline,
+        )
+        timed = _TimedFakeAdapter(script, clock, 20.0)
+        h.loop.adapter = timed  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.turns == 4
+        # Four 20s calls observed: p75 = 20 (inside the bounds), so the
+        # reserve tracks this provider rather than the 30s default.
+        assert deadline.recent_call_median() == pytest.approx(20.0)
+        assert deadline.landing_allowance() == pytest.approx(20.0)
+        assert deadline.landing_reserve() == pytest.approx(80.0)
+
+    async def test_no_deadline_records_nothing_and_caps_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """Without a deadline the loop must not touch a deadline at all."""
+        clock = _MovableClock()
+        sandbox = _BurnsItsWindowSandbox(clock)
+        script = [
+            resp("running", [call("c1", "bash", command="./x", timeout=300)]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox)],  # type: ignore[arg-type]
+            clock=clock,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert sandbox.received_timeout == 300.0  # pure passthrough
+        assert h.events("wall_clock_stop") == []
+
+
 # ---------------------------------------------------------------------------
 # Truncated-turn continuation (output-token cap hit with no action)
 # ---------------------------------------------------------------------------
@@ -2449,11 +2609,13 @@ class TestVerificationTimeoutCap:
             resp("declaring", [declare("v1", "pytest -q")]),
             resp(CLEAN_FINISH),
         ]
-        # remaining=100 throughout (fixed clock); 100 - EXEC_RESERVE(60) = 40,
-        # below VERIFICATION_TIMEOUT_SECONDS(300) -> capped to 40s. 100 is
-        # also above the wind-down threshold for a 100s "budget" (50s), so
+        # remaining=200 throughout (fixed clock); the same fixed clock makes
+        # every model call take 0s, so the landing allowance clamps to its
+        # 15s minimum and the reserve is 60 + 15 = 75. 200 - 75 = 125, below
+        # VERIFICATION_TIMEOUT_SECONDS(300) -> capped to 125s. 200 is also
+        # above the wind-down threshold for a 200s "budget" (100s), so
         # wind-down does not fire and cannot be confused with this path.
-        deadline = Deadline(100.0, clock=lambda: 0.0)
+        deadline = Deadline(200.0, clock=lambda: 0.0)
         h = make_harness(
             tmp_path,
             script,
@@ -2474,7 +2636,7 @@ class TestVerificationTimeoutCap:
         assert failed["timed_out"] is True
         assert failed["timeout_capped"] is True
         assert failed["inconclusive"] is True
-        assert failed["timeout_seconds"] == pytest.approx(40.0)
+        assert failed["timeout_seconds"] == pytest.approx(125.0)
         assert failed["timeout_seconds"] < VERIFICATION_TIMEOUT_SECONDS
         assert "nudge_number" not in failed
         assert "nudges_exhausted" not in failed
@@ -2533,7 +2695,8 @@ class TestVerificationTimeoutCap:
             resp("declaring", [declare("v1", "echo ok")]),
             resp(CLEAN_FINISH),
         ]
-        deadline = Deadline(100.0, clock=lambda: 0.0)  # forces a 40s cap
+        # remaining=200 with a fixed clock -> reserve 75 (see above) -> 125s
+        deadline = Deadline(200.0, clock=lambda: 0.0)
         h = make_harness(
             tmp_path,
             script,
@@ -2545,11 +2708,11 @@ class TestVerificationTimeoutCap:
         result = await h.loop.run(GOAL)
 
         assert result.status == "completed"
-        assert fake.received_timeout == pytest.approx(40.0)
+        assert fake.received_timeout == pytest.approx(125.0)
         (passed,) = h.events("verification_passed")
         assert passed["exit_code"] == 0
         assert passed["timeout_capped"] is True
-        assert passed["timeout_seconds"] == pytest.approx(40.0)
+        assert passed["timeout_seconds"] == pytest.approx(125.0)
         assert h.events("verification_failed") == []
         assert h.events("nudge") == []
 

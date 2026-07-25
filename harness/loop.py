@@ -82,7 +82,6 @@ from harness.adapters.base import AdapterError, ModelAdapter
 from harness.context import ContextManager
 from harness.deadline import (
     EXEC_CAP_FLOOR_SECONDS,
-    EXEC_RESERVE_SECONDS,
     WALL_CLOCK_STOP_FLOOR,
     Deadline,
 )
@@ -647,12 +646,12 @@ class AgentLoop:
                 "denied": True,
             }
         remaining = deadline.remaining() if deadline is not None else None
-        if remaining is None:
+        if deadline is None or remaining is None:
             effective = VERIFICATION_TIMEOUT_SECONDS
         else:
             effective = min(
                 VERIFICATION_TIMEOUT_SECONDS,
-                max(EXEC_CAP_FLOOR_SECONDS, remaining - EXEC_RESERVE_SECONDS),
+                max(EXEC_CAP_FLOOR_SECONDS, remaining - deadline.landing_reserve()),
             )
         timeout_capped = effective < VERIFICATION_TIMEOUT_SECONDS
         try:
@@ -835,6 +834,11 @@ class AgentLoop:
             # the model_turn event, and step 5a's deadline check, so none of
             # the three can disagree about what this call cost.
             last_call_seconds = self.clock() - call_started
+            # Feed the deadline's rolling latency window: the landing
+            # reserve held back from every capped exec is sized from what
+            # this provider's calls actually cost, not from a flat guess.
+            if deadline is not None:
+                deadline.observe_model_call(last_call_seconds)
             duration_ms = int(last_call_seconds * 1000)
             self.store.record_usage(
                 self.run_id,

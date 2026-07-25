@@ -42,7 +42,7 @@ import json
 import re
 from typing import TYPE_CHECKING
 
-from harness.deadline import EXEC_CAP_FLOOR_SECONDS, EXEC_RESERVE_SECONDS, Deadline
+from harness.deadline import EXEC_CAP_FLOOR_SECONDS, Deadline
 from harness.diligence import VERIFICATION_TOOL_NAME
 from harness.memory.store import FactType, MemoryStore
 from harness.permissions import ToolMeta
@@ -121,11 +121,14 @@ def bash_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
     ``timeout`` by what wall-clock is actually left: a command allowed to
     run past the run's own external kill would never get its result back to
     the model at all. The requested timeout is honored as long as
-    ``remaining - EXEC_RESERVE_SECONDS`` covers it; otherwise it is shortened
-    to that (never below ``EXEC_CAP_FLOOR_SECONDS``, so even a nearly-spent
-    budget still gets a usable exec window rather than a spuriously-failing
-    one). ``deadline=None`` (the default) or an unset deadline budget is a
-    pure passthrough -- today's behavior, unchanged.
+    ``remaining - deadline.landing_reserve()`` covers it; otherwise it is
+    shortened to that (never below ``EXEC_CAP_FLOOR_SECONDS``, so even a
+    nearly-spent budget still gets a usable exec window rather than a
+    spuriously-failing one). The reserve is the wall-clock stop floor *plus*
+    a landing allowance, so a capped exec returns with enough time left for
+    the agent to take one more turn and write its answer down.
+    ``deadline=None`` (the default) or an unset deadline budget is a pure
+    passthrough -- today's behavior, unchanged.
     """
 
     spec = ToolSpec(
@@ -157,11 +160,12 @@ def bash_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
         command = _require_str("bash", arguments, "command")
         requested = float(arguments.get("timeout", 120))
         remaining = deadline.remaining() if deadline is not None else None
-        if remaining is None:
+        if deadline is None or remaining is None:
             effective = requested
         else:
             effective = min(
-                requested, max(EXEC_CAP_FLOOR_SECONDS, remaining - EXEC_RESERVE_SECONDS)
+                requested,
+                max(EXEC_CAP_FLOOR_SECONDS, remaining - deadline.landing_reserve()),
             )
         capped = effective < requested
         result = await sandbox.exec(command, timeout=effective)
