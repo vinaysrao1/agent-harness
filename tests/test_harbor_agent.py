@@ -853,6 +853,95 @@ class TestHarnessAgentRun:
         with pytest.warns(UserWarning, match="not an integer"):
             assert agent._int_setting("HARNESS_MAX_TURNS", 80) == 80
 
+    async def test_max_turns_set_to_the_default_value_is_still_hard(
+        self, harbor_agent, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The case the *value* cannot express: an operator who explicitly
+        pins HARNESS_MAX_TURNS to exactly the built-in default still means
+        it, so the turn ceiling must stay hard and the loop must not raise it
+        from the wall clock. Presence, not value, is the signal."""
+        monkeypatch.delenv("HARNESS_MAX_TURNS", raising=False)
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs",
+            model_name="openai/gpt-5.2",
+            extra_env={"HARNESS_MAX_TURNS": "80"},
+        )
+        assert agent._int_setting("HARNESS_MAX_TURNS", 80) == 80  # ambiguous
+        assert agent._setting_present("HARNESS_MAX_TURNS") is True
+
+    async def test_absent_max_turns_is_not_hard(
+        self, harbor_agent, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.delenv("HARNESS_MAX_TURNS", raising=False)
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+        )
+        assert agent._setting_present("HARNESS_MAX_TURNS") is False
+
+    async def test_max_turns_present_in_the_process_environment(
+        self, harbor_agent, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """extra_env is not the only way an operator expresses intent."""
+        monkeypatch.setenv("HARNESS_MAX_TURNS", "80")
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+        )
+        assert agent._setting_present("HARNESS_MAX_TURNS") is True
+
+    async def test_unparseable_max_turns_still_counts_as_present(
+        self, harbor_agent, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A typo'd value falls back to the default *value*, but the operator
+        did express a ceiling, so it stays hard rather than being silently
+        replaced by a clock-derived rail."""
+        monkeypatch.delenv("HARNESS_MAX_TURNS", raising=False)
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs",
+            model_name="openai/gpt-5.2",
+            extra_env={"HARNESS_MAX_TURNS": "lots"},
+        )
+        assert agent._setting_present("HARNESS_MAX_TURNS") is True
+
+    async def test_run_marks_max_turns_hard_only_when_set(
+        self,
+        harbor_agent,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """End to end: the flag the loop reads is wired from presence, for a
+        default run and for an operator-pinned one."""
+        monkeypatch.delenv("HARNESS_MAX_TURNS", raising=False)
+        seen: list[object] = []
+        real_budgets = harbor_agent.Budgets
+
+        def spy(**kwargs: object):
+            budgets = real_budgets(**kwargs)
+            seen.append(budgets)
+            return budgets
+
+        monkeypatch.setattr(harbor_agent, "Budgets", spy)
+        monkeypatch.setattr(
+            harbor_agent, "get_adapter", lambda config: FakeAdapter(bash_script())
+        )
+        agent = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs", model_name="openai/gpt-5.2"
+        )
+        await agent.run("goal", StubEnvironment(), _agent_context())
+        assert seen[-1].max_turns_is_hard is False
+        assert seen[-1].max_turns == 80
+
+        monkeypatch.setattr(
+            harbor_agent, "get_adapter", lambda config: FakeAdapter(bash_script())
+        )
+        pinned = harbor_agent.HarnessAgent(
+            logs_dir=isolated_home / "logs2",
+            model_name="openai/gpt-5.2",
+            extra_env={"HARNESS_MAX_TURNS": "80"},
+        )
+        await pinned.run("goal", StubEnvironment(), _agent_context())
+        assert seen[-1].max_turns_is_hard is True
+        assert seen[-1].max_turns == 80
+
     def test_registry_resolution_reads_users_real_config(
         self, harbor_agent, isolated_home: Path
     ):

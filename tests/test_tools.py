@@ -12,6 +12,7 @@ from harness.deadline import (
     WALL_CLOCK_STOP_FLOOR,
     Deadline,
 )
+from harness.diligence import WrittenData, record_written_data
 from harness.memory.store import FactNotFoundError, MemoryStore
 from harness.permissions import ToolMeta
 from harness.persistence import RunStore
@@ -147,17 +148,25 @@ class FakeExecSandbox:
 
 
 def _fixed_deadline(
-    budget: float, observations: tuple[float, ...] = ()
+    budget: float,
+    remaining: float | None = None,
+    observations: tuple[float, ...] = (),
 ) -> Deadline:
-    """A ``Deadline`` whose ``remaining()`` is always exactly ``budget`` --
+    """A ``Deadline`` of ``budget`` frozen at ``remaining`` seconds left --
     a clock that never advances, so cap-math tests are exact and don't race
-    real wall-clock time.
+    real wall-clock time. ``remaining`` defaults to the whole ``budget``.
+
+    Budget and remaining are separate because the exec cap reads both: the
+    share cap is a fraction of the *budget* while the reserve and the band
+    guarantee work off what *remains*.
 
     ``observations`` pre-loads model-call durations so the landing reserve
     (``WALL_CLOCK_STOP_FLOOR + landing_allowance()``) is pinned; with none,
     the reserve is the no-observations default of 60 + 30 = 90s.
     """
-    deadline = Deadline(budget, clock=lambda: 0.0)
+    elapsed = 0.0 if remaining is None else budget - remaining
+    calls = iter([0.0])
+    deadline = Deadline(budget, clock=lambda: next(calls, elapsed))
     for seconds in observations:
         deadline.observe_model_call(seconds)
     return deadline
@@ -349,10 +358,11 @@ class TestBashToolDeadlineCap:
         assert sandbox.received_timeout == 45
 
     async def test_cap_applies_when_remaining_is_tight(self):
-        # remaining=200, reserve=90 (60 floor + 30 default allowance) ->
-        # allowed 110s, below the default 120s request.
+        # remaining=200 of 900, reserve=90 (60 floor + 30 default allowance)
+        # -> allowed 110s, below the default 120s request. In-band (200 <
+        # the 300s wind-down threshold), so the band softener does not add.
         sandbox = FakeExecSandbox()
-        tool = bash_tool(sandbox, deadline=_fixed_deadline(200.0))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, 200.0))
         await tool.handler({"command": "echo hi"})
         assert sandbox.received_timeout == 110.0
 
@@ -360,7 +370,9 @@ class TestBashToolDeadlineCap:
         # Same remaining, a fast provider: p75 of 5s calls clamps up to the
         # 15s minimum, so the reserve is 75s and the exec gets 125s.
         sandbox = FakeExecSandbox()
-        deadline = _fixed_deadline(200.0, observations=(5.0, 5.0, 5.0, 5.0))
+        deadline = _fixed_deadline(
+            900.0, 200.0, observations=(5.0, 5.0, 5.0, 5.0)
+        )
         tool = bash_tool(sandbox, deadline=deadline)
         await tool.handler({"command": "echo hi", "timeout": 600})
         assert sandbox.received_timeout == 125.0
@@ -370,7 +382,7 @@ class TestBashToolDeadlineCap:
         # burns its whole window, the loop can still start a model call.
         sandbox = FakeExecSandbox()
         remaining = 336.0
-        tool = bash_tool(sandbox, deadline=_fixed_deadline(remaining))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, remaining))
         await tool.handler({"command": "sleep 300", "timeout": 300})
         assert sandbox.received_timeout == 246.0  # 336 - 90
         assert remaining - sandbox.received_timeout > WALL_CLOCK_STOP_FLOOR
@@ -381,13 +393,15 @@ class TestBashToolDeadlineCap:
         # remaining=100, reserve=90 -> 10s, below EXEC_CAP_FLOOR_SECONDS
         # (30): the floor wins so trivial commands don't spuriously fail.
         sandbox = FakeExecSandbox()
-        tool = bash_tool(sandbox, deadline=_fixed_deadline(100.0))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, 100.0))
         await tool.handler({"command": "echo hi", "timeout": 120})
         assert sandbox.received_timeout == EXEC_CAP_FLOOR_SECONDS
 
     async def test_requested_below_the_cap_is_left_untouched(self):
         sandbox = FakeExecSandbox()
-        tool = bash_tool(sandbox, deadline=_fixed_deadline(200.0))  # allows 110s
+        tool = bash_tool(
+            sandbox, deadline=_fixed_deadline(900.0, 200.0)
+        )  # allows 110s
         await tool.handler({"command": "echo hi", "timeout": 10})
         assert sandbox.received_timeout == 10.0
 
@@ -395,15 +409,20 @@ class TestBashToolDeadlineCap:
         sandbox = FakeExecSandbox(
             ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
         )
-        tool = bash_tool(sandbox, deadline=_fixed_deadline(200.0))  # allows 110s
+        tool = bash_tool(
+            sandbox, deadline=_fixed_deadline(900.0, 200.0)
+        )  # allows 110s
         output = await tool.handler({"command": "sleep 1000"})
         assert "timed out after 110.0s" in output
         assert "capped from your requested 120.0s" in output
         assert "~200.0s of wall-clock remain" in output
+        assert "do not start another long command" in output
 
     async def test_capped_success_result_carries_a_note(self):
         sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="done", stderr=""))
-        tool = bash_tool(sandbox, deadline=_fixed_deadline(200.0))  # allows 110s
+        tool = bash_tool(
+            sandbox, deadline=_fixed_deadline(900.0, 200.0)
+        )  # allows 110s
         output = await tool.handler({"command": "echo hi", "timeout": 120})
         assert "note: timeout was capped to 110.0s" in output
         assert "exit code: 0" in output
@@ -424,6 +443,229 @@ class TestBashToolDeadlineCap:
         assert LANDING_ALLOWANCE_DEFAULT == 30.0
         assert EXEC_CAP_FLOOR_SECONDS == 30.0
         assert _fixed_deadline(900.0).landing_reserve() == 90.0
+
+    async def test_share_cap_binds_a_command_issued_early(self):
+        # The mcmc shape: 1800s requested at remaining 1706.9 of 1800. Only
+        # the share cap contains it; the band guarantee alone allows 1346.9s.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(1800.0, 1706.9))
+        await tool.handler({"command": "R CMD INSTALL rstan", "timeout": 1800})
+        assert sandbox.received_timeout == 900.0
+
+    async def test_band_guarantee_binds_above_the_threshold(self):
+        # remaining 335.5 of 900 is above the 300s wind-down threshold, so
+        # the softener holds back 0.25 x 335.5 = 83.875s.
+        sandbox = FakeExecSandbox()
+        deadline = _fixed_deadline(
+            900.0, 335.5, observations=(5.0, 5.0, 5.0, 5.0)
+        )
+        tool = bash_tool(sandbox, deadline=deadline)
+        await tool.handler({"command": "./compress", "timeout": 300})
+        assert sandbox.received_timeout == pytest.approx(251.625)
+
+    async def test_cap_message_names_the_share_reason(self):
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="ok", stderr=""))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(1800.0, 1706.9))
+        output = await tool.handler({"command": "make", "timeout": 1800})
+        assert "half the run's total budget" in output
+
+    async def test_cap_message_names_the_landing_reason(self):
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="ok", stderr=""))
+        tool = bash_tool(
+            sandbox, deadline=_fixed_deadline(900.0, 200.0)
+        )  # in-band: reserve, not share
+        output = await tool.handler({"command": "make", "timeout": 120})
+        assert "land your answer" in output
+
+
+class TestBashToolExecCappedEvent:
+    """X13: every capped exec is telemetry, so round 3 retunes the cap's
+    constants from real runs instead of another simulation."""
+
+    def _wired(
+        self,
+        run_store: RunStore,
+        run_id: str,
+        deadline,
+        result: ExecResult | None = None,
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        sandbox = FakeExecSandbox(result) if result else FakeExecSandbox()
+        tool = bash_tool(
+            sandbox, deadline=deadline, store=run_store, agent_id=agent_id
+        )
+        return agent_id, sandbox, tool
+
+    def _events(self, run_store: RunStore, agent_id: str) -> list[dict]:
+        return [
+            event.payload
+            for event in run_store.load_events(agent_id)
+            if event.kind == "exec_capped"
+        ]
+
+    async def test_payload_carries_every_tuning_field(
+        self, run_store: RunStore, run_id: str
+    ):
+        deadline = _fixed_deadline(1800.0, 1706.9)
+        agent_id, _sandbox, tool = self._wired(run_store, run_id, deadline)
+        await tool.handler({"command": "R CMD INSTALL rstan", "timeout": 1800})
+
+        (payload,) = self._events(run_store, agent_id)
+        assert payload == {
+            "requested": 1800.0,
+            "effective": 900.0,
+            "remaining": pytest.approx(1706.9),
+            "budget": 1800.0,
+            # The base landing reserve (60 floor + 30 default allowance) and
+            # what the cap arithmetic actually held back. They differ here:
+            # remaining is above the 360s wind-down threshold, so the band
+            # softener raised the reserve to 360 even though the share cap
+            # is what ultimately bound.
+            "reserve": 90.0,
+            "applied_reserve": 360.0,
+            "reason": "share",
+            "purpose": "exploratory",
+        }
+
+    async def test_applied_reserve_is_the_softened_band_reserve(
+        self, run_store: RunStore, run_id: str
+    ):
+        """Regression: the payload reported only the *base* landing reserve,
+        so the softener's real contribution — the number round 3 retunes
+        LANDING_RESERVE_FRACTION from — was absent. It is not always
+        recoverable either: for reason "band"/"reserve" it equals
+        remaining - effective, but for "share" nothing in the payload
+        determines it."""
+        # The caffe-cifar-10 row: budget 1200, remaining 619.7, requested
+        # 600 on a fast provider (reserve floor 60 + allowance 15 = 75).
+        # Threshold is 240; 0.25 x 619.7 = 154.925 softens the band down to
+        # it, so 154.925 — not 75 — is what was held back.
+        deadline = _fixed_deadline(
+            1200.0, 619.7, observations=(15.0, 15.0, 15.0, 15.0)
+        )
+        agent_id, _sandbox, tool = self._wired(run_store, run_id, deadline)
+        await tool.handler({"command": "./train.sh", "timeout": 600})
+
+        (payload,) = self._events(run_store, agent_id)
+        assert payload["reason"] == "band"
+        assert payload["reserve"] == 75.0  # base: floor + adaptive allowance
+        assert payload["applied_reserve"] == pytest.approx(154.925)
+        assert payload["effective"] == pytest.approx(464.775)
+        # Consistent with the arithmetic the consumer can see.
+        assert payload["remaining"] - payload["effective"] == pytest.approx(
+            payload["applied_reserve"]
+        )
+
+    async def test_applied_reserve_is_the_base_reserve_when_in_band(
+        self, run_store: RunStore, run_id: str
+    ):
+        """Below the wind-down threshold the softener never fires, so the
+        two reserve fields agree — that agreement is what tells round 3 the
+        softener was not involved."""
+        deadline = _fixed_deadline(900.0, 200.0)  # 200 < the 300s threshold
+        agent_id, _sandbox, tool = self._wired(run_store, run_id, deadline)
+        await tool.handler({"command": "make", "timeout": 300})
+
+        (payload,) = self._events(run_store, agent_id)
+        assert payload["reason"] == "reserve"
+        assert payload["reserve"] == 90.0
+        assert payload["applied_reserve"] == 90.0
+
+    @pytest.mark.parametrize(
+        "budget,remaining,requested,reason",
+        [
+            (1800.0, 1706.9, 1800.0, "share"),
+            (900.0, 335.5, 300.0, "band"),
+            (900.0, 200.0, 300.0, "reserve"),
+        ],
+    )
+    async def test_reason_is_recorded_for_each_bound(
+        self,
+        run_store: RunStore,
+        run_id: str,
+        budget: float,
+        remaining: float,
+        requested: float,
+        reason: str,
+    ):
+        deadline = _fixed_deadline(
+            budget, remaining, observations=(5.0, 5.0, 5.0, 5.0)
+        )
+        agent_id, _sandbox, tool = self._wired(run_store, run_id, deadline)
+        await tool.handler({"command": "make", "timeout": requested})
+        assert self._events(run_store, agent_id)[0]["reason"] == reason
+
+    async def test_written_even_when_the_command_then_succeeds(
+        self, run_store: RunStore, run_id: str
+    ):
+        # The cap's cost is what we are measuring, not the command's fate.
+        deadline = _fixed_deadline(900.0, 200.0)
+        agent_id, _sandbox, tool = self._wired(
+            run_store,
+            run_id,
+            deadline,
+            ExecResult(exit_code=0, stdout="done", stderr=""),
+        )
+        await tool.handler({"command": "make", "timeout": 120})
+        assert len(self._events(run_store, agent_id)) == 1
+
+    async def test_nothing_written_when_the_cap_does_not_bite(
+        self, run_store: RunStore, run_id: str
+    ):
+        deadline = _fixed_deadline(10_000.0)
+        agent_id, _sandbox, tool = self._wired(run_store, run_id, deadline)
+        await tool.handler({"command": "echo hi", "timeout": 45})
+        assert self._events(run_store, agent_id) == []
+
+    async def test_no_deadline_emits_nothing(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id, sandbox, tool = self._wired(run_store, run_id, None)
+        await tool.handler({"command": "echo hi", "timeout": 45})
+        assert sandbox.received_timeout == 45
+        assert self._events(run_store, agent_id) == []
+
+    async def test_the_default_toolset_wires_store_and_agent_id(
+        self,
+        memory_store: MemoryStore,
+        skill_library: SkillLibrary,
+        run_store: RunStore,
+        run_id: str,
+    ):
+        """The telemetry is only worth anything if the real registry build
+        carries it — and to the *owning agent's* stream, not the run's."""
+        from harness.orchestrator import CODING_TOOL_FACTORIES, ToolDeps
+
+        agent_id = run_store.create_agent(run_id, "goal")
+        sandbox = FakeExecSandbox()
+        deps = ToolDeps(
+            sandbox=sandbox,
+            memory=memory_store,
+            skills=skill_library,
+            store=run_store,
+            run_id=run_id,
+            agent_id=agent_id,
+            context=_make_context(),
+            deadline=_fixed_deadline(1800.0, 1706.9),
+        )
+        registry = ToolRegistry()
+        for factory in CODING_TOOL_FACTORIES:
+            registry.register(factory(deps))
+        await registry.get("bash").handler(
+            {"command": "R CMD INSTALL rstan", "timeout": 1800}
+        )
+
+        assert sandbox.received_timeout == 900.0
+        (payload,) = self._events(run_store, agent_id)
+        assert payload["reason"] == "share"
+
+    async def test_unwired_store_still_caps(self):
+        # store/agent_id are optional: the cap is the contract, the event
+        # is telemetry on top of it.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(1800.0, 1706.9))
+        await tool.handler({"command": "make", "timeout": 1800})
+        assert sandbox.received_timeout == 900.0
 
 
 class TestReadWriteEditFileTools:
@@ -1131,6 +1373,7 @@ class TestDeclareVerificationTool:
             skills=skill_library,
             store=run_store,
             run_id=run_id,
+            agent_id=run_store.create_agent(run_id, "goal"),
             context=_make_context(),
         )
         registry = ToolRegistry()
@@ -1138,3 +1381,243 @@ class TestDeclareVerificationTool:
             registry.register(factory(deps))
         names = [spec.name for spec in registry.specs()]
         assert "declare_verification" in names
+
+
+# ---------------------------------------------------------------------------
+# declare_verification: verification-quality lint (Change 4) — warn-only
+# ---------------------------------------------------------------------------
+
+
+class TestDeclareVerificationLint:
+    """The tool appends advisories and emits ``verification_lint``.
+
+    Every assertion here also pins the warn-only contract: the declaration
+    is acknowledged, the result is not an error, and nothing is rejected.
+    """
+
+    @staticmethod
+    def _written(*commands: str) -> WrittenData:
+        written = WrittenData()
+        for command in commands:
+            record_written_data(written, "bash", {"command": command})
+        return written
+
+    @staticmethod
+    def _lint_events(run_store: RunStore, agent_id: str) -> list[dict]:
+        return [
+            event.payload
+            for event in run_store.load_events(agent_id)
+            if event.kind == "verification_lint"
+        ]
+
+    async def test_clean_command_is_unchanged_and_emits_no_event(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        written = self._written('echo "DISCRIMINATING_VALUE" > /app/other.txt')
+        tool = declare_verification_tool(
+            written_data=lambda: written,
+            store=run_store,
+            agent_id=agent_id,
+        )
+        result = await tool.handler(
+            {"command": "pytest -q", "description": "tests pass"}
+        )
+        assert "Advisory" not in result
+        assert self._lint_events(run_store, agent_id) == []
+
+    async def test_tautology_advisory_and_event(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        written = self._written(
+            'echo "Qwen/Qwen3-Embedding-8B" > /app/result.txt'
+        )
+        tool = declare_verification_tool(
+            written_data=lambda: written,
+            store=run_store,
+            agent_id=agent_id,
+        )
+        command = "grep -q '^Qwen/Qwen3-Embedding-8B$' /app/result.txt"
+        result = await tool.handler(
+            {"command": command, "description": "the answer is right"}
+        )
+        # Warn-only: the declaration still stands, in full.
+        assert "verification declared" in result
+        assert command in result
+        assert "Advisory" in result
+
+        (payload,) = self._lint_events(run_store, agent_id)
+        assert payload["command"] == command
+        assert payload["action"] == "warn"
+        assert [f["kind"] for f in payload["findings"]] == ["tautology"]
+
+    async def test_neutralized_exit_is_warned_not_rejected(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        tool = declare_verification_tool(
+            store=run_store, agent_id=agent_id
+        )
+        registry = ToolRegistry()
+        registry.register(tool)
+        result = await registry.dispatch(
+            _call(
+                "declare_verification",
+                {"command": "pytest -q || true", "description": "tests pass"},
+            )
+        )
+        assert result.is_error is False
+        assert "verification declared" in result.content
+        (payload,) = self._lint_events(run_store, agent_id)
+        assert payload["findings"][0]["kind"] == "neutralized_exit"
+        assert payload["findings"][0]["details"]["terminal"] is True
+
+    async def test_non_terminal_neutralizer_is_also_recorded(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        tool = declare_verification_tool(store=run_store, agent_id=agent_id)
+        result = await tool.handler(
+            {
+                "command": "pkill -f server || true; pytest -q",
+                "description": "tests pass with the server down",
+            }
+        )
+        assert "verification declared" in result
+        (payload,) = self._lint_events(run_store, agent_id)
+        details = payload["findings"][0]["details"]
+        assert details["terminal"] is False
+        assert details["token_index"] == 3
+
+    async def test_redeclaration_is_linted_independently(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        tool = declare_verification_tool(store=run_store, agent_id=agent_id)
+        await tool.handler(
+            {"command": "pytest -q || true", "description": "first"}
+        )
+        await tool.handler({"command": "pytest -q", "description": "second"})
+        await tool.handler(
+            {"command": "make check; exit 0", "description": "third"}
+        )
+        payloads = self._lint_events(run_store, agent_id)
+        # The clean redeclaration emits nothing; the other two each emit.
+        assert [payload["command"] for payload in payloads] == [
+            "pytest -q || true",
+            "make check; exit 0",
+        ]
+
+    async def test_lint_is_silent_without_an_accessor(
+        self, run_store: RunStore, run_id: str
+    ):
+        # The tautology detector needs written_data; without it the tool
+        # behaves exactly as it did before Change 4.
+        agent_id = run_store.create_agent(run_id, "goal")
+        tool = declare_verification_tool(store=run_store, agent_id=agent_id)
+        result = await tool.handler(
+            {
+                "command": "grep -q '^Qwen/Qwen3-Embedding-8B$' /app/r.txt",
+                "description": "the answer is right",
+            }
+        )
+        assert "Advisory" not in result
+        assert self._lint_events(run_store, agent_id) == []
+
+    async def test_advisory_without_a_store_still_reaches_the_model(self):
+        written = self._written(
+            'echo "Qwen/Qwen3-Embedding-8B" > /app/result.txt'
+        )
+        tool = declare_verification_tool(written_data=lambda: written)
+        result = await tool.handler(
+            {
+                "command": "grep -q '^Qwen/Qwen3-Embedding-8B$' /app/result.txt",
+                "description": "the answer is right",
+            }
+        )
+        assert "Advisory" in result
+
+    async def test_accessor_returning_none_is_tolerated(self):
+        tool = declare_verification_tool(written_data=lambda: None)
+        result = await tool.handler(
+            {"command": "pytest -q", "description": "tests pass"}
+        )
+        assert "verification declared" in result
+
+    def test_default_toolset_threads_the_accessor(
+        self,
+        sandbox: LocalSandbox,
+        memory_store: MemoryStore,
+        skill_library: SkillLibrary,
+        run_store: RunStore,
+        run_id: str,
+    ):
+        """Change 4 wiring: ToolDeps carries the written-data accessor."""
+        from harness.orchestrator import CODING_TOOL_FACTORIES, ToolDeps
+
+        written = WrittenData()
+        deps = ToolDeps(
+            sandbox=sandbox,
+            memory=memory_store,
+            skills=skill_library,
+            store=run_store,
+            run_id=run_id,
+            agent_id=run_store.create_agent(run_id, "goal"),
+            context=_make_context(),
+            written_data=lambda: written,
+        )
+        registry = ToolRegistry()
+        for factory in CODING_TOOL_FACTORIES:
+            registry.register(factory(deps))
+        assert "declare_verification" in [
+            spec.name for spec in registry.specs()
+        ]
+
+    async def test_default_toolset_lints_against_the_live_map(
+        self,
+        sandbox: LocalSandbox,
+        memory_store: MemoryStore,
+        skill_library: SkillLibrary,
+        run_store: RunStore,
+        run_id: str,
+    ):
+        """The accessor is read at call time, so writes recorded after the
+        registry was built are still linted against."""
+        from harness.orchestrator import CODING_TOOL_FACTORIES, ToolDeps
+
+        written = WrittenData()
+        agent_id = run_store.create_agent(run_id, "goal")
+        deps = ToolDeps(
+            sandbox=sandbox,
+            memory=memory_store,
+            skills=skill_library,
+            store=run_store,
+            run_id=run_id,
+            agent_id=agent_id,
+            context=_make_context(),
+            written_data=lambda: written,
+        )
+        registry = ToolRegistry()
+        for factory in CODING_TOOL_FACTORIES:
+            registry.register(factory(deps))
+        # Recorded *after* the registry exists.
+        record_written_data(
+            written,
+            "bash",
+            {"command": 'echo "Qwen/Qwen3-Embedding-8B" > /app/result.txt'},
+        )
+        result = await registry.dispatch(
+            _call(
+                "declare_verification",
+                {
+                    "command": (
+                        "grep -q '^Qwen/Qwen3-Embedding-8B$' /app/result.txt"
+                    ),
+                    "description": "the answer is right",
+                },
+            )
+        )
+        assert result.is_error is False
+        assert "Advisory" in result.content
+        assert self._lint_events(run_store, agent_id)

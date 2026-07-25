@@ -502,6 +502,156 @@ class TestBudgets:
         assert len(h.adapter.calls) == 1
 
 
+class TestDeadlineDerivedMaxTurns:
+    """A turn count must not end a run that still has wall clock to spend.
+
+    Observed: a trial hit its 80-turn ceiling at 1150s of a 1800s budget and
+    paused with 36% of its time unused. When a deadline exists and the caller
+    did not choose the ceiling, the clock is the rail (:data:`MIN_SECONDS_PER
+    _TURN`); the turn count only survives as a floor.
+    """
+
+    @staticmethod
+    def _busy_script(count: int) -> list[ModelResponse]:
+        """``count`` turns that each do work, so nothing else stops the run."""
+        return [
+            resp("working", [call(f"c{i}", "echo", text="x")])
+            for i in range(count)
+        ]
+
+    @staticmethod
+    def _stepping_clock(step: float) -> "Callable[[], float]":
+        """A clock that advances ``step`` seconds on every read."""
+        now = 0.0
+
+        def clock() -> float:
+            nonlocal now
+            now += step
+            return now
+
+        return clock
+
+    async def test_deadline_lifts_a_low_turn_ceiling(
+        self, tmp_path: Path
+    ) -> None:
+        """max_turns=3 against a 3600s deadline: the derived rail is
+        ceil(3600/5)=720, so the run works past turn 3 and ends on the clock
+        instead."""
+        clock = self._stepping_clock(300.0)
+        deadline = Deadline(3600.0, clock)
+        h = make_harness(
+            tmp_path,
+            self._busy_script(10),
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=3),
+            clock=clock,
+            deadline=deadline,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns > 3
+        # Ended because the wall clock ran out, not because of a turn count.
+        assert len(h.events("wall_clock_stop")) == 1
+
+    async def test_without_a_deadline_the_turn_ceiling_binds(
+        self, tmp_path: Path
+    ) -> None:
+        """The default for every non-deadline caller is unchanged."""
+        h = make_harness(
+            tmp_path,
+            self._busy_script(10),
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=3),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 3
+        assert h.events("wall_clock_stop") == []
+
+    async def test_an_explicit_ceiling_is_never_lifted(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller who chose the ceiling gets exactly it, deadline or not."""
+        clock = self._stepping_clock(300.0)
+        deadline = Deadline(3600.0, clock)
+        h = make_harness(
+            tmp_path,
+            self._busy_script(10),
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=3, max_turns_is_hard=True),
+            clock=clock,
+            deadline=deadline,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 3
+        assert h.events("wall_clock_stop") == []
+
+    async def test_the_derived_rail_is_a_floor_not_a_ceiling(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller's *larger* turn budget survives the derivation: a 60s
+        deadline derives 12 turns, but max_turns=13 still buys 13."""
+        h = make_harness(
+            tmp_path,
+            self._busy_script(20),
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=13),
+            clock=lambda: 0.0,
+            deadline=Deadline(60.0, lambda: 0.0),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 13
+        assert h.events("wall_clock_stop") == []
+
+    async def test_a_budgetless_deadline_derives_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """``Deadline(None)`` is the no-deadline object: it must not silently
+        become an unbounded turn budget."""
+        h = make_harness(
+            tmp_path,
+            self._busy_script(10),
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=3),
+            deadline=Deadline(None),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 3
+
+    async def test_the_token_ceiling_still_binds_independently(
+        self, tmp_path: Path
+    ) -> None:
+        """Lifting the turn rail must not lift the token rail with it."""
+        script = [
+            resp(
+                "working",
+                [call("c1", "echo", text="x")],
+                usage=Usage(input_tokens=80, output_tokens=30),
+            ),
+            resp(CLEAN_FINISH),  # never reached
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("echo")],
+            budgets=Budgets(max_turns=3, max_tokens=100),
+            clock=lambda: 0.0,
+            deadline=Deadline(3600.0, lambda: 0.0),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        assert result.turns == 1
+
+
 # ---------------------------------------------------------------------------
 # Diligence nudges
 # ---------------------------------------------------------------------------
@@ -636,6 +786,7 @@ class TestEventLog:
             "output_tokens": 7,
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
         }
         assert result.usage == Usage(input_tokens=18, output_tokens=7)
 
@@ -1340,10 +1491,12 @@ class TestLandingReserveLeavesATurn:
 
         # The cap: reserve = 60 floor + 15 allowance (a fake clock makes the
         # scripted model calls cost 0s, so the allowance clamps to its
-        # minimum) -> 336 - 75 = 261s, not the old 336 - 60 = 276s.
-        assert sandbox.received_timeout == pytest.approx(261.0)
+        # minimum) = 75s, and Change 1's band softener holds back a further
+        # 0.25 x 336 = 84s because the exec starts above the 300s wind-down
+        # threshold -> 336 - 84 = 252s, not the old 336 - 60 = 276s.
+        assert sandbox.received_timeout == pytest.approx(252.0)
         # ...which is the whole point: the exec returns above the floor.
-        assert deadline.remaining() == pytest.approx(75.0)
+        assert deadline.remaining() == pytest.approx(84.0)
         assert deadline.remaining() > WALL_CLOCK_STOP_FLOOR
         # So the run gets its landing turn instead of a wall_clock_stop.
         assert h.events("wall_clock_stop") == []
@@ -1404,6 +1557,223 @@ class TestLandingReserveLeavesATurn:
         assert result.status == "completed"
         assert sandbox.received_timeout == 300.0  # pure passthrough
         assert h.events("wall_clock_stop") == []
+
+
+class _RecordingBurnSandbox(_BurnsItsWindowSandbox):
+    """:class:`_BurnsItsWindowSandbox` that logs what it was handed and
+    what the run had left when it was handed it — the two numbers the exec
+    cap is judged on."""
+
+    def __init__(self, clock: _MovableClock, deadline: Deadline) -> None:
+        super().__init__(clock)
+        self._deadline = deadline
+        #: ``(remaining_before, timeout)`` for every exec, in order.
+        self.log: list[tuple[float, float]] = []
+
+    async def exec(  # type: ignore[no-untyped-def]
+        self, command: str, timeout: float = 120
+    ):
+        remaining = self._deadline.remaining()
+        assert remaining is not None
+        self.log.append((remaining, timeout))
+        return await super().exec(command, timeout)
+
+
+class TestExecCapEndsTheBandSkip:
+    """Change 1 at the loop level, on the four trials that proved the bug.
+
+    All four emitted ``wall_clock_stop`` with **no ``wind_down`` event
+    ever**: a single exec carried the run from above the wind-down
+    threshold to below the hard-stop floor, so step 1b was never reached.
+    The cap now guarantees the agent regains control inside the band.
+
+    The model is scripted to keep asking for the same long command until
+    the clock is gone — the pathological shape, not a cooperative one.
+    """
+
+    #: ``(id, budget, remaining_at_first_exec, requested)`` — see plan §0.2.
+    SHAPES = [
+        ("mcmc-sampling-stan", 1800.0, 1706.9, 1800.0),
+        ("caffe-cifar-10", 1200.0, 619.7, 600.0),
+        ("extract-moves-from-video", 1800.0, 926.0, 600.0),
+        ("write-compressor", 900.0, 335.5, 300.0),
+    ]
+
+    def _run_shape(
+        self, tmp_path: Path, budget: float, remaining: float, requested: float
+    ):
+        clock = _MovableClock()
+        deadline = Deadline(budget, clock)
+        clock.now = budget - remaining
+        sandbox = _RecordingBurnSandbox(clock, deadline)
+        script = [
+            resp(
+                "still working",
+                [call(f"c{i}", "bash", command="./long", timeout=requested)],
+            )
+            for i in range(40)
+        ] + [resp(CLEAN_FINISH)]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox, deadline=deadline)],  # type: ignore[arg-type]
+            clock=clock,
+            deadline=deadline,
+            budgets=Budgets(max_turns=100),
+        )
+        return h, sandbox, deadline
+
+    @pytest.mark.parametrize(
+        "budget,remaining,requested",
+        [shape[1:] for shape in SHAPES],
+        ids=[shape[0] for shape in SHAPES],
+    )
+    async def test_wind_down_always_precedes_the_hard_stop(
+        self, tmp_path: Path, budget: float, remaining: float, requested: float
+    ) -> None:
+        h, sandbox, _deadline = self._run_shape(
+            tmp_path, budget, remaining, requested
+        )
+        await h.loop.run(GOAL)
+
+        kinds = h.event_kinds()
+        assert "wall_clock_stop" in kinds  # the shape does exhaust the clock
+        assert "wind_down" in kinds
+        assert kinds.index("wind_down") < kinds.index("wall_clock_stop")
+
+    @pytest.mark.parametrize(
+        "budget,remaining,requested",
+        [shape[1:] for shape in SHAPES],
+        ids=[shape[0] for shape in SHAPES],
+    )
+    async def test_a_model_turn_follows_every_capped_exec(
+        self, tmp_path: Path, budget: float, remaining: float, requested: float
+    ) -> None:
+        h, sandbox, _deadline = self._run_shape(
+            tmp_path, budget, remaining, requested
+        )
+        await h.loop.run(GOAL)
+
+        # The bug was one exec owning the rest of the run. Now the agent
+        # comes back and gets at least one further turn — which is what the
+        # four failing trials never got.
+        assert len(sandbox.log) >= 2
+        assert len(h.events("model_turn")) >= 2
+        # Every exec but the last leaves more than the stop floor behind
+        # it, which is what makes the next turn startable. (The last one
+        # runs out the clock by construction — that is the hard stop.)
+        for before, timeout in sandbox.log[:-1]:
+            assert before - timeout > WALL_CLOCK_STOP_FLOOR
+
+    async def test_mcmc_regains_control_mid_install(self, tmp_path: Path) -> None:
+        # The headline number: the runaway `while pgrep ...; do sleep 20;
+        # done` owned 1647s of 1800s and the agent never came back. Capped
+        # at half the budget, it comes back at ~807s remaining — with the
+        # install still running and most of the run left to use.
+        h, sandbox, _deadline = self._run_shape(tmp_path, 1800.0, 1706.9, 1800.0)
+        await h.loop.run(GOAL)
+
+        first_remaining, first_timeout = sandbox.log[0]
+        assert first_timeout == 900.0  # 0.5 x budget, the share cap
+        assert first_remaining - first_timeout == pytest.approx(806.9)
+        assert h.events("exec_capped") == []  # tool not wired to a store here
+
+    async def test_the_cap_reason_reaches_the_model(self, tmp_path: Path) -> None:
+        # The agent has to be able to tell "your command was too long" from
+        # "the run is nearly over" to respond correctly to either.
+        h, sandbox, _deadline = self._run_shape(tmp_path, 1800.0, 1706.9, 1800.0)
+        await h.loop.run(GOAL)
+
+        results = [
+            payload
+            for payload in h.events("tool_result")
+            if "half the run's total budget" in (payload.get("content") or "")
+        ]
+        assert results
+
+
+class TestVerificationIsExemptFromTheExecCap:
+    """X7: the completion gate must not be shortened into a non-gate.
+
+    ``_run_verification`` runs at completion by definition. If the band
+    softener or the share cap applied, a legitimate check would be cut into
+    ``timed_out`` + ``timeout_capped``, which this loop reads as
+    *inconclusive* and accepts — turning a passing gate into no gate at all.
+    """
+
+    async def test_a_250s_check_still_gets_its_full_window(
+        self, tmp_path: Path
+    ) -> None:
+        from harness.diligence import VERIFICATION_TIMEOUT_SECONDS
+        from harness.sandbox.base import ExecResult
+        from harness.tools.builtin import declare_verification_tool
+
+        # The reviewer's exact case: budget 900, remaining 400. Exploratory
+        # arithmetic would hold back the band softener's share; verification
+        # holds back only the landing reserve, so the 300s gate is untouched
+        # and the 250s check inside it completes.
+        clock = _MovableClock()
+        deadline = Deadline(900.0, clock)
+        clock.now = 500.0  # remaining 400
+        script = [
+            resp("declaring", [declare("v1", "pytest -q tests/acceptance.py")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[declare_verification_tool()],
+            clock=clock,
+            deadline=deadline,
+        )
+        fake = ScriptedTimeoutSandbox(
+            ExecResult(exit_code=0, stdout="250 passed", stderr="")
+        )
+        h.loop.sandbox = fake  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        assert fake.received_timeout is not None
+        assert fake.received_timeout >= 300.0
+        assert fake.received_timeout == VERIFICATION_TIMEOUT_SECONDS
+        assert fake.received_timeout > 250.0  # the check fits
+        assert result.status == "completed"
+        (passed,) = h.events("verification_passed")
+        assert "timeout_capped" not in passed
+        assert h.events("verification_failed") == []
+
+    async def test_the_same_shape_would_be_cut_for_an_exploratory_exec(
+        self, tmp_path: Path
+    ) -> None:
+        # The contrast that makes the exemption load-bearing rather than
+        # cosmetic: identical budget and remaining, ordinary bash tool.
+        clock = _MovableClock()
+        deadline = Deadline(900.0, clock)
+        clock.now = 500.0  # remaining 400
+        assert deadline.exec_cap(300.0) == (300.0, False, None)
+        # ...and twenty seconds more of elapsed time is enough to split them.
+        clock.now = 520.0  # remaining 380
+        assert deadline.exec_cap(300.0) == (285.0, True, "band")
+        assert deadline.exec_cap(300.0, purpose="verification") == (
+            290.0,
+            True,
+            "reserve",
+        )
+
+    async def test_no_share_cap_on_a_long_verification(
+        self, tmp_path: Path
+    ) -> None:
+        # VERIFICATION_TIMEOUT_SECONDS is well under 0.5 x any real budget,
+        # so the share cap would not bite today — but the exemption is
+        # explicit rather than accidental, and this pins it.
+        deadline = Deadline(400.0, clock=lambda: 0.0)  # share cap = 200s
+        for _ in range(4):
+            deadline.observe_model_call(5.0)  # reserve 75
+        assert deadline.exec_cap(300.0) == (200.0, True, "share")
+        assert deadline.exec_cap(300.0, purpose="verification") == (
+            300.0,
+            False,
+            None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +2184,205 @@ class TestTruncationDeadlineSkip:
         assert result.status == "completed"
         assert h.events("truncation_continue_skipped") == []
 
+    async def test_the_guard_is_priced_on_the_median_not_the_last_call(
+        self, tmp_path: Path
+    ) -> None:
+        """make-doom-for-mips' numbers exactly. One 225.5s call — the turn
+        that ran to the output cap, so by construction the expensive one —
+        priced the whole decision under the old rule and paused the run with
+        267.6s (30% of the budget) still on the clock. The window's median is
+        9.0s, so two more calls plainly fit."""
+        clock = scripted_clock([0.0, 0.0, 408.0, 633.0, 633.0])
+        deadline = Deadline(900.0, clock)
+        # Three earlier 9.0s calls, as an ordinary run would have recorded.
+        for _ in range(3):
+            deadline.observe_model_call(9.0)
+        script = [
+            resp(content="(truncated)", stop_reason=StopReason.MAX_TOKENS),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, clock=clock, deadline=deadline)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.events("truncation_continue_skipped") == []
+        assert len(h.events("truncation_continue")) == 1
+        assert len(h.adapter.calls) == 2
+
+    async def test_the_skip_still_fires_inside_the_stop_floor(
+        self, tmp_path: Path
+    ) -> None:
+        """Cheap calls do not buy a re-prompt below the hard-stop floor: the
+        loop refuses to start a call there anyway, so the answer the
+        re-prompt provokes could never be acted on."""
+        clock = scripted_clock([0.0, 0.0, 800.0, 801.0, 870.0])
+        deadline = Deadline(900.0, clock)
+        for _ in range(3):
+            deadline.observe_model_call(1.0)
+        script = [
+            resp(content="(truncated)", stop_reason=StopReason.MAX_TOKENS),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(tmp_path, script, clock=clock, deadline=deadline)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "paused_budget"
+        (event,) = h.events("truncation_continue_skipped")
+        assert event["remaining_seconds"] == pytest.approx(30.0)
+        assert event["remaining_seconds"] < WALL_CLOCK_STOP_FLOOR
+        assert event["typical_call_seconds"] == pytest.approx(1.0)
+        assert h.events("truncation_continue") == []
+        assert len(h.adapter.calls) == 1
+
+
+class TestLengthBoundTruncation:
+    """A tool call dropped on a turn that also ran to the output-token cap is
+    a *length* failure, not a corrupted one. The observed drop carried 26 KB
+    of C source: telling that model "your call was cut off, re-issue it"
+    invites the same oversized call again, and lowering the per-call cap
+    makes the truncation more likely — so the wording is the only lever, and
+    the retry it provokes is attributed to the model rather than the
+    provider."""
+
+    @staticmethod
+    def _at_cap(cap: int = 8192) -> ModelResponse:
+        """A turn whose only tool call was dropped at the output-token cap."""
+        return resp(
+            content="(1 tool call was dropped)",
+            usage=Usage(output_tokens=cap),
+            stop_reason=StopReason.MAX_TOKENS,
+            dropped=[drop()],
+        )
+
+    async def test_drop_at_the_output_cap_asks_for_smaller_pieces(
+        self, tmp_path: Path
+    ) -> None:
+        from harness.loop import TRUNCATION_REMINDERS
+
+        h = make_harness(
+            tmp_path,
+            [self._at_cap(), resp(CLEAN_FINISH)],
+            budgets=Budgets(max_output_tokens=8192),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        reminder = h.adapter.calls[1].messages[-1]
+        assert reminder.role is Role.USER
+        assert reminder.content == TRUNCATION_REMINDERS["max_tokens"]
+        assert "smaller pieces" in (reminder.content or "")
+        (event,) = h.events("truncation_continue")
+        assert event["length_bound"] is True
+        assert event["incomplete_reason"] == "dropped_calls"
+
+    async def test_the_per_call_cap_is_left_alone(self, tmp_path: Path) -> None:
+        """The retry must not be squeezed: the dropped call was 26 KB of
+        arguments, so a smaller cap makes the next attempt truncate sooner.
+        The instruction is the lever, not the cap."""
+        h = make_harness(
+            tmp_path,
+            [self._at_cap(), resp(CLEAN_FINISH)],
+            budgets=Budgets(max_output_tokens=8192),
+        )
+        await h.loop.run(GOAL)
+
+        assert [c.params["max_tokens"] for c in h.adapter.calls] == [8192, 8192]
+
+    async def test_a_drop_below_the_cap_keeps_the_dropped_call_wording(
+        self, tmp_path: Path
+    ) -> None:
+        """Only the coincidence with the output cap means "too long". A drop
+        on a short turn is a corrupted call, and must still be diagnosed as
+        one."""
+        from harness.loop import TRUNCATION_REMINDERS
+
+        short = resp(
+            content="(1 tool call was dropped)",
+            usage=Usage(output_tokens=100),
+            dropped=[drop()],
+        )
+        h = make_harness(
+            tmp_path,
+            [short, resp(CLEAN_FINISH)],
+            budgets=Budgets(max_output_tokens=8192),
+        )
+        await h.loop.run(GOAL)
+
+        reminder = h.adapter.calls[1].messages[-1]
+        assert reminder.content == TRUNCATION_REMINDERS["dropped_calls"]
+        (event,) = h.events("truncation_continue")
+        assert event["length_bound"] is False
+
+    async def test_no_cap_configured_keeps_the_dropped_call_wording(
+        self, tmp_path: Path
+    ) -> None:
+        """With no per-call cap there is no cap to have hit, so nothing can
+        be attributed to length."""
+        from harness.loop import TRUNCATION_REMINDERS
+
+        h = make_harness(tmp_path, [self._at_cap(), resp(CLEAN_FINISH)])
+        await h.loop.run(GOAL)
+
+        reminder = h.adapter.calls[1].messages[-1]
+        assert reminder.content == TRUNCATION_REMINDERS["dropped_calls"]
+        (event,) = h.events("truncation_continue")
+        assert event["length_bound"] is False
+
+    async def test_a_constrained_retry_that_drops_again_is_not_a_fault(
+        self, tmp_path: Path
+    ) -> None:
+        """The misattribution this guards against: a model that cannot
+        shorten its writes would otherwise exhaust the continue budget on
+        drops and be reported as a broken provider — the exact fault the
+        round-1 taxonomy exists to keep *honest*."""
+        from harness.loop import MAX_TRUNCATION_CONTINUES
+
+        h = make_harness(
+            tmp_path,
+            [self._at_cap() for _ in range(MAX_TRUNCATION_CONTINUES + 1)],
+            budgets=Budgets(max_output_tokens=8192),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert result.error_kind != "malformed_response"
+        assert result.error_kind is None
+        assert h.events("run_error") == []
+        # The first drop is still provider evidence; the ones the loop had
+        # already warned about are counted apart from it.
+        counts = [
+            e["constrained_retries"]
+            for e in h.events("truncation_continue")
+        ]
+        assert counts == [0, 1, 2]
+
+    async def test_all_unprompted_drops_still_end_as_malformed_response(
+        self, tmp_path: Path
+    ) -> None:
+        """The round-1 exhaustion path is untouched when every continue was
+        an unprompted provider drop — here with a per-call cap configured and
+        every dropping turn comfortably under it."""
+        from harness.loop import MAX_TRUNCATION_CONTINUES
+
+        short = resp(
+            content="(1 tool call was dropped)",
+            usage=Usage(output_tokens=100),
+            dropped=[drop()],
+        )
+        h = make_harness(
+            tmp_path,
+            [short] * (MAX_TRUNCATION_CONTINUES + 1),
+            budgets=Budgets(max_output_tokens=8192),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "error"
+        assert result.error_kind == "malformed_response"
+        assert all(
+            e["constrained_retries"] == 0
+            for e in h.events("truncation_continue")
+        )
+
 
 class TestIncompleteTurnEndToEnd:
     async def test_reasoning_only_turn_replays_with_its_placeholder(
@@ -2008,6 +2577,7 @@ class TestTurnProvenance:
                 "provider_stop_reason": "tool_calls",
                 "stop_reason": "tool_use",
                 "output_tokens": 3,
+                "reasoning_tokens": 0,
                 "duration_ms": 500,
                 "tool_call_count": 1,
                 "content_chars": len("working"),
@@ -2017,6 +2587,7 @@ class TestTurnProvenance:
                 "provider_stop_reason": "stop",
                 "stop_reason": "end_turn",
                 "output_tokens": 4,
+                "reasoning_tokens": 0,
                 "duration_ms": 250,
                 "tool_call_count": 0,
                 "content_chars": len(CLEAN_FINISH),
@@ -2028,6 +2599,26 @@ class TestTurnProvenance:
             500,
             250,
         ]
+
+    async def test_model_turn_event_carries_reasoning_tokens(
+        self, tmp_path: Path
+    ) -> None:
+        """Reasoning-token telemetry (openai_compat only): the model_turn
+        event carries reasoning_tokens alongside output_tokens, straight
+        from the scripted response's usage."""
+        script = [
+            resp(
+                CLEAN_FINISH,
+                usage=Usage(output_tokens=100, reasoning_tokens=42),
+                provider_stop_reason="stop",
+            ),
+        ]
+        h = make_harness(tmp_path, script)
+        await h.loop.run(GOAL)
+
+        (turn,) = h.events("model_turn")
+        assert turn["output_tokens"] == 100
+        assert turn["reasoning_tokens"] == 42
 
     async def test_unmapped_and_missing_stop_reasons_stay_distinguishable(
         self, tmp_path: Path
@@ -2864,3 +3455,195 @@ class TestVerificationResume:
                 assert [
                     e for e in events if e.kind == "verification_failed"
                 ] == []
+
+
+# ---------------------------------------------------------------------------
+# Verification-quality lint (Change 4) — warn-only, no control-flow change
+# ---------------------------------------------------------------------------
+
+
+def lint_harness(
+    tmp_path: Path, script: list[ModelResponse]
+) -> "Harness":
+    """A verification harness whose declare_verification tool lints against
+    the loop's own live written-data map.
+
+    The tool is registered *after* :func:`make_harness` because the
+    accessor has to close over the loop that maintains the map — exactly
+    the ordering the orchestrator faces (registry first, loop second).
+    """
+    from harness.tools.builtin import declare_verification_tool, write_file_tool
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(exist_ok=True)
+    sandbox = LocalSandbox(workspace)
+    h = make_harness(
+        tmp_path,
+        script,
+        tools=[bash_tool(sandbox), write_file_tool(sandbox)],
+        sandbox=sandbox,
+    )
+    h.loop.registry.register(
+        declare_verification_tool(
+            written_data=lambda: h.loop.written_data,
+            store=h.store,
+            agent_id=h.agent_id,
+        )
+    )
+    return h
+
+
+class TestVerificationLint:
+    """The mteb-leaderboard shape, replayed offline through FakeAdapter."""
+
+    MTEB_WRITE = 'echo "Qwen/Qwen3-Embedding-8B" > result.txt'
+    MTEB_CHECK = "grep -q '^Qwen/Qwen3-Embedding-8B$' result.txt"
+
+    async def test_mteb_replay_warns_but_still_completes(
+        self, tmp_path: Path
+    ) -> None:
+        """The circular check is flagged everywhere it should be — and the
+        run finishes exactly as it did before, because the lint warns."""
+        script = [
+            resp("writing the answer", [call("b1", "bash", command=self.MTEB_WRITE)]),
+            resp("declaring", [declare("v1", self.MTEB_CHECK)]),
+            resp(CLEAN_FINISH),
+        ]
+        h = lint_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        # 1. No control-flow change: same completion, same turn count as an
+        #    unflagged run, no nudge, no failure.
+        assert result.status == "completed"
+        assert result.final_text == CLEAN_FINISH
+        assert result.turns == 3
+        assert h.events("nudge") == []
+        assert h.events("verification_failed") == []
+
+        # 2. The tool warned the model on the turn it declared.
+        (lint,) = h.events("verification_lint")
+        assert lint["command"] == self.MTEB_CHECK
+        assert lint["action"] == "warn"
+        assert [f["kind"] for f in lint["findings"]] == ["tautology"]
+
+        # 3. The gate recorded the pass *and* that it was flagged weak.
+        (passed,) = h.events("verification_passed")
+        assert passed["exit_code"] == 0
+        assert [f["kind"] for f in passed["lint_findings"]] == ["tautology"]
+        assert passed["lint_findings"][0]["details"]["path"] == "result.txt"
+
+    async def test_honest_check_is_never_flagged(self, tmp_path: Path) -> None:
+        """The X9 acceptance case end to end: the agent writes a program
+        that prints PASS, runs it into test.log, and greps that — no
+        finding anywhere, and no lint_findings key on the pass."""
+        script = [
+            resp(
+                "writing the solver",
+                [
+                    call(
+                        "w1",
+                        "write_file",
+                        path="solve.py",
+                        content='print("ALL_CHECKS_PASSED")\n',
+                    )
+                ],
+            ),
+            resp(
+                "running it",
+                [
+                    call(
+                        "b1",
+                        "bash",
+                        command="python3 solve.py > test.log",
+                    )
+                ],
+            ),
+            resp(
+                "declaring",
+                [declare("v1", 'grep -q "ALL_CHECKS_PASSED" test.log')],
+            ),
+            resp(CLEAN_FINISH),
+        ]
+        h = lint_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.events("verification_lint") == []
+        (passed,) = h.events("verification_passed")
+        assert passed["exit_code"] == 0
+        assert "lint_findings" not in passed
+
+    async def test_written_data_ignores_failed_tool_calls(
+        self, tmp_path: Path
+    ) -> None:
+        """A denied write taught the lint nothing, so the same declaration
+        is not flagged."""
+        script = [
+            resp(
+                "writing the answer",
+                [call("b1", "bash", command=self.MTEB_WRITE)],
+            ),
+            resp("declaring", [declare("v1", self.MTEB_CHECK)]),
+            resp(CLEAN_FINISH),
+        ]
+        h = lint_harness(tmp_path, script)
+        # Deny bash so its result is an error result: nothing was written.
+        h.loop.policy = Policy(mode=PermissionMode.AUTO, deny=("bash",))
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.events("verification_lint") == []
+        assert len(h.loop.written_data) == 0
+
+    async def test_neutralized_exit_does_not_reject_the_declaration(
+        self, tmp_path: Path
+    ) -> None:
+        """`|| true` is warned about and then honored — the declaration is
+        recorded, executed, and the run completes."""
+        script = [
+            resp("declaring", [declare("v1", "echo verified-ok || true")]),
+            resp(CLEAN_FINISH),
+        ]
+        h = lint_harness(tmp_path, script)
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        (declared,) = h.events("verification_declared")
+        assert declared["command"] == "echo verified-ok || true"
+        (lint,) = h.events("verification_lint")
+        assert [f["kind"] for f in lint["findings"]] == ["neutralized_exit"]
+        (passed,) = h.events("verification_passed")
+        assert passed["exit_code"] == 0
+        assert passed["lint_findings"][0]["kind"] == "neutralized_exit"
+
+    async def test_loop_lints_even_without_a_wired_tool_accessor(
+        self, tmp_path: Path
+    ) -> None:
+        """The gate reads the loop's own map, so a registry built without
+        the accessor still produces the round-3 corpus (minus the
+        model-facing advisory)."""
+        from harness.tools.builtin import declare_verification_tool
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir(exist_ok=True)
+        sandbox = LocalSandbox(workspace)
+        script = [
+            resp(
+                "writing the answer",
+                [call("b1", "bash", command=self.MTEB_WRITE)],
+            ),
+            resp("declaring", [declare("v1", self.MTEB_CHECK)]),
+            resp(CLEAN_FINISH),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox), declare_verification_tool()],
+            sandbox=sandbox,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert h.events("verification_lint") == []  # no store wired in
+        (passed,) = h.events("verification_passed")
+        assert [f["kind"] for f in passed["lint_findings"]] == ["tautology"]

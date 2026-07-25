@@ -40,10 +40,17 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from harness.deadline import EXEC_CAP_FLOOR_SECONDS, Deadline
-from harness.diligence import VERIFICATION_TOOL_NAME
+from harness.deadline import Deadline
+from harness.diligence import (
+    VERIFICATION_LINT_EVENT,
+    VERIFICATION_TOOL_NAME,
+    WrittenData,
+    format_lint_advisory,
+    lint_verification,
+)
 from harness.memory.store import FactType, MemoryStore
 from harness.permissions import ToolMeta
 from harness.persistence import RunStore, TaskLedgerItem
@@ -107,7 +114,33 @@ def _require_str(tool_name: str, arguments: dict, key: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def bash_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
+#: What to tell the model when its exec timeout was cut, keyed by the
+#: ``exec_cap`` reason. The reason changes the *correct response*: a share
+#: cap early in a run means "break this work up", while a landing cap near
+#: the deadline means "stop starting long work and write your answer down".
+#: One generic note would teach the wrong lesson in one of the two cases.
+_CAP_ADVICE: dict[str, str] = {
+    "share": (
+        "no single command may use more than half the run's total budget; "
+        "break the work into smaller steps rather than re-running this"
+    ),
+    "band": (
+        "time is held back so you get a turn to wind down and land your "
+        "answer before the deadline; do not start another long command"
+    ),
+    "reserve": (
+        "time is held back so you get a turn to land your answer before "
+        "the deadline; do not start another long command"
+    ),
+}
+
+
+def bash_tool(
+    sandbox: Sandbox,
+    deadline: Deadline | None = None,
+    store: RunStore | None = None,
+    agent_id: str | None = None,
+) -> Tool:
     """Build the ``bash`` tool: runs a shell command in ``sandbox``.
 
     Result is exit code + stdout + stderr formatted as plain text -- no
@@ -118,17 +151,30 @@ def bash_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
     for that on every single `bash` call (the highest-volume tool) adds up.
 
     ``deadline`` (wind-down plan §Fix 3a), when given, caps the requested
-    ``timeout`` by what wall-clock is actually left: a command allowed to
-    run past the run's own external kill would never get its result back to
-    the model at all. The requested timeout is honored as long as
-    ``remaining - deadline.landing_reserve()`` covers it; otherwise it is
-    shortened to that (never below ``EXEC_CAP_FLOOR_SECONDS``, so even a
-    nearly-spent budget still gets a usable exec window rather than a
-    spuriously-failing one). The reserve is the wall-clock stop floor *plus*
-    a landing allowance, so a capped exec returns with enough time left for
-    the agent to take one more turn and write its answer down.
-    ``deadline=None`` (the default) or an unset deadline budget is a pure
-    passthrough -- today's behavior, unchanged.
+    ``timeout`` by what wall-clock is actually left, via
+    :meth:`~harness.deadline.Deadline.exec_cap`: a command allowed to run
+    past the run's own external kill would never get its result back to the
+    model at all, and one allowed to swallow the whole budget never hands
+    control back at all. That method owns the three bounds (share cap, band
+    guarantee, landing reserve) and the floor below which no cap goes;
+    ``bash`` only reports the outcome. ``deadline=None`` (the default) or an
+    unset deadline budget is a pure passthrough -- today's behavior,
+    unchanged.
+
+    ``store``/``agent_id``, when both given, turn every capped exec into an
+    ``exec_capped`` transcript event carrying ``requested``, ``effective``,
+    ``remaining``, ``budget``, ``reserve``, ``applied_reserve``, ``reason``
+    and ``purpose``. It is written whenever the cap bites, including when
+    the command then succeeds inside the shorter window -- the point is to
+    measure the cap's own cost from real runs rather than re-deriving it
+    from simulation.
+
+    The two reserve fields are deliberately both there: ``reserve`` is the
+    base landing reserve (floor + adaptive allowance), ``applied_reserve``
+    is what the cap arithmetic actually held back -- larger when the band
+    softener raised it. Only the pair answers the question the event exists
+    to answer, since ``remaining - effective`` recovers the applied reserve
+    for ``reason`` ``"band"``/``"reserve"`` but not for ``"share"``.
     """
 
     spec = ToolSpec(
@@ -160,30 +206,45 @@ def bash_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
         command = _require_str("bash", arguments, "command")
         requested = float(arguments.get("timeout", 120))
         remaining = deadline.remaining() if deadline is not None else None
-        if deadline is None or remaining is None:
-            effective = requested
-        else:
-            effective = min(
-                requested,
-                max(EXEC_CAP_FLOOR_SECONDS, remaining - deadline.landing_reserve()),
+        effective, capped, reason = requested, False, None
+        if deadline is not None:
+            decision = deadline.exec_decision(requested)
+            effective, capped, reason = (
+                decision.effective,
+                decision.capped,
+                decision.reason,
             )
-        capped = effective < requested
+            if capped and store is not None and agent_id is not None:
+                store.append_event(
+                    agent_id,
+                    "exec_capped",
+                    {
+                        "requested": requested,
+                        "effective": effective,
+                        "remaining": remaining,
+                        "budget": deadline.budget,
+                        "reserve": deadline.landing_reserve(),
+                        "applied_reserve": decision.reserve,
+                        "reason": reason,
+                        "purpose": "exploratory",
+                    },
+                )
+        advice = _CAP_ADVICE.get(reason or "", "")
         result = await sandbox.exec(command, timeout=effective)
         lines = [f"exit code: {result.exit_code}"]
         if result.timed_out:
             if capped:
                 lines.append(
                     f"(command timed out after {effective}s — capped from "
-                    f"your requested {requested}s because only ~{remaining}s "
-                    "of wall-clock remain; do not re-run long commands, "
-                    "finalize your answer now)"
+                    f"your requested {requested}s with ~{remaining}s of "
+                    f"wall-clock remaining: {advice})"
                 )
             else:
                 lines.append(f"(command timed out after {effective}s)")
         elif capped:
             lines.append(
                 f"(note: timeout was capped to {effective}s to fit the "
-                "remaining time budget)"
+                f"remaining time budget: {advice})"
             )
         if result.stdout:
             lines.append("--- stdout ---")
@@ -847,7 +908,11 @@ def search_history_tool(store: RunStore, run_id: str) -> Tool:
 # ---------------------------------------------------------------------------
 
 
-def declare_verification_tool() -> Tool:
+def declare_verification_tool(
+    written_data: Callable[[], WrittenData | None] | None = None,
+    store: RunStore | None = None,
+    agent_id: str | None = None,
+) -> Tool:
     """Build the ``declare_verification`` tool (DESIGN.md §10.3 B1).
 
     The model declares the shell command that proves the goal is met; the
@@ -858,6 +923,19 @@ def declare_verification_tool() -> Tool:
     The handler itself only validates and acknowledges the declaration —
     deliberately stateless, so the mechanism's single source of truth is
     the transcript the loop already persists.
+
+    ``written_data`` is an accessor for the loop's live
+    :class:`~harness.diligence.WrittenData` map (an accessor, not the map:
+    the registry is built before the loop that owns it). When given, every
+    declaration is run through
+    :func:`~harness.diligence.lint_verification` and any findings are
+    appended to the tool result as an advisory the model reads on its next
+    turn. ``store``/``agent_id``, when both given, additionally persist a
+    :data:`~harness.diligence.VERIFICATION_LINT_EVENT` event.
+
+    **The lint is warn-only.** A flagged declaration is still accepted,
+    still recorded, and still the command the loop will re-run; nothing
+    about control flow depends on a finding.
     """
 
     spec = ToolSpec(
@@ -900,10 +978,26 @@ def declare_verification_tool() -> Tool:
                 f"{VERIFICATION_TOOL_NAME!r} argument 'command' must be "
                 "non-empty"
             )
-        return (
+        acknowledgement = (
             f"verification declared: {command!r} ({description}). It will "
             "be re-run before your final answer is accepted; exit 0 means "
             "verified."
         )
+        findings = lint_verification(
+            command, written_data() if written_data is not None else None
+        )
+        if not findings:
+            return acknowledgement
+        if store is not None and agent_id is not None:
+            store.append_event(
+                agent_id,
+                VERIFICATION_LINT_EVENT,
+                {
+                    "command": command,
+                    "findings": [finding.as_payload() for finding in findings],
+                    "action": "warn",
+                },
+            )
+        return f"{acknowledgement}\n\n{format_lint_advisory(findings)}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)

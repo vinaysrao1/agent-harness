@@ -433,6 +433,16 @@ def from_openai_response(response: Any) -> ModelResponse:
     docstring). So cache tokens are subtracted from ``prompt_tokens`` here,
     clamped at zero for providers that report cache counts outside the
     prompt total.
+
+    ``reasoning_tokens`` is read from
+    ``usage.completion_tokens_details.reasoning_tokens`` (0 when ``usage``,
+    ``completion_tokens_details``, or the field itself is absent/``None``).
+    Unlike the cache fields above, it is **not** subtracted from anything —
+    it is a subset of ``completion_tokens``/``output_tokens`` that the
+    provider already includes there, not cache-inclusive traffic layered on
+    top of it — so ``output_tokens`` is reported as-is. This is telemetry
+    only; it does not change what is sent to the provider or how the loop
+    behaves.
     """
     provider_error = _provider_error(response)
     if provider_error is not None:
@@ -523,6 +533,12 @@ def from_openai_response(response: Any) -> ModelResponse:
     # prompt_tokens is cache-inclusive per the OpenAI API; Usage.input_tokens
     # is cache-exclusive by convention, so peel the cache traffic off here.
     input_tokens = max(0, prompt_tokens - cache_read_tokens - cache_write_tokens)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    # A subset of completion_tokens/output_tokens, not a sibling traffic
+    # bucket — see the docstring above and the Usage docstring for why this
+    # is never subtracted from output_tokens the way cache tokens are
+    # subtracted from prompt_tokens.
+    reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
     raw: dict | None = None
     dump = getattr(response, "model_dump", None)
     if callable(dump):
@@ -541,6 +557,7 @@ def from_openai_response(response: Any) -> ModelResponse:
             output_tokens=getattr(usage, "completion_tokens", 0) or 0,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            reasoning_tokens=reasoning_tokens,
         ),
         stop_reason=stop_reason,
         provider_stop_reason=provider_stop_reason,
@@ -573,6 +590,13 @@ def accumulate_stream_chunks(chunks: Any) -> Any:
     :func:`from_openai_response` raises the same *retryable* "no choices" error
     an empty non-streamed reply would — a content-less stream is a transient
     fault, not a clean empty turn.
+
+    ``usage`` (including its ``completion_tokens_details`` — the source of
+    :attr:`~harness.types.Usage.reasoning_tokens`) is carried through by
+    reference, not rebuilt field-by-field: the final usage-only chunk's
+    ``usage`` object is stored as-is and handed to the folded response
+    unchanged, so every attribute the provider set on it — including nested
+    ones :func:`from_openai_response` reads — survives the fold.
     """
     content_parts: list[str] = []
     tool_frags: dict[int, dict[str, Any]] = {}
