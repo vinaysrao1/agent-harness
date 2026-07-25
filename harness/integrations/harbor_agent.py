@@ -20,6 +20,12 @@ module, guarded below so the failure mode outside Harbor's venv is a clear
 instruction rather than a bare ``ModuleNotFoundError``. The sandbox wrapper
 itself (:mod:`harness.sandbox.harbor_env`) is duck-typed and imports no
 Harbor code, so our test suite never needs Harbor installed.
+
+This module is also where the harness's provider-neutral fault taxonomy
+(:data:`harness.adapters.base.Fault`, carried out of the loop on
+:attr:`~harness.loop.AgentResult.error_kind`) is translated into Harbor's
+own exception classes — see :data:`_FAULT_EXCEPTIONS`. Nothing under
+``harness/`` knows Harbor exists; the mapping lives here alone.
 """
 
 from __future__ import annotations
@@ -44,6 +50,59 @@ except ImportError as exc:  # pragma: no cover - exercised via stubs in tests
         "  uv tool install --force harbor "
         "--with-editable /Users/vinay/vinaysrao1/harness"
     ) from exc
+
+try:
+    from harbor.agents.installed.base import (
+        AgentAuthenticationError,
+        ApiInternalServerError,
+        ApiRateLimitError,
+        ApiUsageLimitError,
+        NetworkConnectionError,
+        UnknownApiError,
+    )
+
+    #: harness provider-fault (:data:`harness.adapters.base.Fault`) -> the
+    #: Harbor exception class ``run()`` raises for it.
+    #:
+    #: These must be **Harbor's own** classes, not harness-defined ones.
+    #: ``SingleStepTrial._run_agent`` catches only ``(AgentTimeoutError,
+    #: NonZeroAgentExitCodeError)`` and then ``_run()`` proceeds to
+    #: ``_collect_artifacts()`` and ``_run_verifier()``; a harness-defined
+    #: exception would instead escape to ``Trial.run``'s ``except Exception``
+    #: and trigger ``_recover_outputs()`` *instead of* the verifier —
+    #: destroying the reward of any trial that did real work before the
+    #: provider died. Every class below is a ``NonZeroAgentExitCodeError``
+    #: subclass (``ApiError`` subclasses it), which is exactly the invariant
+    #: that keeps the verifier alive; ``tests/test_harbor_agent.py`` asserts
+    #: it so a Harbor upgrade that re-parents them fails loudly.
+    #:
+    #: The choice of class also drives retry: Harbor's default
+    #: ``RetryConfig.exclude_exceptions`` contains ``ApiUsageLimitError`` and
+    #: ``AgentAuthenticationError`` (correct — exhausted credit and a bad key
+    #: will not fix themselves, and retrying would re-burn what is left) but
+    #: not the rate-limit/5xx/network types (correct — those are transient).
+    _FAULT_EXCEPTIONS: dict[str, type[Exception]] = {
+        "auth": AgentAuthenticationError,
+        "quota": ApiUsageLimitError,
+        "rate_limit": ApiRateLimitError,
+        "server": ApiInternalServerError,
+        "transport": NetworkConnectionError,
+        "malformed_response": UnknownApiError,
+    }
+except ImportError:
+    # Harbor version drift: the classes moved or were renamed. Degrade to
+    # the pre-taxonomy behaviour (a provider fault stays an ordinary
+    # completed-with-error trial) rather than raising something Harbor does
+    # not catch, which would cost the trial its verifier run.
+    _FAULT_EXCEPTIONS = {}
+    warnings.warn(
+        "harbor.agents.installed.base does not export the expected API "
+        "error classes; provider faults will not be reported to Harbor as "
+        "infrastructure errors (they stay ordinary scored failures). This "
+        "usually means the installed Harbor version moved or renamed them.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 from harness.adapters import get_adapter
 from harness.config import (
@@ -277,6 +336,14 @@ class HarnessAgent(BaseAgent):
         on exception paths, so Harbor records partial usage even for a
         failed trial; the exception is re-raised so Harbor marks the
         failure.
+
+        A run that died on a *provider* fault (auth, quota, rate limit,
+        5xx, transport) raises the matching Harbor error class rather than
+        returning normally — see :data:`_FAULT_EXCEPTIONS`. Harbor catches
+        those in ``SingleStepTrial._run_agent``, so the trial is still
+        verified and keeps whatever reward its container earned, while the
+        fault is recorded as infrastructure instead of masquerading as a
+        capability failure.
         """
         # Anchor the wall-clock deadline first: Harbor's kill clock
         # (asyncio.wait_for around this coroutine, trial.py) starts at
@@ -328,6 +395,21 @@ class HarnessAgent(BaseAgent):
                     sandbox=sandbox,
                     deadline=deadline,
                 )
+                # A run the provider killed is infrastructure, not a
+                # capability failure: re-raise it as Harbor's own error
+                # type so it lands in exception_stats/exception_info and
+                # Harbor's retry policy can target it. Raising *inside*
+                # this try is deliberate — the `except BaseException`
+                # below records it and the `finally` still populates the
+                # AgentContext with the tokens and metadata the run
+                # accrued before the fault. `result` is already bound, so
+                # nothing is lost. An unmapped or absent error_kind (the
+                # overwhelming majority: every clean finish, every budget
+                # pause, every unclassified error) returns normally, as
+                # before.
+                exc_type = _FAULT_EXCEPTIONS.get(result.error_kind or "")
+                if exc_type is not None:
+                    raise exc_type(result.final_text or "provider fault")
             except BaseException as exc:
                 error = exc
                 raise

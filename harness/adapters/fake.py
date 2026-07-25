@@ -13,6 +13,10 @@ JSONL script format, one JSON object per line::
 Lines with ``tool_calls`` become :attr:`StopReason.TOOL_USE` responses;
 lines without become :attr:`StopReason.END_TURN`. Call ids are generated
 (``fake_<line>_<index>``) unless a tool call provides an ``"id"``.
+
+An optional ``"provider_stop_reason"`` key scripts the provider's verbatim
+stop string (what the agent loop records on its ``model_turn`` event); it
+defaults to ``None``, since a fake has no provider to quote.
 """
 
 from __future__ import annotations
@@ -84,6 +88,8 @@ def _response_from_line(line: str, line_number: int) -> ModelResponse:
         ),
         usage=Usage(),
         stop_reason=StopReason.TOOL_USE if tool_calls else StopReason.END_TURN,
+        # Scriptable provenance; absent means "the fake quoted no provider".
+        provider_stop_reason=data.get("provider_stop_reason"),
     )
 
 

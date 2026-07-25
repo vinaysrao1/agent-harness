@@ -14,7 +14,15 @@ import pytest
 
 from collections.abc import Callable
 
+from harness.adapters.anthropic import (
+    EMPTY_ASSISTANT_PLACEHOLDER as ANTHROPIC_EMPTY_ASSISTANT_PLACEHOLDER,
+)
+from harness.adapters.anthropic import to_anthropic_messages
 from harness.adapters.fake import FakeAdapter
+from harness.adapters.openai_compat import (
+    EMPTY_ASSISTANT_PLACEHOLDER as OPENAI_EMPTY_ASSISTANT_PLACEHOLDER,
+)
+from harness.adapters.openai_compat import to_openai_messages
 from harness.config import HarnessConfig, PermissionMode
 from harness.deadline import Deadline
 from harness.loop import Budgets
@@ -406,6 +414,106 @@ async def test_resume_task_continues_run(
         for message in messages
     )
     assert "resumed" in (messages[-1].content or "")
+
+
+class TranslatingFakeAdapter(FakeAdapter):
+    """A :class:`FakeAdapter` that also runs the real message translators.
+
+    The scripted fake never translates, so it cannot see the failure C1
+    fixes: an empty assistant message in a persisted transcript used to
+    abort ``to_openai_messages``/``to_anthropic_messages`` with a
+    non-retryable ``AdapterError``, making the whole ``state.db``
+    permanently unresumable. Running both translators inside ``complete()``
+    reproduces that end to end without a network or an API key.
+    """
+
+    async def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system: str | None = None,
+        **params: object,
+    ) -> ModelResponse:
+        """Translate ``messages`` both ways, then defer to the script."""
+        self.translated_openai = to_openai_messages(messages, system)
+        self.translated_anthropic = to_anthropic_messages(
+            [m for m in messages if m.role is not Role.SYSTEM], cache=False
+        )
+        return await super().complete(messages, tools, system, **params)
+
+
+async def test_resume_over_empty_assistant_message(
+    orchestrator: Orchestrator, store: RunStore
+) -> None:
+    """Regression: a persisted empty assistant message must not make a run
+    permanently unresumable (plan C1).
+
+    A provider can return ``content=null`` with no tool calls (observed:
+    a whole turn spent on hidden reasoning). The loop persists that message
+    verbatim, so every later replay — live *and* on resume — pushes it back
+    through the translators. They used to raise a non-retryable
+    ``AdapterError``, killing the run and every future resume of it.
+    """
+    first = FakeAdapter(
+        [resp(calls=[call("c1", "write_file", path="hello.txt", content="hi")])]
+    )
+    run_id, paused = await orchestrator.run_task(
+        GOAL, "fake-model", adapter_override=first, budgets=Budgets(max_turns=1)
+    )
+    assert paused.status == "paused_budget"
+
+    # Splice in the message a real provider produced: assistant role, no
+    # content, no tool calls — exactly what sits in the affected state.db.
+    (lead,) = [
+        agent
+        for agent in store.list_agents(run_id)
+        if agent.parent_agent_id is None
+    ]
+    store.append_event(
+        lead.id,
+        "message",
+        Message(role=Role.ASSISTANT).model_dump(mode="json"),
+    )
+
+    second = TranslatingFakeAdapter([resp(CLEAN_FINISH)])
+    with pytest.warns(UserWarning, match="neither content nor tool calls"):
+        result = await orchestrator.resume_task(
+            run_id, adapter_override=second, budgets=Budgets(max_turns=3)
+        )
+    assert result.status == "completed"
+    assert store.get_run(run_id).status == "completed"
+
+    # The empty message survived replay as itself, and both translators
+    # rendered it with the placeholder rather than refusing the transcript.
+    replayed = second.calls[0].messages
+    assert any(
+        message.role is Role.ASSISTANT
+        and not message.content
+        and not message.tool_calls
+        for message in replayed
+    )
+    assert any(
+        entry["content"] == OPENAI_EMPTY_ASSISTANT_PLACEHOLDER
+        for entry in second.translated_openai
+    )
+    assert any(
+        block == {"type": "text", "text": ANTHROPIC_EMPTY_ASSISTANT_PLACEHOLDER}
+        for entry in second.translated_anthropic
+        for block in entry["content"]
+    )
+
+    # The placeholder is a translation-time artifact only: the persisted
+    # event log still records what the provider actually returned.
+    empty_events = [
+        event
+        for event in store.load_events(lead.id)
+        if event.kind == "message"
+        and event.payload.get("role") == "assistant"
+        and not event.payload.get("content")
+        and not event.payload.get("tool_calls")
+    ]
+    assert len(empty_events) == 1
+    assert empty_events[0].payload["content"] is None
 
 
 async def test_resume_task_unknown_run(orchestrator: Orchestrator) -> None:

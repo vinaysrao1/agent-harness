@@ -14,17 +14,90 @@ import asyncio
 import random
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from harness.types import Capabilities, Message, ModelResponse, ToolSpec
 
 __all__ = [
     "AdapterError",
+    "Fault",
     "ModelAdapter",
+    "classify_http_fault",
     "retry_with_backoff",
 ]
 
 T = TypeVar("T")
+
+#: Provider-fault taxonomy: *why* a run died at the provider boundary, as
+#: opposed to at the model's own hands. Deliberately provider-neutral and
+#: free of any benchmark-harness vocabulary — the mapping onto a specific
+#: harness's exception classes lives in that harness's integration module
+#: (``harness/integrations/harbor_agent.py`` is the only place allowed to
+#: import Harbor). Consumers that do not care may ignore it entirely.
+Fault = Literal[
+    "auth",
+    "quota",
+    "rate_limit",
+    "server",
+    "transport",
+    "malformed_response",
+]
+
+#: Substrings that mark an HTTP 403 body as *credit/quota exhaustion* rather
+#: than one of 403's other meanings. 403 alone is over-broad: gateways also
+#: use it for region blocks, moderation refusals, and "your key may not use
+#: this model" — all of which are genuine scored failures that must NOT be
+#: laundered into an infrastructure fault. Matching is case-insensitive on
+#: the provider's own error text; when nothing matches we deliberately
+#: classify nothing rather than guess.
+_QUOTA_BODY_MARKERS = (
+    "insufficient_quota",
+    "limit exceeded",
+    "credit",
+    "quota",
+)
+
+
+def classify_http_fault(status: int | None, body: str = "") -> Fault | None:
+    """Classify an HTTP status (plus its error body) into a :data:`Fault`.
+
+    Shared by every HTTP-speaking adapter so the taxonomy cannot drift
+    between providers:
+
+    ==============================================  ===============
+    Condition                                       ``Fault``
+    ==============================================  ===============
+    401                                             ``auth``
+    402                                             ``quota``
+    403 whose body matches a quota marker           ``quota``
+    403 otherwise                                   ``None``
+    429                                             ``rate_limit``
+    5xx                                             ``server``
+    anything else (400, 404, ...)                   ``None``
+    ==============================================  ===============
+
+    ``None`` means "not a provider fault" — the failure stays an ordinary
+    scored failure, which is the right answer for a 400 (a harness bug that
+    must remain loudly visible in the numbers) and for the non-quota 403s.
+    Statusless transport faults are classified by their callers, which are
+    the ones that know a fault had no status at all.
+    """
+    if status is None:
+        return None
+    if status == 401:
+        return "auth"
+    if status == 402:
+        return "quota"
+    if status == 403:
+        lowered = body.lower()
+        if any(marker in lowered for marker in _QUOTA_BODY_MARKERS):
+            return "quota"
+        return None
+    if status == 429:
+        return "rate_limit"
+    if status >= 500:
+        return "server"
+    return None
 
 
 class AdapterError(Exception):
@@ -33,11 +106,26 @@ class AdapterError(Exception):
     ``retryable`` distinguishes transient faults (rate limits, 5xx, network
     timeouts) from permanent ones (auth failure, invalid request): the retry
     helper only retries the former.
+
+    ``fault`` optionally classifies *what kind* of provider fault this was
+    (see :data:`Fault`). It is orthogonal to ``retryable``: ``retryable``
+    governs this adapter's own bounded retry loop, while ``fault`` describes
+    the surviving failure for whoever is above the harness — the agent loop
+    carries it out on ``AgentResult.error_kind``. ``None`` (the default,
+    which preserves every existing construction site) means "unclassified":
+    an ordinary failure that should be scored as one.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        fault: Fault | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.fault = fault
 
 
 class ModelAdapter(abc.ABC):

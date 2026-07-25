@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,15 +12,20 @@ import pytest
 
 from harness.adapters.base import AdapterError
 from harness.adapters.openai_compat import (
+    EMPTY_ASSISTANT_PLACEHOLDER,
+    EMPTY_MESSAGE_PLACEHOLDERS,
     OpenAICompatAdapter,
     accumulate_stream_chunks,
+    drop_notice,
     from_openai_response,
     map_finish_reason,
     to_openai_messages,
     to_openai_tools,
     wrap_openai_error,
 )
+from harness.diligence import looks_unfinished
 from harness.types import (
+    DROPPED_ARGUMENTS_PREFIX_CHARS,
     Message,
     Role,
     StopReason,
@@ -27,6 +33,7 @@ from harness.types import (
     ToolResult,
     ToolSpec,
 )
+from tests.test_adapters_base import QUOTA_403_BODY
 
 
 def fake_response(
@@ -151,19 +158,58 @@ class TestToOpenAIMessages:
         with pytest.raises(AdapterError, match="no content"):
             to_openai_messages([Message(role=Role.USER)])
 
-    def test_empty_assistant_message_without_tool_calls_rejected(self) -> None:
-        with pytest.raises(AdapterError, match="no content"):
-            to_openai_messages([Message(role=Role.ASSISTANT)])
+    def test_empty_assistant_message_gets_placeholder_not_error(self) -> None:
+        # C1 replay backstop: an assistant message with neither content nor
+        # tool calls must stay translatable, or every transcript already
+        # holding one (including a persisted one being resumed) is dead.
+        with pytest.warns(UserWarning, match="neither content nor tool calls"):
+            out = to_openai_messages([Message(role=Role.ASSISTANT)])
+        assert out == [
+            {"role": "assistant", "content": EMPTY_ASSISTANT_PLACEHOLDER}
+        ]
+
+    def test_empty_assistant_placeholder_is_diligence_safe(self) -> None:
+        # Must not look like a promise of future work or a question if it
+        # ever reaches the diligence check.
+        assert not EMPTY_ASSISTANT_PLACEHOLDER.rstrip().endswith("?")
+        unfinished, _reason = looks_unfinished(EMPTY_ASSISTANT_PLACEHOLDER, 0)
+        assert unfinished is False
+
+    def test_empty_assistant_placeholder_not_written_back(self) -> None:
+        # Translation is pure: the caller's Message must be untouched so the
+        # persisted event log stays a faithful record of the provider output.
+        message = Message(role=Role.ASSISTANT)
+        with pytest.warns(UserWarning):
+            to_openai_messages([message])
+        assert message.content is None
+        assert message.tool_calls == []
+
+    def test_empty_assistant_message_among_others(self) -> None:
+        with pytest.warns(UserWarning):
+            out = to_openai_messages(
+                [
+                    Message(role=Role.USER, content="go"),
+                    Message(role=Role.ASSISTANT),
+                    Message(role=Role.USER, content="continue"),
+                ]
+            )
+        assert [entry["content"] for entry in out] == [
+            "go",
+            EMPTY_ASSISTANT_PLACEHOLDER,
+            "continue",
+        ]
 
     def test_assistant_tool_calls_without_content_allowed(self) -> None:
-        out = to_openai_messages(
-            [
-                Message(
-                    role=Role.ASSISTANT,
-                    tool_calls=[ToolCall(id="c1", name="bash", arguments={})],
-                )
-            ]
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = to_openai_messages(
+                [
+                    Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[ToolCall(id="c1", name="bash", arguments={})],
+                    )
+                ]
+            )
         (entry,) = out
         assert entry["content"] is None
         assert entry["tool_calls"][0]["function"]["name"] == "bash"
@@ -219,26 +265,34 @@ class TestFromOpenAIResponse:
             )
             assert from_openai_response(resp).message.tool_calls[0].arguments == {}
 
-    def test_malformed_arguments_surface_as_adapter_error(self) -> None:
+    def test_malformed_arguments_drop_the_call_instead_of_raising(
+        self,
+    ) -> None:
+        # The arguments are already spent — no retry can repair them — so the
+        # call is dropped and reported, never raised on.
         resp = fake_response(
             content=None,
             tool_calls=[fake_tool_call("c1", "bash", '{"cmd": ')],
             finish_reason="tool_calls",
         )
-        with pytest.raises(AdapterError) as excinfo:
-            from_openai_response(resp)
-        assert "bash" in str(excinfo.value)
-        assert "malformed JSON" in str(excinfo.value)
-        assert excinfo.value.retryable is False
+        result = from_openai_response(resp)
+        assert result.message.tool_calls == []
+        (dropped,) = result.dropped_tool_calls
+        assert dropped.tool_name == "bash"
+        assert dropped.raw_arguments_prefix == '{"cmd": '
+        assert result.incomplete_reason == "dropped_calls"
 
-    def test_non_object_arguments_rejected(self) -> None:
+    def test_non_object_arguments_also_dropped(self) -> None:
+        # _parse_arguments rejects non-object payloads too; that is the same
+        # unusable-payload case and degrades identically.
         resp = fake_response(
             content=None,
             tool_calls=[fake_tool_call("c1", "bash", '["not", "a", "dict"]')],
             finish_reason="tool_calls",
         )
-        with pytest.raises(AdapterError, match="non-object"):
-            from_openai_response(resp)
+        result = from_openai_response(resp)
+        assert result.message.tool_calls == []
+        assert [d.tool_name for d in result.dropped_tool_calls] == ["bash"]
 
     def test_no_choices_rejected_and_retryable(self) -> None:
         # Empty choices is a transient upstream fault (e.g. OpenRouter under
@@ -409,6 +463,40 @@ class TestFromOpenAIResponse:
     ) -> None:
         assert map_finish_reason(provider) is ours
 
+    @pytest.mark.parametrize(
+        ("provider", "ours"),
+        [
+            ("stop", StopReason.END_TURN),
+            ("tool_calls", StopReason.TOOL_USE),
+            ("length", StopReason.MAX_TOKENS),
+            ("content_filter", StopReason.REFUSAL),
+            ("weird_reason", StopReason.ERROR),
+            (None, StopReason.ERROR),
+        ],
+    )
+    def test_provider_stop_reason_carried_through_verbatim(
+        self, provider: str | None, ours: StopReason
+    ) -> None:
+        """§C2: the raw finish_reason survives translation untouched while
+        stop_reason maps exactly as before. The two ERROR rows are the point
+        — after mapping alone, an unmapped provider string and a missing one
+        are the same value, and post-hoc triage cannot tell them apart."""
+        result = from_openai_response(fake_response(finish_reason=provider))
+        assert result.provider_stop_reason == provider
+        assert result.stop_reason is ours
+
+    def test_provider_stop_reason_absent_attribute_is_none(self) -> None:
+        """A response object with no finish_reason attribute at all (not
+        merely None) must not raise; provenance is best-effort."""
+        message = SimpleNamespace(content="hi", tool_calls=None)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+        result = from_openai_response(response)
+        assert result.provider_stop_reason is None
+        assert result.stop_reason is StopReason.ERROR
+
 
 # ------------------------- truncated tool calls (graceful degradation)
 
@@ -438,10 +526,59 @@ class TestTruncatedToolCallDegradation:
         assert result.stop_reason is StopReason.MAX_TOKENS
         assert result.message.tool_calls == []
 
-    def test_all_calls_dropped_and_no_content_gets_placeholder(self) -> None:
-        # An empty assistant message would be rejected by to_openai_messages
-        # when the transcript is replayed next turn; the placeholder keeps the
-        # transcript translatable.
+    @pytest.mark.parametrize(
+        "finish_reason",
+        [None, "stop", "tool_calls", "error", "length", "weird_reason"],
+    )
+    def test_malformed_args_never_raise_whatever_the_finish_reason(
+        self, finish_reason: str | None
+    ) -> None:
+        """The old rule keyed degradation on ``finish_reason == "length"``,
+        which is wrong: a call cut off mid-JSON is equally unrecoverable under
+        every other finish reason, and the real make-mips trial died under a
+        *missing* one. Whatever the provider says it stopped for, an
+        unparseable call is dropped and the reason is ``dropped_calls``."""
+        resp = fake_response(
+            content=None,
+            tool_calls=[
+                fake_tool_call("c1", "write_file", TRUNCATED_WRITE_FILE_ARGS)
+            ],
+            finish_reason=finish_reason,
+        )
+        result = from_openai_response(resp)
+        assert result.message.tool_calls == []
+        assert result.incomplete is True
+        assert result.incomplete_reason == "dropped_calls"
+        (dropped,) = result.dropped_tool_calls
+        assert dropped.tool_name == "write_file"
+        assert dropped.raw_arguments_len == len(TRUNCATED_WRITE_FILE_ARGS)
+        assert drop_notice(1) in result.message.content
+        # stop_reason stays a faithful translation of what the provider said.
+        assert result.provider_stop_reason == finish_reason
+
+    def test_dropped_call_reported_with_capped_prefix(self) -> None:
+        # The loop persists these; the prefix must show the cut point without
+        # carrying a whole truncated file body (one real fragment was ~21 KB).
+        huge = '{"path": "big.py", "content": "' + "x" * 21_000
+        resp = fake_response(
+            content=None,
+            tool_calls=[fake_tool_call("c1", "write_file", huge)],
+            finish_reason="length",
+        )
+        (dropped,) = from_openai_response(resp).dropped_tool_calls
+        assert dropped.tool_name == "write_file"
+        assert dropped.raw_arguments_len == len(huge)
+        assert dropped.raw_arguments_prefix == huge[
+            :DROPPED_ARGUMENTS_PREFIX_CHARS
+        ]
+        assert len(dropped.raw_arguments_prefix) == (
+            DROPPED_ARGUMENTS_PREFIX_CHARS
+        )
+
+    def test_all_calls_dropped_and_no_content_gets_drop_notice(self) -> None:
+        # An empty assistant message would force to_openai_messages to invent
+        # a body when the transcript is replayed next turn; the notice keeps
+        # the transcript translatable *and* tells the model what happened.
         resp = fake_response(
             content=None,
             tool_calls=[
@@ -450,33 +587,38 @@ class TestTruncatedToolCallDegradation:
             finish_reason="length",
         )
         result = from_openai_response(resp)
-        assert result.message.content == (
-            "(response truncated at the output-token limit while emitting "
-            "a tool call)"
-        )
-        # Next-turn translation of the transcript does not raise.
-        (entry,) = to_openai_messages([result.message])
+        assert result.message.content == drop_notice(1)
+        # Next-turn translation of the transcript does not raise or warn.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            (entry,) = to_openai_messages([result.message])
         assert entry["role"] == "assistant"
-        assert "truncated" in entry["content"]
+        assert "dropped" in entry["content"]
 
-    def test_well_formed_calls_survive_alongside_dropped_one(self) -> None:
-        # The drop is per tool call: a complete parallel call is kept, and no
-        # placeholder is substituted since the message is not empty.
+    def test_drop_notice_appended_even_when_a_sibling_survives(self) -> None:
+        """M2: the drop must be announced even on the sibling-survivor path.
+        The loop takes its tool-call branch there and never consults
+        ``incomplete``, so this notice — read back as the model's own prior
+        turn — is the only way it learns call 2 vanished."""
         resp = fake_response(
-            content=None,
+            content="Listing, then writing the file.",
             tool_calls=[
                 fake_tool_call("c1", "bash", '{"cmd": "ls"}'),
                 fake_tool_call("c2", "write_file", TRUNCATED_WRITE_FILE_ARGS),
             ],
-            finish_reason="length",
+            finish_reason="tool_calls",
         )
         result = from_openai_response(resp)
         assert result.message.tool_calls == [
             ToolCall(id="c1", name="bash", arguments={"cmd": "ls"})
         ]
-        assert result.message.content is None
+        assert result.message.content == (
+            "Listing, then writing the file.\n\n" + drop_notice(1)
+        )
+        assert [d.tool_name for d in result.dropped_tool_calls] == ["write_file"]
+        assert result.incomplete_reason == "dropped_calls"
 
-    def test_existing_content_not_replaced_by_placeholder(self) -> None:
+    def test_existing_content_is_kept_and_the_notice_appended(self) -> None:
         resp = fake_response(
             content="Writing the interpreter now.",
             tool_calls=[
@@ -485,12 +627,29 @@ class TestTruncatedToolCallDegradation:
             finish_reason="length",
         )
         result = from_openai_response(resp)
-        assert result.message.content == "Writing the interpreter now."
+        assert result.message.content.startswith("Writing the interpreter now.")
+        assert result.message.content.endswith(drop_notice(1))
         assert result.message.tool_calls == []
 
+    def test_two_dropped_calls_are_reported_and_counted_in_the_notice(
+        self,
+    ) -> None:
+        resp = fake_response(
+            content=None,
+            tool_calls=[
+                fake_tool_call("c1", "write_file", TRUNCATED_WRITE_FILE_ARGS),
+                fake_tool_call("c2", "bash", '{"cmd": '),
+            ],
+            finish_reason="length",
+        )
+        result = from_openai_response(resp)
+        assert len(result.dropped_tool_calls) == 2
+        assert result.message.content == drop_notice(2)
+        assert "2 tool calls were dropped" in result.message.content
+
     def test_non_object_args_also_dropped_when_truncated(self) -> None:
-        # _parse_arguments rejects non-object payloads too; under truncation
-        # that is the same salvageable failure.
+        # _parse_arguments rejects non-object payloads too; that is the same
+        # salvageable failure.
         resp = fake_response(
             content=None,
             tool_calls=[fake_tool_call("c1", "bash", '"cut off mid')],
@@ -499,17 +658,18 @@ class TestTruncatedToolCallDegradation:
         result = from_openai_response(resp)
         assert result.message.tool_calls == []
         assert result.stop_reason is StopReason.MAX_TOKENS
+        assert result.incomplete_reason == "dropped_calls"
 
-    def test_non_length_malformed_args_still_raise_non_retryable(self) -> None:
-        # A genuine provider fault (not truncation) keeps today's contract.
-        resp = fake_response(
-            content=None,
-            tool_calls=[fake_tool_call("c1", "bash", '{"cmd": ')],
-            finish_reason="stop",
-        )
-        with pytest.raises(AdapterError) as excinfo:
-            from_openai_response(resp)
-        assert excinfo.value.retryable is False
+    def test_injected_texts_cannot_trip_the_diligence_check(self) -> None:
+        # Every one of these becomes assistant content and can reach
+        # looks_unfinished; none may read as promised future work, and none
+        # may end in '?'. A false "unfinished" here would spend a nudge on a
+        # string the harness wrote itself.
+        texts = [drop_notice(1), drop_notice(2)]
+        texts += list(EMPTY_MESSAGE_PLACEHOLDERS.values())
+        for text in texts:
+            assert not text.rstrip().endswith("?")
+            assert looks_unfinished(text, 0)[0] is False
 
     def test_streaming_truncated_args_behave_identically(self) -> None:
         # The same truncated arguments arriving as stream fragments fold into
@@ -535,10 +695,185 @@ class TestTruncatedToolCallDegradation:
         result = from_openai_response(resp)
         assert result.stop_reason is StopReason.MAX_TOKENS
         assert result.message.tool_calls == []
-        assert result.message.content == (
-            "(response truncated at the output-token limit while emitting "
-            "a tool call)"
+        assert result.message.content == drop_notice(1)
+
+    def test_streaming_truncated_args_with_no_terminal_chunk(self) -> None:
+        """The actual make-mips shape: the tool-call fragments arrived but no
+        terminal chunk ever did, so ``finish_reason`` was None — the one case
+        the ``"length"``-keyed rule did not cover, and the one that killed the
+        run. Same fragments as the test above, minus the terminal chunk."""
+        resp = accumulate_stream_chunks(
+            [
+                stream_chunk(
+                    tool_calls=[
+                        tc_delta(
+                            0,
+                            id="c1",
+                            name="write_file",
+                            arguments='{"path": "interp.py", "content": "def ',
+                        )
+                    ]
+                ),
+                stream_chunk(
+                    tool_calls=[tc_delta(0, arguments="main():\\n    regs")]
+                ),
+            ]
         )
+        result = from_openai_response(resp)
+        assert result.provider_stop_reason is None
+        assert result.message.tool_calls == []
+        assert result.incomplete_reason == "dropped_calls"
+        assert result.message.content == drop_notice(1)
+
+
+# ------------------------- incomplete-turn derivation (M1 gating)
+
+
+class TestIncompleteDerivation:
+    def test_content_without_a_terminal_chunk_is_not_incomplete(self) -> None:
+        """**The M1 regression guard.** A stream that delivered a real answer
+        but no terminal chunk maps to StopReason.ERROR. Treating that alone as
+        incomplete would give any gateway that omits ``finish_reason`` three
+        spurious re-prompts at the end of *every* run, each telling a model
+        that just answered correctly it had been cut off — false, and at
+        17-40s a turn, fatal after wind-down."""
+        resp = accumulate_stream_chunks(
+            [stream_chunk(content="The answer is 42. All tests pass.")]
+        )
+        result = from_openai_response(resp)
+        assert result.stop_reason is StopReason.ERROR
+        assert result.provider_stop_reason is None
+        assert result.incomplete is False
+        assert result.incomplete_reason is None
+
+    def test_surviving_tool_call_without_terminal_chunk_is_not_incomplete(
+        self,
+    ) -> None:
+        # Same gate, via the other half of "usable": a parseable tool call.
+        resp = accumulate_stream_chunks(
+            [
+                stream_chunk(
+                    tool_calls=[
+                        tc_delta(
+                            0, id="c1", name="bash", arguments='{"cmd": "ls"}'
+                        )
+                    ]
+                )
+            ]
+        )
+        result = from_openai_response(resp)
+        assert result.stop_reason is StopReason.ERROR
+        assert result.incomplete is False
+
+    def test_empty_message_without_terminal_chunk_is_no_finish_reason(
+        self,
+    ) -> None:
+        # Nothing usable *and* no recognised stop reason: the only shape the
+        # no_finish_reason branch is allowed to fire on.
+        result = from_openai_response(
+            fake_response(content=None, tool_calls=None, finish_reason=None)
+        )
+        assert result.incomplete is True
+        assert result.incomplete_reason == "no_finish_reason"
+
+    def test_unmapped_finish_reason_with_empty_message_is_no_finish_reason(
+        self,
+    ) -> None:
+        result = from_openai_response(
+            fake_response(
+                content=None, tool_calls=None, finish_reason="weird_reason"
+            )
+        )
+        assert result.incomplete_reason == "no_finish_reason"
+        assert result.provider_stop_reason == "weird_reason"
+
+    def test_max_tokens_beats_no_finish_reason_but_loses_to_dropped_calls(
+        self,
+    ) -> None:
+        # Precedence: dropped_calls > max_tokens > no_finish_reason.
+        truncated_empty = from_openai_response(
+            fake_response(content=None, tool_calls=None, finish_reason="length")
+        )
+        assert truncated_empty.incomplete_reason == "max_tokens"
+
+        truncated_with_drop = from_openai_response(
+            fake_response(
+                content=None,
+                tool_calls=[
+                    fake_tool_call(
+                        "c1", "write_file", TRUNCATED_WRITE_FILE_ARGS
+                    )
+                ],
+                finish_reason="length",
+            )
+        )
+        assert truncated_with_drop.incomplete_reason == "dropped_calls"
+
+    def test_max_tokens_with_a_surviving_call_is_still_incomplete(self) -> None:
+        """``max_tokens`` is unconditional per the precedence table — it does
+        not require an empty message. The loop still dispatches the surviving
+        call (its tool-call branch runs first), so this costs no re-prompt;
+        the flag is what a caller inspects to know the turn was cut short."""
+        result = from_openai_response(
+            fake_response(
+                content="writing",
+                tool_calls=[fake_tool_call("c1", "bash", '{"cmd": "ls"}')],
+                finish_reason="length",
+            )
+        )
+        assert result.incomplete_reason == "max_tokens"
+        assert len(result.message.tool_calls) == 1
+
+    def test_clean_finish_is_not_incomplete(self) -> None:
+        result = from_openai_response(fake_response(content="done"))
+        assert result.incomplete is False
+        assert result.incomplete_reason is None
+        assert result.dropped_tool_calls == []
+
+    @pytest.mark.parametrize(
+        ("finish_reason", "reason", "text"),
+        [
+            (
+                "length",
+                "max_tokens",
+                "(response truncated at the output-token limit before "
+                "producing any output)",
+            ),
+            (
+                None,
+                "no_finish_reason",
+                "(provider response ended without completing)",
+            ),
+            (
+                "stop",
+                None,
+                "(provider returned an empty assistant message)",
+            ),
+        ],
+    )
+    def test_empty_message_gets_a_cause_specific_placeholder(
+        self, finish_reason: str | None, reason: str | None, text: str
+    ) -> None:
+        """A turn with no content and no tool calls used to be persisted empty
+        and then rejected on replay, killing a real run at turn 1. The
+        substitute names the cause, since the model reads it back as its own
+        prior turn. Note the ``"stop"`` row: a *recognised* stop reason with an
+        empty body still gets a body, but is NOT incomplete — that is the M1
+        gate, which confines re-prompting to unrecognised stop reasons."""
+        result = from_openai_response(
+            fake_response(
+                content=None, tool_calls=None, finish_reason=finish_reason
+            )
+        )
+        assert result.message.content == text
+        assert result.message.content == EMPTY_MESSAGE_PLACEHOLDERS[reason]
+        assert result.incomplete is (reason is not None)
+        assert result.incomplete_reason == reason
+        # Replay-safe and diligence-safe.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            to_openai_messages([result.message])
+        assert looks_unfinished(text, 0)[0] is False
 
 
 # ------------------------------------------------------------- error mapping
@@ -596,6 +931,142 @@ class TestWrapOpenAIError:
     def test_adapter_error_passthrough(self) -> None:
         original = AdapterError("wrapped", retryable=True)
         assert wrap_openai_error(original) is original
+
+
+class FakeStatusErrorWithBody(Exception):
+    """An SDK error whose str() carries the provider's error body, which is
+    how the openai SDK actually renders an APIStatusError."""
+
+    def __init__(self, status_code: int, body: str) -> None:
+        super().__init__(body)
+        self.status_code = status_code
+
+
+class TestWrapOpenAIErrorFault:
+    """The provider-fault taxonomy, which is orthogonal to ``retryable``.
+
+    The classification is what lets a benchmark harness record an exhausted
+    key as *infrastructure* rather than as an agent capability failure. It
+    must be conservative: anything it cannot positively identify stays
+    ``None`` and is scored as an ordinary failure.
+    """
+
+    @pytest.mark.parametrize(
+        "status,want",
+        [
+            (401, "auth"),
+            (402, "quota"),
+            (429, "rate_limit"),
+            (500, "server"),
+            (503, "server"),
+            (400, None),
+            (404, None),
+            (408, None),
+        ],
+    )
+    def test_status_classification(self, status: int, want: str | None) -> None:
+        assert wrap_openai_error(FakeStatusError(status)).fault == want
+
+    def test_403_quota_body_from_the_real_run(self) -> None:
+        """The load-bearing case: 7 of 22 trials in one Terminal-Bench run
+        died on exactly this body and were recorded by Harbor as clean
+        completions with reward 0."""
+        exc = FakeStatusErrorWithBody(403, QUOTA_403_BODY)
+        wrapped = wrap_openai_error(exc)
+        assert wrapped.fault == "quota"
+        assert wrapped.retryable is False  # credit is gone; do not re-burn it
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "Error code: 403 - this model is not permitted in your region",
+            "Error code: 403 - blocked by moderation",
+            "Error code: 403 - your key may not use this model",
+        ],
+    )
+    def test_403_non_quota_stays_a_scored_failure(self, body: str) -> None:
+        # 403 alone is over-broad; only a quota-shaped body may be laundered
+        # into an infrastructure fault.
+        assert wrap_openai_error(FakeStatusErrorWithBody(403, body)).fault is None
+
+    @pytest.mark.parametrize(
+        "exc_name",
+        [
+            "ReadError",
+            "ReadTimeout",
+            "WriteError",
+            "RemoteProtocolError",
+            "StreamError",
+            "IncompleteRead",
+            "PoolTimeout",
+            "APIConnectionError",
+        ],
+    )
+    def test_statusless_transport_errors_are_transport_faults(
+        self, exc_name: str
+    ) -> None:
+        exc = type(exc_name, (Exception,), {})()
+        assert wrap_openai_error(exc).fault == "transport"
+
+    def test_builtin_timeout_is_a_transport_fault(self) -> None:
+        assert wrap_openai_error(TimeoutError()).fault == "transport"
+
+    def test_unknown_sdk_error_unclassified(self) -> None:
+        assert wrap_openai_error(RuntimeError("boom")).fault is None
+
+    def test_passthrough_adapter_error_keeps_its_own_fault(self) -> None:
+        original = AdapterError("already classified", fault="quota")
+        assert wrap_openai_error(original).fault == "quota"
+
+
+class TestInlineGatewayErrorFault:
+    """OpenRouter reports faults as HTTP 200 bodies with an inline error
+    object; the same taxonomy has to apply there or the most common real
+    failure path stays unclassified."""
+
+    @staticmethod
+    def _raise(code: object, message: str) -> AdapterError:
+        resp = SimpleNamespace(
+            choices=[], usage=None, error={"code": code, "message": message}
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        return excinfo.value
+
+    @pytest.mark.parametrize(
+        "code,want",
+        [
+            (401, "auth"),
+            (402, "quota"),
+            (429, "rate_limit"),
+            (500, "server"),
+            (400, None),
+        ],
+    )
+    def test_code_classification(self, code: int, want: str | None) -> None:
+        assert self._raise(code, "upstream said so").fault == want
+
+    def test_403_quota_body(self) -> None:
+        assert self._raise(403, "Key limit exceeded (total limit)").fault == "quota"
+
+    def test_403_non_quota_body(self) -> None:
+        assert self._raise(403, "not permitted in your region").fault is None
+
+    def test_codeless_inline_error_unclassified(self) -> None:
+        """No code means no evidence: stay retryable (as before) but refuse
+        to guess a fault kind."""
+        resp = SimpleNamespace(
+            choices=[], usage=None, error={"message": "something transient"}
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(resp)
+        assert excinfo.value.retryable is True
+        assert excinfo.value.fault is None
+
+    def test_empty_choices_unclassified(self) -> None:
+        with pytest.raises(AdapterError) as excinfo:
+            from_openai_response(SimpleNamespace(choices=[], usage=None))
+        assert excinfo.value.fault is None
 
 
 # ------------------------------------------------------------------ complete
@@ -729,6 +1200,29 @@ class TestComplete:
         assert "hard timeout" in str(excinfo.value)
         assert HungAPI.calls == 1
 
+    async def test_hard_timeout_is_a_transport_fault_after_retries(self) -> None:
+        # The adapter raises its *own* AdapterError for a timeout, before
+        # wrap_openai_error ever sees it (asyncio.TimeoutError is TimeoutError
+        # on 3.11+), so the taxonomy has to be attached at that construction
+        # site. Asserted through complete() with the retry budget spent,
+        # because that is the exception the agent loop turns into
+        # AgentResult.error_kind -> Harbor's NetworkConnectionError.
+        class HungAPI:
+            async def create(self, **kwargs: Any) -> Any:
+                await asyncio.sleep(10.0)
+
+        async def fake_sleep(delay: float) -> None:
+            return None
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=HungAPI()))
+        adapter = OpenAICompatAdapter(
+            "m", client=client, stream=False, request_timeout=0.02,
+            retry={"max_attempts": 3, "sleep": fake_sleep, "jitter": lambda: 0.0},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.fault == "transport"
+
     def test_default_retry_config_bounds_wall_clock(self) -> None:
         # The adapter defaults a retry budget so request_timeout × max_attempts
         # cannot silently overrun an upstream agent deadline.
@@ -740,9 +1234,11 @@ class TestComplete:
         )
         assert override._retry["max_elapsed"] == 42.0
 
-    async def test_malformed_tool_json_not_retried(self) -> None:
-        # Non-retryable translation errors must still fail fast even though
-        # translation now runs inside the retried call.
+    async def test_malformed_tool_json_degrades_without_retrying(self) -> None:
+        # Malformed arguments are a spent payload: retrying cannot repair
+        # them, so the call is dropped in place and exactly one request is
+        # made. (This asserted a raise before C4; the run-killing behaviour it
+        # pinned is what the change removes.)
         bad = fake_response(
             content=None,
             tool_calls=[fake_tool_call("c1", "bash", '{"cmd": ')],
@@ -750,8 +1246,11 @@ class TestComplete:
         )
         client = fake_client([bad, fake_response(content="unreached")])
         adapter = OpenAICompatAdapter("m", client=client, stream=False)
-        with pytest.raises(AdapterError, match="malformed JSON"):
-            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        result = await adapter.complete(
+            [Message(role=Role.USER, content="hi")], []
+        )
+        assert result.incomplete_reason == "dropped_calls"
+        assert [d.tool_name for d in result.dropped_tool_calls] == ["bash"]
         assert len(client.chat.completions.calls) == 1
 
     def test_capabilities(self) -> None:
@@ -968,6 +1467,26 @@ class TestAccumulateStreamChunks:
             from_openai_response(resp)
         assert excinfo.value.retryable is True
 
+    def test_provider_stop_reason_survives_the_streaming_path(self) -> None:
+        """§C2: the accumulated shape feeds the same translator, so the
+        terminal chunk's verbatim finish_reason reaches the response."""
+        resp = accumulate_stream_chunks(
+            [stream_chunk(content="hi"), stream_chunk(finish_reason="length")]
+        )
+        assert from_openai_response(resp).provider_stop_reason == "length"
+
+    def test_stream_with_no_terminal_chunk_reports_no_stop_reason(self) -> None:
+        """The observed mid-generation death (trial make-mips-interpreter):
+        content arrived, then the stream ended with no finish_reason chunk.
+        stop_reason maps to ERROR — the same value an unmapped provider
+        string yields — so ``provider_stop_reason is None`` is the only
+        durable evidence that nothing terminal was ever sent."""
+        resp = accumulate_stream_chunks([stream_chunk(content="partial")])
+        translated = from_openai_response(resp)
+        assert translated.provider_stop_reason is None
+        assert translated.stop_reason is StopReason.ERROR
+        assert translated.message.content == "partial"
+
 
 class TestStreamingComplete:
     async def test_streams_text_and_requests_usage(self) -> None:
@@ -1054,6 +1573,30 @@ class TestStreamingComplete:
         assert excinfo.value.retryable is True
         assert "stalled" in str(excinfo.value)
         assert stream.closed is True  # the stalled stream was closed, not leaked
+
+    async def test_stall_surviving_retries_is_a_transport_fault(self) -> None:
+        # Mid-stream death is the trial-forfeiting fault class this taxonomy
+        # exists for. A stall that outlives the retry budget must reach the
+        # caller classified as ``transport`` (-> NetworkConnectionError, which
+        # Harbor does *not* exclude from -r retries), not unclassified — which
+        # would score an infrastructure failure as a capability failure.
+        streams = [
+            FakeStream([stream_chunk(content="a")], gaps=[0.3]) for _ in range(3)
+        ]
+        client = fake_streaming_client(streams)
+
+        async def fake_sleep(delay: float) -> None:
+            return None
+
+        adapter = OpenAICompatAdapter(
+            "m", client=client, stream_idle_timeout=0.05,
+            retry={"max_attempts": 3, "sleep": fake_sleep, "jitter": lambda: 0.0},
+        )
+        with pytest.raises(AdapterError) as excinfo:
+            await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert excinfo.value.fault == "transport"
+        assert excinfo.value.retryable is True
+        assert len(client.chat.completions.calls) == 3
 
     async def test_stall_then_retry_succeeds(self) -> None:
         # A transient stall on the first attempt self-heals on a fresh stream.

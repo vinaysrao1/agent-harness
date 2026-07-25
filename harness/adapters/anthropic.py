@@ -21,11 +21,18 @@ be unit-tested without a client or network.
 from __future__ import annotations
 
 import asyncio
+import warnings
 from typing import Any
 
-from harness.adapters.base import AdapterError, ModelAdapter, retry_with_backoff
+from harness.adapters.base import (
+    AdapterError,
+    ModelAdapter,
+    classify_http_fault,
+    retry_with_backoff,
+)
 from harness.types import (
     Capabilities,
+    IncompleteReason,
     Message,
     ModelResponse,
     Role,
@@ -38,6 +45,8 @@ from harness.types import (
 
 __all__ = [
     "AnthropicAdapter",
+    "EMPTY_ASSISTANT_PLACEHOLDER",
+    "EMPTY_MESSAGE_PLACEHOLDERS",
     "to_anthropic_messages",
     "to_anthropic_system",
     "to_anthropic_tools",
@@ -61,6 +70,38 @@ _DEFAULT_RETRY_MAX_ELAPSED = 300.0
 
 #: ``cache_control`` value for ephemeral prompt-cache breakpoints.
 _EPHEMERAL = {"type": "ephemeral"}
+
+#: Stand-in body emitted at translation time for an assistant message that
+#: carries neither content nor tool calls. Such a message is a provider (or
+#: producer-side adapter) defect, but refusing to translate it makes every
+#: transcript that already contains one permanently unreplayable — including
+#: persisted ``state.db`` transcripts a resume must walk. The text is
+#: deliberately free of :data:`harness.diligence._PROMISE_PATTERNS` phrasing
+#: and of a trailing ``?`` so it cannot make a turn look unfinished if it
+#: ever reaches the diligence check. It is *never* written back into the
+#: transcript: the persisted event log stays a faithful record of what the
+#: provider actually returned. Kept textually identical to the
+#: OpenAI-compatible adapter's placeholder so replay looks the same on both.
+EMPTY_ASSISTANT_PLACEHOLDER = (
+    "(no content: the provider returned an empty assistant message)"
+)
+
+#: Producer-side stand-ins keyed by :data:`~harness.types.IncompleteReason`,
+#: substituted by :func:`from_anthropic_response` when the translated
+#: assistant message would carry neither content nor tool calls — the mirror
+#: of the OpenAI-compatible adapter's table, and kept textually identical to
+#: it (same rationale as :data:`EMPTY_ASSISTANT_PLACEHOLDER`) so a transcript
+#: reads the same whichever provider produced it. ``dropped_calls`` has no
+#: entry here: Anthropic delivers ``tool_use`` inputs pre-parsed, so this
+#: adapter has no malformed-arguments case and never drops a call.
+EMPTY_MESSAGE_PLACEHOLDERS: dict[IncompleteReason | None, str] = {
+    "max_tokens": (
+        "(response truncated at the output-token limit before producing "
+        "any output)"
+    ),
+    "no_finish_reason": "(provider response ended without completing)",
+    None: "(provider returned an empty assistant message)",
+}
 
 #: Provider stop reasons -> harness :class:`StopReason`.
 _STOP_REASONS: dict[str, StopReason] = {
@@ -131,6 +172,15 @@ def to_anthropic_messages(
     - When ``cache`` is true, a ``cache_control: ephemeral`` breakpoint is
       set on the final content block of the last message, marking the whole
       transcript so far as a cacheable stable prefix for the next turn.
+    - An *assistant* message with neither content nor tool calls is
+      translated as a single text block holding
+      :data:`EMPTY_ASSISTANT_PLACEHOLDER`, with a :class:`UserWarning`,
+      rather than raising: refusing it would make any transcript already
+      holding one — including a persisted one being resumed — permanently
+      unreplayable. The warning is the only channel available here (this
+      function is pure and has no store access) and exists so a future
+      producer-side adapter bug is not silently masked. Every other empty
+      message stays a hard :class:`AdapterError`.
     """
     out: list[dict[str, Any]] = []
     for message in messages:
@@ -142,10 +192,20 @@ def to_anthropic_messages(
             )
         blocks = _message_blocks(message)
         if not blocks:
-            raise AdapterError(
-                f"message with role {message.role.value!r} has no content, "
-                "tool calls, or tool result; cannot translate"
+            if message.role is not Role.ASSISTANT:
+                raise AdapterError(
+                    f"message with role {message.role.value!r} has no "
+                    "content, tool calls, or tool result; cannot translate"
+                )
+            warnings.warn(
+                "assistant message has neither content nor tool calls; "
+                "translating it with a placeholder body so the transcript "
+                "stays replayable — this indicates a provider or "
+                "producer-side adapter defect",
+                UserWarning,
+                stacklevel=2,
             )
+            blocks = [{"type": "text", "text": EMPTY_ASSISTANT_PLACEHOLDER}]
         role = "user" if message.role in (Role.USER, Role.TOOL) else "assistant"
         if out and out[-1]["role"] == role:
             out[-1]["content"].extend(blocks)
@@ -192,7 +252,35 @@ def from_anthropic_response(response: Any) -> ModelResponse:
     same attribute shape): ``content`` blocks with ``type``/``text``/``id``/
     ``name``/``input``, ``stop_reason``, and ``usage`` with token counts
     including ``cache_read_input_tokens``/``cache_creation_input_tokens``.
+
+    The provider's raw ``stop_reason`` is carried through verbatim on
+    :attr:`~harness.types.ModelResponse.provider_stop_reason` (``None`` when
+    absent) alongside the lossy :func:`map_stop_reason` normalization, which
+    collapses every unknown or missing value to :attr:`StopReason.ERROR`. The
+    agent loop persists it per turn, so *why* a turn ended stays recoverable
+    from ``state.db`` after the fact.
+
+    Incompleteness mirrors the OpenAI-compatible adapter, minus the
+    ``dropped_calls`` row it cannot produce (``tool_use`` inputs arrive
+    pre-parsed, so there are no malformed arguments to drop):
+    ``max_tokens`` when the turn hit the output cap, else
+    ``no_finish_reason`` when the stop reason is missing or unmapped **and**
+    the translated message is empty. That second condition is load-bearing:
+    without it, a response that stopped for a reason we simply do not map yet
+    would earn three re-prompts even though it answered perfectly well.
+
+    An empty translated message (no text blocks, no ``tool_use``) gets a
+    cause-specific placeholder from :data:`EMPTY_MESSAGE_PLACEHOLDERS`, so a
+    turn that produced nothing still round-trips through
+    :func:`to_anthropic_messages` on replay.
     """
+    raw_stop_reason = getattr(response, "stop_reason", None)
+    # Verbatim provenance: str() is identity for the strings the API
+    # actually sends, and keeps a non-string oddity from turning into a
+    # ValidationError that would kill the turn.
+    provider_stop_reason = (
+        None if raw_stop_reason is None else str(raw_stop_reason)
+    )
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     for block in response.content or []:
@@ -204,6 +292,21 @@ def from_anthropic_response(response: Any) -> ModelResponse:
                 ToolCall(id=block.id, name=block.name, arguments=dict(block.input))
             )
         # Unknown block types (e.g. future thinking blocks) are ignored.
+    content = "".join(text_parts) or None
+    stop_reason = map_stop_reason(raw_stop_reason)
+
+    # Precedence mirrors the OpenAI-compatible adapter (minus dropped_calls);
+    # the empty-message gate on no_finish_reason is deliberate — see docstring.
+    incomplete_reason: IncompleteReason | None = None
+    if stop_reason is StopReason.MAX_TOKENS:
+        incomplete_reason = "max_tokens"
+    elif stop_reason is StopReason.ERROR and not content and not tool_calls:
+        incomplete_reason = "no_finish_reason"
+    if not content and not tool_calls:
+        content = EMPTY_MESSAGE_PLACEHOLDERS.get(
+            incomplete_reason, EMPTY_MESSAGE_PLACEHOLDERS[None]
+        )
+
     usage = getattr(response, "usage", None)
     raw: dict | None = None
     dump = getattr(response, "model_dump", None)
@@ -215,7 +318,7 @@ def from_anthropic_response(response: Any) -> ModelResponse:
     return ModelResponse(
         message=Message(
             role=Role.ASSISTANT,
-            content="".join(text_parts) or None,
+            content=content,
             tool_calls=tool_calls,
         ),
         usage=Usage(
@@ -224,7 +327,10 @@ def from_anthropic_response(response: Any) -> ModelResponse:
             cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
             cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
         ),
-        stop_reason=map_stop_reason(getattr(response, "stop_reason", None)),
+        stop_reason=stop_reason,
+        provider_stop_reason=provider_stop_reason,
+        incomplete=incomplete_reason is not None,
+        incomplete_reason=incomplete_reason,
         raw=raw,
     )
 
@@ -236,6 +342,13 @@ def wrap_anthropic_error(exc: Exception) -> AdapterError:
     ``overloaded_error``) are retryable; other statuses (400 invalid request,
     401 auth, ...) are not. Statusless connection/timeout failures are
     retryable. Anything else is treated as a permanent adapter bug.
+
+    Independently of ``retryable``, the error is classified into the
+    provider-fault taxonomy (:data:`~harness.adapters.base.Fault`) by the same
+    shared :func:`~harness.adapters.base.classify_http_fault` the
+    OpenAI-compatible adapter uses — one rule for every provider, so the
+    taxonomy cannot drift between them. A statusless connection/timeout
+    failure is ``transport``; an unrecognised SDK error stays unclassified.
     """
     if isinstance(exc, AdapterError):
         return exc
@@ -243,11 +356,17 @@ def wrap_anthropic_error(exc: Exception) -> AdapterError:
     if isinstance(status, int):
         retryable = status in (408, 429) or status >= 500
         return AdapterError(
-            f"anthropic API error (HTTP {status}): {exc}", retryable=retryable
+            f"anthropic API error (HTTP {status}): {exc}",
+            retryable=retryable,
+            fault=classify_http_fault(status, str(exc)),
         )
     name = type(exc).__name__
     if isinstance(exc, TimeoutError) or "Timeout" in name or "Connection" in name:
-        return AdapterError(f"anthropic connection error: {exc}", retryable=True)
+        return AdapterError(
+            f"anthropic connection error: {exc}",
+            retryable=True,
+            fault="transport",
+        )
     return AdapterError(f"anthropic SDK error: {name}: {exc}", retryable=False)
 
 
@@ -339,10 +458,15 @@ class AnthropicAdapter(ModelAdapter):
                     timeout=self._request_timeout,
                 )
             except (asyncio.TimeoutError, TimeoutError) as exc:
+                # Our own ``wait_for`` fired, so this never reaches
+                # :func:`wrap_anthropic_error`: classify it here or the hard
+                # timeout escapes the taxonomy (parity with the OpenAI
+                # adapter's identically-placed branch).
                 raise AdapterError(
                     f"model call exceeded {self._request_timeout}s hard "
                     "timeout (no response)",
                     retryable=True,
+                    fault="transport",
                 ) from exc
             except Exception as exc:
                 raise wrap_anthropic_error(exc) from exc

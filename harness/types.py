@@ -12,6 +12,7 @@ All models are pydantic v2 with strict-ish validation; enums are plain
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,11 +22,26 @@ __all__ = [
     "ToolSpec",
     "ToolCall",
     "ToolResult",
+    "DROPPED_ARGUMENTS_PREFIX_CHARS",
+    "DroppedToolCall",
     "Message",
     "Usage",
+    "IncompleteReason",
     "ModelResponse",
     "Capabilities",
 ]
+
+#: Why an adapter judged a turn to have ended without producing anything the
+#: agent loop can act on. The loop selects its re-prompt wording from this, so
+#: every member must correspond to advice a model can actually follow:
+#:
+#: - ``"dropped_calls"`` — at least one tool call was discarded because its
+#:   arguments could not be parsed (typically cut off mid-JSON).
+#: - ``"max_tokens"`` — the turn hit the output-token cap before producing a
+#:   tool call or a complete answer.
+#: - ``"no_finish_reason"`` — the provider ended the response without a stop
+#:   reason we recognise *and* left nothing usable in the message.
+IncompleteReason = Literal["max_tokens", "dropped_calls", "no_finish_reason"]
 
 
 class Role(str, Enum):
@@ -89,6 +105,37 @@ class ToolResult(BaseModel):
     is_error: bool = False
 
 
+#: Cap on :attr:`DroppedToolCall.raw_arguments_prefix`: enough to see where
+#: the provider cut the payload off, without carrying — or persisting — whole
+#: truncated file bodies (one observed fragment was ~21 KB). Adapters trim to
+#: this when reporting a drop and the agent loop trims again when writing the
+#: ``tool_call_dropped`` event, so neither side can widen it alone.
+DROPPED_ARGUMENTS_PREFIX_CHARS: int = 512
+
+
+class DroppedToolCall(BaseModel):
+    """A tool call the adapter discarded because it could not be parsed.
+
+    Providers cut a response off mid-generation — at the output-token cap, or
+    because the stream died — and a tool call caught by that cut arrives with
+    truncated JSON arguments. Raising would kill the run non-retryably over a
+    payload that is already spent, so adapters *drop* the call and report it
+    here instead; the agent loop persists one ``tool_call_dropped`` event per
+    entry, which is the only durable trace such a call leaves.
+
+    ``raw_arguments_prefix`` holds the leading characters of the provider's
+    unparseable argument string (enough to see where it was cut) and
+    ``raw_arguments_len`` the full length that prefix was taken from, so a
+    21 KB fragment is diagnosable without being stored.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tool_name: str
+    raw_arguments_prefix: str = ""
+    raw_arguments_len: int = 0
+
+
 class Message(BaseModel):
     """One transcript entry in the provider-neutral conversation format.
 
@@ -148,6 +195,35 @@ class Usage(BaseModel):
 class ModelResponse(BaseModel):
     """Everything the harness needs back from one adapter ``complete()`` call.
 
+    ``stop_reason`` is the harness's normalized enum; ``provider_stop_reason``
+    is the provider's **untranslated** stop string, verbatim (OpenAI
+    ``finish_reason``, Anthropic ``stop_reason``), or ``None`` when the
+    provider sent none. It exists because normalization is lossy: every
+    unknown or missing value collapses to :attr:`StopReason.ERROR`, so
+    "the stream ended with no terminal chunk", "the provider said ``stop``",
+    and "the provider sent a value we do not map" are indistinguishable after
+    mapping — and that distinction is exactly what post-hoc triage of a dead
+    turn needs. The agent loop persists it on each ``model_turn`` event,
+    which is the only place it is durably recorded (``raw`` is not
+    persisted). Nothing above the adapter layer may *branch* on its value:
+    it is evidence, not control flow.
+
+    ``incomplete`` says the turn ended without producing anything the loop can
+    act on, and ``incomplete_reason`` says why (see :data:`IncompleteReason`).
+    It is deliberately *not* derived from ``stop_reason`` at the loop: the two
+    answer different questions. ``stop_reason`` is a faithful translation of
+    what the provider said; ``incomplete`` is the adapter's judgement about
+    whether the translated message is usable — a turn can stop at
+    ``MAX_TOKENS`` and still carry a perfectly good tool call (not incomplete),
+    and one can stop at ``END_TURN`` having had its only tool call dropped
+    (incomplete). Keeping both means ``stop_reason`` stays truthful while the
+    loop still knows which of the three re-prompts to send.
+
+    ``dropped_tool_calls`` lists the calls the adapter discarded while
+    translating (see :class:`DroppedToolCall`). Translation is
+    side-effect-free by module contract, so adapters only *report* drops here;
+    persisting them is the agent loop's job.
+
     ``raw`` optionally holds the provider's original response (as a dict) for
     debugging and trace logging; nothing above the adapter layer may depend
     on its shape.
@@ -156,6 +232,10 @@ class ModelResponse(BaseModel):
     message: Message
     usage: Usage
     stop_reason: StopReason
+    provider_stop_reason: str | None = None
+    incomplete: bool = False
+    incomplete_reason: IncompleteReason | None = None
+    dropped_tool_calls: list[DroppedToolCall] = Field(default_factory=list)
     raw: dict | None = None
 
 
