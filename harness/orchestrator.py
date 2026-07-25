@@ -51,6 +51,7 @@ from harness.adapters.base import ModelAdapter
 from harness.config import HarnessConfig, PermissionMode
 from harness.context import ContextManager
 from harness.deadline import Deadline
+from harness.diligence import WrittenData
 from harness.loop import AgentLoop, AgentResult, AskCallable, Budgets
 from harness.memory.store import MemoryStore
 from harness.permissions import Policy, ToolMeta
@@ -187,12 +188,25 @@ class ToolDeps:
     skills: SkillLibrary
     store: RunStore
     run_id: str
+    #: The agent that owns these tools — the stream per-agent tool telemetry
+    #: (e.g. ``bash``'s ``exec_capped``, ``declare_verification``'s
+    #: ``verification_lint``) is written to. Distinct from ``run_id``: a
+    #: subagent's capped exec belongs on the subagent's own transcript, not
+    #: pooled into the run, or the telemetry cannot be attributed.
+    agent_id: str
     context: ContextManager
     #: The run's shared wall-clock deadline (``None`` = no deadline), so
     #: deadline-aware tools (e.g. a bash exec cap) can consult the same
     #: countdown as the loops. One instance per run: lead, subagents, and
     #: every tool factory all see the identical object.
     deadline: Deadline | None = None
+    #: Accessor for this agent's live :class:`~harness.diligence.WrittenData`
+    #: map, which the ``declare_verification`` lint reads. An accessor rather
+    #: than the map itself because the registry is built before the loop that
+    #: maintains it, and because the lint must see writes recorded *after*
+    #: the registry was assembled. ``None`` disables the lint (warn-only
+    #: either way — no control flow depends on it).
+    written_data: Callable[[], WrittenData | None] | None = None
 
 
 #: A tool factory: binds the live dependency bundle into a ready
@@ -205,7 +219,12 @@ ToolFactory = Callable[[ToolDeps], Tool]
 #: ``declare_verification`` (§10.3 B1 — the loop re-runs the declared
 #: command before accepting completion).
 CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
-    lambda deps: bash_tool(deps.sandbox, deadline=deps.deadline),
+    lambda deps: bash_tool(
+        deps.sandbox,
+        deadline=deps.deadline,
+        store=deps.store,
+        agent_id=deps.agent_id,
+    ),
     lambda deps: read_file_tool(deps.sandbox),
     lambda deps: write_file_tool(deps.sandbox),
     lambda deps: edit_file_tool(deps.sandbox),
@@ -217,7 +236,9 @@ CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
     lambda deps: load_skill_tool(deps.skills, deps.context),
     lambda deps: add_instruction_tool(deps.store, deps.run_id, deps.context),
     lambda deps: search_history_tool(deps.store, deps.run_id),
-    lambda deps: declare_verification_tool(),
+    lambda deps: declare_verification_tool(
+        deps.written_data, deps.store, deps.agent_id
+    ),
 )
 
 #: System prompt for the (same-adapter, v1) compaction summarizer call.
@@ -487,10 +508,13 @@ class Orchestrator:
           consumed — matching the live-run scoping, where every subagent
           gets its own fresh budget and spends nothing of the lead's. If
           nothing remains the loop pauses again immediately.
-          ``max_output_tokens`` and ``wall_clock_seconds`` carry through
-          unchanged: the former is a per-call cap with nothing to
-          subtract, and the wall clock restarts fresh on resume because
-          the external deadline it mirrors is per-invocation.
+          ``max_output_tokens``, ``wall_clock_seconds`` and
+          ``max_turns_is_hard`` carry through unchanged: the first is a
+          per-call cap with nothing to subtract, the wall clock restarts
+          fresh on resume because the external deadline it mirrors is
+          per-invocation, and the last is caller intent rather than a
+          consumable budget — dropping it would let the resumed loop
+          derive a clock-based turn rail and ignore the subtraction above.
           ``deadline`` (like :meth:`run_task`'s) is likewise
           per-invocation: pass a freshly anchored one, or rely on
           ``budgets.wall_clock_seconds`` for the self-built fallback.
@@ -544,11 +568,16 @@ class Orchestrator:
             max_turns=max(base.max_turns - turns_used, 0),
             max_tokens=max(base.max_tokens - tokens_used, 0),
             # Carried through unchanged: max_output_tokens is a per-call cap
-            # (nothing to subtract), and wall_clock_seconds restarts fresh —
+            # (nothing to subtract), wall_clock_seconds restarts fresh —
             # the external deadline it mirrors is per-invocation, so the
-            # resumed invocation gets the full window again.
+            # resumed invocation gets the full window again — and
+            # max_turns_is_hard is caller *intent*, not a consumable budget:
+            # dropping it would let the resumed loop derive a clock-based
+            # turn rail and blow straight past the ceiling the caller chose
+            # (and past the max_turns - turns_used subtraction just above).
             max_output_tokens=base.max_output_tokens,
             wall_clock_seconds=base.wall_clock_seconds,
+            max_turns_is_hard=base.max_turns_is_hard,
         )
         restored_grants = [
             event.payload["pattern"]
@@ -681,9 +710,11 @@ class Orchestrator:
         memory: MemoryStore,
         skills: SkillLibrary,
         run_id: str,
+        agent_id: str,
         context: ContextManager,
         tool_factories: Sequence[ToolFactory] | None = None,
         deadline: Deadline | None = None,
+        written_data: Callable[[], WrittenData | None] | None = None,
     ) -> ToolRegistry:
         """Build a registry from ``tool_factories`` bound to this run.
 
@@ -696,7 +727,12 @@ class Orchestrator:
         and ``add_instruction`` feeds its instruction ledger (§4.5).
         ``deadline`` is the run's shared wall-clock deadline (resolved at
         the top of :meth:`_execute`, *before* any registry is built, so
-        every factory sees it).
+        every factory sees it). ``agent_id`` is the owning agent, so a tool
+        that records its own telemetry (``bash``'s ``exec_capped``,
+        ``declare_verification``'s ``verification_lint``) writes it to that
+        agent's stream rather than to the lead's. ``written_data`` is the
+        accessor for that agent's live written-data map (the loop is built
+        after this registry, so it cannot be the map itself).
 
         This is the **subagent-shaped** registry: it deliberately excludes
         ``spawn_agent``/``await_agents`` (depth cap 1); :meth:`_execute`
@@ -708,8 +744,10 @@ class Orchestrator:
             skills=skills,
             store=self.store,
             run_id=run_id,
+            agent_id=agent_id,
             context=context,
             deadline=deadline,
+            written_data=written_data,
         )
         factories = (
             CODING_TOOL_FACTORIES if tool_factories is None else tool_factories
@@ -967,6 +1005,7 @@ class Orchestrator:
             context: ContextManager,
             agent_sandbox: Sandbox,
             declared_command: str | None = None,
+            written_data: WrittenData | None = None,
         ) -> AgentLoop:
             loop = AgentLoop(
                 adapter=adapter,
@@ -988,6 +1027,9 @@ class Orchestrator:
                 # The run's ONE shared deadline: a subagent spawned late
                 # in the run counts down from the same anchor as the lead.
                 deadline=deadline,
+                # The same map this agent's declare_verification accessor
+                # returns, so the lint sees what the loop observed.
+                written_data=written_data,
             )
             self._live_loops.append(loop)
             return loop
@@ -1040,6 +1082,9 @@ class Orchestrator:
                         await child_sandbox.start()
                     try:
                         child_context = build_context(child_adapter)
+                        # Per-agent, like the transcript it lints against:
+                        # a subagent's writes are not the lead's evidence.
+                        child_written = WrittenData()
                         # Subagents inherit the lead's tool factories (v1,
                         # §11.4) — same profile, minus spawn/await below.
                         child_registry = self._build_registry(
@@ -1047,9 +1092,11 @@ class Orchestrator:
                             memory,
                             skills,
                             run_id,
+                            agent_id,
                             child_context,
                             tool_factories,
                             deadline,
+                            lambda: child_written,
                         )
                         child_loop = build_loop(
                             child_adapter,
@@ -1057,6 +1104,7 @@ class Orchestrator:
                             agent_id,
                             child_context,
                             child_sandbox,
+                            written_data=child_written,
                         )
                         return await child_loop.run(prompt)
                     finally:
@@ -1115,8 +1163,17 @@ class Orchestrator:
 
         lead_adapter = make_adapter()
         lead_context = build_context(lead_adapter)
+        lead_written = WrittenData()
         lead_registry = self._build_registry(
-            sandbox, memory, skills, run_id, lead_context, tool_factories, deadline
+            sandbox,
+            memory,
+            skills,
+            run_id,
+            lead_agent_id,
+            lead_context,
+            tool_factories,
+            deadline,
+            lambda: lead_written,
         )
         lead_registry.register(_spawn_agent_tool(spawn_handler))
         lead_registry.register(_await_agents_tool(await_handler))
@@ -1132,6 +1189,7 @@ class Orchestrator:
             lead_context,
             sandbox,
             declared_command=replayed_declaration,
+            written_data=lead_written,
         )
 
         try:

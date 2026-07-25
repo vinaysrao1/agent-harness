@@ -473,6 +473,7 @@ def test_total_usage_aggregates_across_agents_and_models(store: RunStore) -> Non
         "cache_read_tokens": 5,
         "cache_write_tokens": 1,
         "duration_ms": 0,
+        "reasoning_tokens": 0,
     }
 
 
@@ -484,6 +485,7 @@ def test_total_usage_empty_run_is_all_zero(store: RunStore) -> None:
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "duration_ms": 0,
+        "reasoning_tokens": 0,
     }
 
 
@@ -513,6 +515,102 @@ def test_record_usage_with_duration_and_aggregate(store: RunStore) -> None:
     records = store.list_usage(run_id)
     assert [record.duration_ms for record in records] == [1500, 250, 0]
     assert store.total_usage(run_id)["duration_ms"] == 1750
+
+
+def test_record_usage_with_reasoning_tokens_and_aggregate(store: RunStore) -> None:
+    """Reasoning-token telemetry: per-call reasoning_tokens is stored,
+    listed, and summed by total_usage; omitting it defaults to 0."""
+    run_id = store.create_run("g", "m", "gated")
+    agent_id = store.create_agent(run_id, "prompt")
+    store.record_usage(
+        run_id,
+        agent_id,
+        "opus",
+        Usage(input_tokens=1, output_tokens=100, reasoning_tokens=40),
+    )
+    store.record_usage(
+        run_id,
+        agent_id,
+        "opus",
+        Usage(input_tokens=1, output_tokens=50, reasoning_tokens=10),
+    )
+    store.record_usage(run_id, agent_id, "opus", Usage(input_tokens=1, output_tokens=1))
+
+    records = store.list_usage(run_id)
+    assert [r.usage.reasoning_tokens for r in records] == [40, 10, 0]
+    assert store.total_usage(run_id)["reasoning_tokens"] == 50
+
+
+def test_open_pre_reasoning_tokens_schema_db_migrates_cleanly(
+    db_path: Path,
+) -> None:
+    """A database created before ``reasoning_tokens`` existed (but after
+    ``duration_ms`` was added) opens without crashing; old rows read back as
+    reasoning_tokens 0 and new rows record the field normally."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+            id               TEXT PRIMARY KEY,
+            created_at       TEXT NOT NULL,
+            goal             TEXT NOT NULL,
+            model            TEXT NOT NULL,
+            permission_mode  TEXT NOT NULL,
+            status           TEXT NOT NULL
+        );
+        CREATE TABLE agents (
+            id               TEXT PRIMARY KEY,
+            run_id           TEXT NOT NULL REFERENCES runs(id),
+            parent_agent_id  TEXT REFERENCES agents(id),
+            prompt           TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            created_at       TEXT NOT NULL
+        );
+        CREATE TABLE usage (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id              TEXT NOT NULL REFERENCES runs(id),
+            agent_id            TEXT REFERENCES agents(id),
+            model               TEXT NOT NULL,
+            input_tokens        INTEGER NOT NULL,
+            output_tokens       INTEGER NOT NULL,
+            cache_read_tokens   INTEGER NOT NULL,
+            cache_write_tokens  INTEGER NOT NULL,
+            duration_ms         INTEGER NOT NULL DEFAULT 0,
+            created_at          TEXT NOT NULL
+        );
+        INSERT INTO runs VALUES ('r1', 't0', 'old goal', 'opus', 'gated', 'completed');
+        INSERT INTO agents VALUES ('a1', 'r1', NULL, 'old prompt', 'completed', 't0');
+        INSERT INTO usage (run_id, agent_id, model, input_tokens,
+            output_tokens, cache_read_tokens, cache_write_tokens,
+            duration_ms, created_at)
+        VALUES ('r1', 'a1', 'opus', 10, 5, 0, 0, 100, 't0');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = RunStore(db_path)  # must not crash on the old schema
+    try:
+        records = store.list_usage("r1")
+        assert len(records) == 1
+        assert records[0].usage.reasoning_tokens == 0
+        assert records[0].usage.input_tokens == 10
+        assert records[0].duration_ms == 100  # untouched by this migration
+
+        store.record_usage(
+            "r1", "a1", "opus", Usage(input_tokens=1, reasoning_tokens=7)
+        )
+        assert store.total_usage("r1")["reasoning_tokens"] == 7
+
+        # Reopening again (already-migrated schema) is a no-op, not an error.
+        store.close()
+        store = RunStore(db_path)
+        assert [r.usage.reasoning_tokens for r in store.list_usage("r1")] == [
+            0,
+            7,
+        ]
+    finally:
+        store.close()
 
 
 def test_open_pre_duration_schema_db_migrates_cleanly(db_path: Path) -> None:
@@ -647,6 +745,7 @@ def test_resume_flow_reopen_reloads_identical_state(db_path: Path) -> None:
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
             "duration_ms": 0,
+            "reasoning_tokens": 0,
         }
 
         # Resumed store can keep appending right after the last seq.

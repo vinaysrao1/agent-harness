@@ -588,6 +588,60 @@ async def test_resume_carries_output_token_and_wall_clock_budgets(
     assert remaining.wall_clock_seconds == 2400.0  # restarts fresh, full value
 
 
+async def test_resume_carries_hard_turn_ceiling_under_a_deadline(
+    orchestrator: Orchestrator,
+    store: RunStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: resume_task rebuilt the remaining Budgets field by field
+    and dropped ``max_turns_is_hard`` — the *only* guard against the loop
+    deriving its turn ceiling from the wall clock. A resumed run with an
+    explicitly chosen ceiling and a deadline therefore silently got
+    ``max(remaining_turns, budget / MIN_SECONDS_PER_TURN)`` instead, blowing
+    past both the caller's ceiling and resume's own turns-used subtraction.
+    The flag is caller intent, not a consumable budget: it must carry."""
+    first = FakeAdapter(
+        [resp(calls=[call("c1", "write_file", path="hello.txt", content="hi")])]
+    )
+    run_id, paused = await orchestrator.run_task(
+        GOAL,
+        "fake-model",
+        adapter_override=first,
+        budgets=Budgets(max_turns=1, max_turns_is_hard=True),
+    )
+    assert paused.status == "paused_budget"
+
+    captured: dict[str, Budgets] = {}
+    real_execute = Orchestrator._execute
+
+    async def spy_execute(self, **kwargs):
+        captured["budgets"] = kwargs["budgets"]
+        return await real_execute(self, **kwargs)
+
+    monkeypatch.setattr(Orchestrator, "_execute", spy_execute)
+
+    # Two scripted responses, but only one turn of ceiling left. A 1800s
+    # deadline would derive a 360-turn rail if the flag were dropped, so the
+    # resumed loop would happily consume both and finish.
+    second = FakeAdapter(
+        [
+            resp(calls=[call("c2", "write_file", path="two.txt", content="2")]),
+            resp(CLEAN_FINISH),
+        ]
+    )
+    result = await orchestrator.resume_task(
+        run_id,
+        adapter_override=second,
+        budgets=Budgets(max_turns=2, max_turns_is_hard=True),
+        deadline=Deadline(1800.0),
+    )
+
+    assert captured["budgets"].max_turns == 1  # one turn already consumed
+    assert captured["budgets"].max_turns_is_hard is True  # carried, not dropped
+    assert len(second.calls) == 1  # the ceiling held; the clock rail did not
+    assert result.status == "paused_budget"
+
+
 # -- crash-resume: dangling tool calls ---------------------------------------
 
 

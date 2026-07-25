@@ -310,6 +310,14 @@ class TestFromAnthropicResponse:
         assert usage.cache_read_tokens == 0
         assert usage.cache_write_tokens == 0
 
+    def test_reasoning_tokens_always_zero(self) -> None:
+        # Anthropic thinking is not wired up (round-3 prerequisite: a
+        # thinking-block passthrough field on Message, which does not exist
+        # yet). This adapter must never report reasoning_tokens, whatever the
+        # response carries — a stray attribute must not leak through.
+        resp = fake_response(content=[SimpleNamespace(type="text", text="hi")])
+        assert from_anthropic_response(resp).usage.reasoning_tokens == 0
+
     def test_empty_content_gets_a_placeholder_body(self) -> None:
         # Parity with the OpenAI-compatible adapter: an assistant message with
         # nothing in it must never be produced, because replaying one forces
@@ -641,6 +649,26 @@ class TestComplete:
         ]
         # last transcript block carries the second cache breakpoint
         assert kwargs["messages"][-1]["content"][-1]["cache_control"] == EPHEMERAL
+
+    async def test_never_sends_thinking_or_output_config(self) -> None:
+        # Guard against an accidental re-introduction of Anthropic reasoning
+        # mapping: thinking={"type":"enabled","budget_tokens":N} returns
+        # HTTP 400 on every current Anthropic model, and this harness
+        # discards thinking blocks the API requires echoed back on
+        # multi-turn tool use (round-3 prerequisite, not yet built). No
+        # reasoning-shaped key may ever be sent until that lands.
+        client = fake_client(
+            [fake_response(content=[SimpleNamespace(type="text", text="ok")])]
+        )
+        adapter = AnthropicAdapter("claude-opus-4-8", client=client)
+        await adapter.complete(
+            [Message(role=Role.USER, content="hi")],
+            [ToolSpec(name="bash", description="run", input_schema={})],
+            system="rules",
+        )
+        (kwargs,) = client.messages.calls
+        assert "thinking" not in kwargs
+        assert "output_config" not in kwargs
 
     async def test_omits_system_and_tools_when_absent(self) -> None:
         client = fake_client(

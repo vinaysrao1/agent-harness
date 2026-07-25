@@ -371,6 +371,49 @@ class TestFromOpenAIResponse:
         assert usage.input_tokens == 1
         assert usage.cache_read_tokens == 0
         assert usage.cache_write_tokens == 0
+        assert usage.reasoning_tokens == 0
+
+    def test_reasoning_tokens_read_from_completion_tokens_details(self) -> None:
+        resp = fake_response(
+            usage=SimpleNamespace(
+                prompt_tokens=7,
+                completion_tokens=100,
+                completion_tokens_details=SimpleNamespace(
+                    reasoning_tokens=1234
+                ),
+            )
+        )
+        usage = from_openai_response(resp).usage
+        assert usage.reasoning_tokens == 1234
+        # reasoning_tokens is a SUBSET of completion_tokens, not additional
+        # traffic on top of it — output_tokens must not be reduced by it,
+        # unlike the cache-token subtraction applied to input_tokens.
+        assert usage.output_tokens == 100
+
+    def test_reasoning_tokens_absent_completion_tokens_details_default_zero(
+        self,
+    ) -> None:
+        resp = fake_response(
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3)
+        )
+        assert from_openai_response(resp).usage.reasoning_tokens == 0
+
+    def test_reasoning_tokens_none_default_zero(self) -> None:
+        resp = fake_response(
+            usage=SimpleNamespace(
+                prompt_tokens=7,
+                completion_tokens=3,
+                completion_tokens_details=SimpleNamespace(
+                    reasoning_tokens=None
+                ),
+            )
+        )
+        assert from_openai_response(resp).usage.reasoning_tokens == 0
+
+    def test_reasoning_tokens_usage_none_default_zero(self) -> None:
+        resp = fake_response(content="hi")
+        resp.usage = None
+        assert from_openai_response(resp).usage.reasoning_tokens == 0
 
     def test_input_tokens_exclude_cache_traffic(self) -> None:
         """Regression: OpenAI's prompt_tokens INCLUDES cached tokens
@@ -1447,6 +1490,22 @@ class TestAccumulateStreamChunks:
         assert translated.usage.input_tokens == 300  # 1000 - 700 cached
         assert translated.usage.output_tokens == 42
         assert translated.usage.cache_read_tokens == 700
+
+    def test_reasoning_tokens_carried_through_terminal_usage_chunk(self) -> None:
+        # Regression: the fold must carry completion_tokens_details through
+        # the final usage-only chunk (choices == []), the same object the
+        # non-streamed path reads reasoning_tokens off of.
+        usage = SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=42,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=17),
+        )
+        resp = accumulate_stream_chunks(
+            [stream_chunk(content="hi"), stream_chunk(finish_reason="stop", usage=usage)]
+        )
+        translated = from_openai_response(resp)
+        assert translated.usage.reasoning_tokens == 17
+        assert translated.usage.output_tokens == 42
 
     def test_content_less_stream_collapses_to_retryable_no_choices(self) -> None:
         # A stream that yields only a usage chunk (no content, no tool calls, no

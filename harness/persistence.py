@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_read_tokens   INTEGER NOT NULL,
     cache_write_tokens  INTEGER NOT NULL,
     duration_ms         INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL
 );
 """
@@ -291,8 +292,9 @@ class RunStore:
 
         ``CREATE TABLE IF NOT EXISTS`` leaves tables created by an older
         harness untouched, so columns added since then are applied here via
-        ``ALTER TABLE`` — currently just ``usage.duration_ms`` (DESIGN.md
-        §10.2 A5). Idempotent: opening an up-to-date database is a no-op.
+        ``ALTER TABLE`` — ``usage.duration_ms`` (DESIGN.md §10.2 A5) and
+        ``usage.reasoning_tokens`` (reasoning-token telemetry, openai_compat
+        only). Idempotent: opening an up-to-date database is a no-op.
         """
         usage_columns = {
             row["name"]
@@ -303,6 +305,12 @@ class RunStore:
                 self._conn.execute(
                     "ALTER TABLE usage ADD COLUMN "
                     "duration_ms INTEGER NOT NULL DEFAULT 0"
+                )
+        if "reasoning_tokens" not in usage_columns:
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE usage ADD COLUMN "
+                    "reasoning_tokens INTEGER NOT NULL DEFAULT 0"
                 )
 
     def close(self) -> None:
@@ -646,7 +654,8 @@ class RunStore:
             cur = self._conn.execute(
                 "INSERT INTO usage (run_id, agent_id, model, input_tokens, "
                 "output_tokens, cache_read_tokens, cache_write_tokens, "
-                "duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "duration_ms, reasoning_tokens, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     agent_id,
@@ -656,6 +665,7 @@ class RunStore:
                     usage.cache_read_tokens,
                     usage.cache_write_tokens,
                     duration_ms,
+                    usage.reasoning_tokens,
                     created_at,
                 ),
             )
@@ -677,6 +687,7 @@ class RunStore:
                     output_tokens=row["output_tokens"],
                     cache_read_tokens=row["cache_read_tokens"],
                     cache_write_tokens=row["cache_write_tokens"],
+                    reasoning_tokens=row["reasoning_tokens"],
                 ),
                 duration_ms=row["duration_ms"],
                 created_at=row["created_at"],
@@ -689,9 +700,10 @@ class RunStore:
 
         Returns a dict with the same field names as :class:`~harness.types.Usage`
         (``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
-        ``cache_write_tokens``), plus ``duration_ms`` (total wall-clock time
-        across the run's model calls, §10.2 A5), summed across every agent
-        and model. Missing usage rows sum to ``0``, never ``NULL``.
+        ``cache_write_tokens``, ``reasoning_tokens``), plus ``duration_ms``
+        (total wall-clock time across the run's model calls, §10.2 A5),
+        summed across every agent and model. Missing usage rows sum to ``0``,
+        never ``NULL``.
         """
         row = self._conn.execute(
             """
@@ -700,7 +712,8 @@ class RunStore:
                 COALESCE(SUM(output_tokens), 0)      AS output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0)  AS cache_read_tokens,
                 COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
-                COALESCE(SUM(duration_ms), 0)        AS duration_ms
+                COALESCE(SUM(duration_ms), 0)        AS duration_ms,
+                COALESCE(SUM(reasoning_tokens), 0)   AS reasoning_tokens
             FROM usage WHERE run_id = ?
             """,
             (run_id,),
@@ -711,6 +724,7 @@ class RunStore:
             "cache_read_tokens": row["cache_read_tokens"],
             "cache_write_tokens": row["cache_write_tokens"],
             "duration_ms": row["duration_ms"],
+            "reasoning_tokens": row["reasoning_tokens"],
         }
 
 

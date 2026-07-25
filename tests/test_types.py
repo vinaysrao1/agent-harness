@@ -111,6 +111,7 @@ class TestUsage:
         u = Usage()
         assert (u.input_tokens, u.output_tokens) == (0, 0)
         assert (u.cache_read_tokens, u.cache_write_tokens) == (0, 0)
+        assert u.reasoning_tokens == 0
 
     def test_addition(self):
         a = Usage(input_tokens=10, output_tokens=5, cache_read_tokens=2)
@@ -122,6 +123,15 @@ class TestUsage:
             cache_read_tokens=2,
             cache_write_tokens=7,
         )
+
+    def test_addition_sums_reasoning_tokens(self):
+        a = Usage(output_tokens=10, reasoning_tokens=4)
+        b = Usage(output_tokens=5, reasoning_tokens=3)
+        total = a + b
+        assert total.reasoning_tokens == 7
+        # reasoning_tokens is a subset of output_tokens, not a sibling
+        # traffic bucket: it is never subtracted from output_tokens.
+        assert total.output_tokens == 15
 
     def test_addition_does_not_mutate_operands(self):
         a = Usage(input_tokens=1)
@@ -141,6 +151,10 @@ class TestUsage:
 
     def test_round_trip(self):
         u = Usage(input_tokens=1, output_tokens=2, cache_read_tokens=3)
+        assert Usage.model_validate_json(u.model_dump_json()) == u
+
+    def test_round_trip_with_reasoning_tokens(self):
+        u = Usage(output_tokens=10, reasoning_tokens=4)
         assert Usage.model_validate_json(u.model_dump_json()) == u
 
 

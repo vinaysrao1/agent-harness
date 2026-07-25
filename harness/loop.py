@@ -12,7 +12,10 @@ nothing.
 Loop shape per turn:
 
 1. Check budgets — exceeded means pause resumably (``paused_budget``), never
-   a hard failure (§4.9: "budgets are pause-points, not failures").
+   a hard failure (§4.9: "budgets are pause-points, not failures"). With a
+   wall-clock deadline and no caller-chosen turn ceiling, the turn budget is
+   raised to a clock-derived runaway rail (:data:`MIN_SECONDS_PER_TURN`) so a
+   turn count cannot end a run that still has time to work.
 2. ``await context.maybe_compact()`` repeatedly until the assembly is back
    under the threshold (or compaction stops shrinking the transcript) —
    each evicted span is persisted as a ``compaction`` event together with
@@ -41,12 +44,15 @@ Loop shape per turn:
 5. If it carries none but the response is ``incomplete`` (nothing usable came
    back — a cap-truncated turn, a dropped tool call, a response that just
    ended), re-prompt with wording matching the cause, up to
-   :data:`MAX_TRUNCATION_CONTINUES` times. Two guards bound the cost: a
-   re-prompt the remaining wall-clock cannot fund is skipped
-   (``truncation_continue_skipped``, pausing resumably), and a budget spent
-   entirely on unparseable provider replies ends the run as ``error`` with
-   ``malformed_response`` rather than banking a placeholder as a clean
-   completion.
+   :data:`MAX_TRUNCATION_CONTINUES` times — with the "too long, write it in
+   smaller pieces" wording whenever the dropped call coincided with the
+   per-call output cap, since that turn was cut for length, not corrupted.
+   Two guards bound the cost: a re-prompt the remaining wall-clock cannot
+   fund — priced on the *typical* recent call, not the expensive one that
+   triggered this step — is skipped (``truncation_continue_skipped``, pausing
+   resumably), and a budget spent entirely on *unprompted* unparseable
+   provider replies ends the run as ``error`` with ``malformed_response``
+   rather than banking a placeholder as a clean completion.
 6. Otherwise: run :func:`harness.diligence.looks_unfinished`; an
    unfinished-looking answer earns a continue-reminder nudge (bounded by
    :data:`~harness.diligence.MAX_NUDGES`). Then, if the model declared a
@@ -72,6 +78,7 @@ Loop shape per turn:
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable
 from typing import Literal
@@ -81,10 +88,12 @@ from pydantic import BaseModel, ConfigDict
 from harness.adapters.base import AdapterError, ModelAdapter
 from harness.context import ContextManager
 from harness.deadline import (
-    EXEC_CAP_FLOOR_SECONDS,
-    EXEC_RESERVE_SECONDS,
     WALL_CLOCK_STOP_FLOOR,
+    WIND_DOWN_FRACTION,
+    WIND_DOWN_MAX_REMAINING,
+    WIND_DOWN_MIN_REMAINING,
     Deadline,
+    wind_down_threshold,
 )
 from harness.diligence import (
     CONTINUE_REMINDER,
@@ -92,7 +101,10 @@ from harness.diligence import (
     VERIFICATION_FAILED_REMINDER,
     VERIFICATION_TIMEOUT_SECONDS,
     VERIFICATION_TOOL_NAME,
+    WrittenData,
+    lint_verification,
     looks_unfinished,
+    record_written_data,
     truncate_verification_output,
 )
 from harness.permissions import Decision, Policy, ToolMeta, evaluate
@@ -114,6 +126,10 @@ __all__ = [
     "AgentResult",
     "AskCallable",
     "AgentLoop",
+    "MIN_SECONDS_PER_TURN",
+    "WIND_DOWN_FRACTION",
+    "WIND_DOWN_MAX_REMAINING",
+    "WIND_DOWN_MIN_REMAINING",
     "wind_down_threshold",
 ]
 
@@ -173,40 +189,13 @@ TRUNCATION_REMINDERS: dict[str, str] = {
     ),
 }
 
-#: Fraction of the wall-clock budget remaining at which the loop injects the
-#: one-time wind-down reminder (below), clamped by the two bounds that
-#: follow — see :func:`wind_down_threshold`. Chosen to leave the agent one
-#: or two turns to land a best-effort answer on disk before an external
-#: deadline (e.g. a benchmark harness's per-agent timeout) kills the trial
-#: mid-turn.
-WIND_DOWN_FRACTION = 0.2
-
-#: Floor on the wind-down threshold: single (slow-provider) model calls have
-#: been observed to run up to ~271s, so a raw 0.2 fraction of a 900s budget
-#: (180s) can vanish inside ONE call — the reminder would land with nothing
-#: left to act on.
-WIND_DOWN_MIN_REMAINING = 300.0
-
-#: Ceiling on the wind-down threshold: 0.2 of a 12000s budget would wind the
-#: run down with 2400s still left — disabling diligence nudges for 40
-#: minutes of perfectly usable time.
-WIND_DOWN_MAX_REMAINING = 600.0
-
-
-def wind_down_threshold(budget: float) -> float:
-    """The remaining-seconds threshold at which wind-down fires for ``budget``.
-
-    ``WIND_DOWN_FRACTION`` of the budget, clamped to the
-    [:data:`WIND_DOWN_MIN_REMAINING`, :data:`WIND_DOWN_MAX_REMAINING`] band —
-    and never more than half the budget, so degenerate tiny budgets still get
-    at least half the run before the reminder lands.
-    """
-    return min(
-        max(WIND_DOWN_FRACTION * budget, WIND_DOWN_MIN_REMAINING),
-        WIND_DOWN_MAX_REMAINING,
-        0.5 * budget,
-    )
-
+#: The wind-down band (:data:`WIND_DOWN_FRACTION`,
+#: :data:`WIND_DOWN_MIN_REMAINING`, :data:`WIND_DOWN_MAX_REMAINING`,
+#: :func:`wind_down_threshold`) is defined in :mod:`harness.deadline` and
+#: re-exported here: :meth:`Deadline.exec_cap` needs the threshold to make
+#: its band guarantee, and the tools layer must reach it without importing
+#: the loop. Every pre-existing ``from harness.loop import ...`` of these
+#: four names keeps working.
 
 #: Injected once as a user message when the wall-clock budget is nearly spent.
 #: Unlike the diligence nudge (which pushes the agent to keep working), this
@@ -225,6 +214,16 @@ WIND_DOWN_REMINDER: str = (
 )
 
 
+#: Floor on how long a turn can plausibly take, used to derive a runaway
+#: turn rail from a wall-clock budget (see :class:`Budgets.max_turns_is_hard`
+#: and step 1 of :meth:`AgentLoop.run`). Calibrated to the p10 of observed
+#: model-call durations (4.8s): a run cannot sustain more than one turn per
+#: this many seconds, so ``budget / MIN_SECONDS_PER_TURN`` turns is a ceiling
+#: the wall clock will always reach first — which is the point. It exists to
+#: stop a zero-cost infinite loop, not to ration turns.
+MIN_SECONDS_PER_TURN: float = 5.0
+
+
 class Budgets(BaseModel):
     """Per-run loop budgets (DESIGN.md §4.1). Hitting one pauses, not kills.
 
@@ -236,6 +235,13 @@ class Budgets(BaseModel):
     :data:`WIND_DOWN_REMINDER`) when a hard external deadline applies; ``None``
     disables it. Both default off, so nothing changes for callers that do not
     set them.
+
+    ``max_turns_is_hard`` says the caller *chose* this turn ceiling and means
+    it. When it is false (the default) and the run has a wall-clock deadline,
+    the loop treats ``max_turns`` as a floor and raises it to a runaway rail
+    derived from the clock (:data:`MIN_SECONDS_PER_TURN`), so the deadline —
+    not an arbitrary turn count — is what ends a run that still has time
+    left. Callers that never supply a deadline are unaffected either way.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -244,6 +250,7 @@ class Budgets(BaseModel):
     max_tokens: int = 1_000_000
     max_output_tokens: int | None = None
     wall_clock_seconds: float | None = None
+    max_turns_is_hard: bool = False
 
 
 class AgentResult(BaseModel):
@@ -327,6 +334,13 @@ class AgentLoop:
         subagent whose *first* check is already past the wind-down
         threshold is deliberately born wound-down (the reminder lands on
         its turn 1).
+    written_data:
+        The bounded :class:`~harness.diligence.WrittenData` map the
+        verification-quality lint reads (Change 4). Pass the *same*
+        instance the ``declare_verification`` tool's accessor returns, so
+        the tool lints against what this loop has actually observed;
+        ``None`` (the default) makes the loop own a private one, which is
+        still maintained but is only read at the completion gate.
     """
 
     def __init__(
@@ -346,6 +360,7 @@ class AgentLoop:
         sandbox: Sandbox | None = None,
         declared_command: str | None = None,
         deadline: Deadline | None = None,
+        written_data: WrittenData | None = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -369,6 +384,16 @@ class AgentLoop:
         #: falls back to a self-built one from ``budgets.wall_clock_seconds``
         #: when this is None.
         self.deadline = deadline
+        #: What this agent has written where (Change 4): fed from the
+        #: tool-call stream, read by the verification-quality lint. Loop
+        #: state, not context state, so compaction cannot erase it; not
+        #: persisted, so a resumed run starts empty and simply lints less
+        #: (acceptable while the lint only warns). Shared with the tool
+        #: registry via an accessor, which is why the caller may pass one
+        #: in rather than let the loop own it privately.
+        self.written_data = (
+            written_data if written_data is not None else WrittenData()
+        )
         #: Monotonic counter for synthetic verification-execution tool-call
         #: ids, so each execution's permission decision is auditable on its
         #: own row (§4.11: every decision is logged).
@@ -441,6 +466,7 @@ class AgentLoop:
                 "provider_stop_reason": response.provider_stop_reason,
                 "stop_reason": response.stop_reason.value,
                 "output_tokens": response.usage.output_tokens,
+                "reasoning_tokens": response.usage.reasoning_tokens,
                 "duration_ms": duration_ms,
                 "tool_call_count": len(response.message.tool_calls),
                 "content_chars": len(response.message.content or ""),
@@ -626,8 +652,16 @@ class AgentLoop:
 
         ``deadline`` (wind-down plan §Fix 3b), when given, caps
         :data:`~harness.diligence.VERIFICATION_TIMEOUT_SECONDS` by what
-        wall-clock is actually left, mirroring the ``bash`` tool's cap
-        (:func:`~harness.tools.builtin.bash_tool`). When the cap bites,
+        wall-clock is actually left, via
+        :meth:`~harness.deadline.Deadline.exec_cap` with
+        ``purpose="verification"`` — the exec cap's plain landing-reserve
+        shape, deliberately exempt from the share cap and the band softener
+        that bound the ``bash`` tool
+        (:func:`~harness.tools.builtin.bash_tool`). Verification runs at
+        completion by definition, and shortening it would turn a legitimate
+        check into ``timed_out`` + ``timeout_capped``, which this loop reads
+        as *inconclusive* and accepts — silently demoting a passing gate to
+        a non-gate. When the cap bites,
         ``payload["timeout_capped"]`` and ``payload["timeout_seconds"]``
         (the timeout actually applied) are set regardless of whether the
         run then times out or passes within the shorter window — the loop
@@ -646,15 +680,12 @@ class AgentLoop:
                 ),
                 "denied": True,
             }
-        remaining = deadline.remaining() if deadline is not None else None
-        if remaining is None:
-            effective = VERIFICATION_TIMEOUT_SECONDS
+        if deadline is None:
+            effective, timeout_capped = VERIFICATION_TIMEOUT_SECONDS, False
         else:
-            effective = min(
-                VERIFICATION_TIMEOUT_SECONDS,
-                max(EXEC_CAP_FLOOR_SECONDS, remaining - EXEC_RESERVE_SECONDS),
+            effective, timeout_capped, _reason = deadline.exec_cap(
+                VERIFICATION_TIMEOUT_SECONDS, purpose="verification"
             )
-        timeout_capped = effective < VERIFICATION_TIMEOUT_SECONDS
         try:
             result = await self.sandbox.exec(command, timeout=effective)
         except Exception as exc:  # noqa: BLE001 - any sandbox failure is a
@@ -710,6 +741,18 @@ class AgentLoop:
         # re-prompt hit an unparseable provider reply and the run failed for
         # provider reasons, not the model's (step 5a).
         truncation_continues_with_drops = 0
+        # Continues spent re-prompting a turn that dropped its calls *after*
+        # the loop had already told the model its output was too long. Those
+        # drops are a model-capability outcome, not a provider fault, so they
+        # are counted here instead of above — otherwise a model that cannot
+        # shorten its writes would be reported as a broken provider (step 5a).
+        constrained_retries = 0
+        # Whether the last re-prompt this loop sent was the length-constrained
+        # one — i.e. whether the next drop counts as "prompted". It stays set
+        # until the next re-prompt decision replaces it, so a drop that
+        # follows the warning is attributed to the model whether or not a
+        # working turn intervened.
+        constrained_pending = False
         # Wall-clock cost of the most recent model call, used to decide whether
         # another re-prompt can still fit in the remaining budget (step 5a).
         last_call_seconds = 0.0
@@ -726,6 +769,25 @@ class AgentLoop:
         deadline = self.deadline
         if deadline is None and self.budgets.wall_clock_seconds is not None:
             deadline = Deadline(self.budgets.wall_clock_seconds, self.clock)
+        # The effective turn ceiling. A fixed turn count is the wrong rail
+        # when a wall clock is already counting down: an 80-turn ceiling was
+        # observed ending a trial at turn 80 with 36% of its wall-clock
+        # budget unspent, which is pure waste — the clock, not the turn
+        # count, is the resource the run is actually racing. So unless the
+        # caller explicitly set a ceiling (max_turns_is_hard), derive a
+        # runaway rail from the budget instead and keep whichever is larger.
+        # Derived per-loop, not once per run: a subagent shares the deadline
+        # but has its own Budgets. The token ceiling still binds
+        # independently, and without a deadline nothing changes at all.
+        max_turns = self.budgets.max_turns
+        if (
+            not self.budgets.max_turns_is_hard
+            and deadline is not None
+            and deadline.budget is not None
+        ):
+            max_turns = max(
+                max_turns, math.ceil(deadline.budget / MIN_SECONDS_PER_TURN)
+            )
         call_params: dict[str, object] = {}
         if self.budgets.max_output_tokens is not None:
             call_params["max_tokens"] = self.budgets.max_output_tokens
@@ -733,7 +795,7 @@ class AgentLoop:
         while True:
             # 1. Budgets: pause resumably, never fail (§4.9).
             spent = total_usage.input_tokens + total_usage.output_tokens
-            if turns >= self.budgets.max_turns or spent >= self.budgets.max_tokens:
+            if turns >= max_turns or spent >= self.budgets.max_tokens:
                 return self._finish("paused_budget", None, total_usage, turns)
 
             # 1a. Wall-clock hard stop: below the exec reserve, nothing new
@@ -835,6 +897,11 @@ class AgentLoop:
             # the model_turn event, and step 5a's deadline check, so none of
             # the three can disagree about what this call cost.
             last_call_seconds = self.clock() - call_started
+            # Feed the deadline's rolling latency window: the landing
+            # reserve held back from every capped exec is sized from what
+            # this provider's calls actually cost, not from a flat guess.
+            if deadline is not None:
+                deadline.observe_model_call(last_call_seconds)
             duration_ms = int(last_call_seconds * 1000)
             self.store.record_usage(
                 self.run_id,
@@ -872,10 +939,16 @@ class AgentLoop:
                 for tool_call, result in zip(
                     response.message.tool_calls, results
                 ):
-                    if (
-                        tool_call.name == VERIFICATION_TOOL_NAME
-                        and not result.is_error
-                    ):
+                    if result.is_error:
+                        continue
+                    # Same stream, same success test (Change 4): what the
+                    # agent wrote into which file, for the tautology
+                    # detector. A failed or denied call wrote nothing, so
+                    # it must not teach the lint that it did.
+                    record_written_data(
+                        self.written_data, tool_call.name, tool_call.arguments
+                    )
+                    if tool_call.name == VERIFICATION_TOOL_NAME:
                         declared_command = str(
                             tool_call.arguments.get("command", "")
                         )
@@ -905,15 +978,33 @@ class AgentLoop:
                     # calls are the dominant cost here — one observed
                     # cap-truncated reasoning turn burned 299s of a 900s budget
                     # — so once the remaining wall-clock cannot fund two more
-                    # calls at the last one's price, continuing just converts a
+                    # calls at the *typical* price, continuing just converts a
                     # fast failure into a slow one that also loses the budget
                     # the continue exists to protect.
+                    #
+                    # Priced on the median of the deadline's rolling window,
+                    # not on the last call: the turn that triggers this step is
+                    # by construction the expensive one (it ran to the output
+                    # cap), so pricing the next call at *its* cost is
+                    # systematically pessimistic. One observed trial paused
+                    # with 267.6s left because a single 225.5s outlier priced a
+                    # median-9.0s run. The stop floor is the other half of the
+                    # guard: below it the loop starts nothing new anyway, so a
+                    # re-prompt there is guaranteed waste however cheap calls
+                    # have been.
                     remaining_now = (
                         deadline.remaining() if deadline is not None else None
                     )
-                    if (
-                        remaining_now is not None
-                        and remaining_now < 2 * last_call_seconds
+                    typical_call_seconds = (
+                        deadline.recent_call_median()
+                        if deadline is not None
+                        else None
+                    )
+                    if typical_call_seconds is None:
+                        typical_call_seconds = last_call_seconds
+                    if remaining_now is not None and (
+                        remaining_now < WALL_CLOCK_STOP_FLOOR
+                        or remaining_now < 2 * typical_call_seconds
                     ):
                         self.store.append_event(
                             self.agent_id,
@@ -922,6 +1013,7 @@ class AgentLoop:
                                 "reason": "deadline",
                                 "remaining_seconds": remaining_now,
                                 "last_call_seconds": last_call_seconds,
+                                "typical_call_seconds": typical_call_seconds,
                                 "incomplete_reason": response.incomplete_reason,
                             },
                         )
@@ -929,13 +1021,44 @@ class AgentLoop:
                             "paused_budget", None, total_usage, turns
                         )
 
+                    # Was this turn's drop a *length* problem? A call the
+                    # adapter dropped on a turn that also ran to the
+                    # output-token cap was not corrupted in transit: the model
+                    # simply wrote more than one call could carry (one observed
+                    # drop was 26 KB of C source). The cause is length, so send
+                    # the wording that says to write the file in smaller
+                    # pieces rather than the "your call was cut off, re-issue
+                    # it" text, which invites the same oversized call again.
+                    # The per-call cap itself is deliberately left alone —
+                    # lowering it makes the very truncation this branch is
+                    # handling more likely.
+                    at_output_cap = (
+                        self.budgets.max_output_tokens is not None
+                        and response.usage.output_tokens
+                        >= self.budgets.max_output_tokens
+                    )
+                    length_bound = (
+                        bool(response.dropped_tool_calls) and at_output_cap
+                    )
+
                     truncation_continues += 1
                     if response.dropped_tool_calls:
-                        truncation_continues_with_drops += 1
-                    reminder = TRUNCATION_REMINDERS.get(
-                        response.incomplete_reason or "",
-                        TRUNCATION_REMINDERS["max_tokens"],
-                    )
+                        # A drop the loop already warned about is evidence
+                        # about the model, not the provider: attributing it to
+                        # the provider would let a capability failure exhaust
+                        # the budget and surface as malformed_response.
+                        if constrained_pending:
+                            constrained_retries += 1
+                        else:
+                            truncation_continues_with_drops += 1
+                    if length_bound:
+                        reminder = TRUNCATION_REMINDERS["max_tokens"]
+                    else:
+                        reminder = TRUNCATION_REMINDERS.get(
+                            response.incomplete_reason or "",
+                            TRUNCATION_REMINDERS["max_tokens"],
+                        )
+                    constrained_pending = length_bound
                     self._append_message(
                         Message(role=Role.USER, content=reminder)
                     )
@@ -945,18 +1068,23 @@ class AgentLoop:
                         {
                             "count": truncation_continues,
                             "incomplete_reason": response.incomplete_reason,
+                            "length_bound": length_bound,
+                            "constrained_retries": constrained_retries,
                         },
                     )
                     continue
 
                 # Budget spent. If *every* continue went on a turn whose tool
-                # calls were unparseable, the run never had a working provider
-                # to begin with: finishing "completed" here would hand the
-                # enclosing harness a clean completion with a placeholder for
-                # an answer — a loud infrastructure failure laundered into a
-                # silent scored one. Fail with a fault the C3 bridge maps to
-                # the harness's own API-error type instead. A mix of causes
-                # (or none) falls through and is accepted as before.
+                # calls were unparseable — and none of them was a drop the
+                # loop had already asked the model to shorten, which
+                # ``constrained_retries`` holds out of this count — the run
+                # never had a working provider to begin with: finishing
+                # "completed" here would hand the enclosing harness a clean
+                # completion with a placeholder for an answer — a loud
+                # infrastructure failure laundered into a silent scored one.
+                # Fail with a fault the C3 bridge maps to the harness's own
+                # API-error type instead. A mix of causes (or none) falls
+                # through and is accepted as before.
                 if (
                     truncation_continues > 0
                     and truncation_continues_with_drops == truncation_continues
@@ -1004,6 +1132,17 @@ class AgentLoop:
                     declared_command, deadline
                 )
                 if passed:
+                    # Change 4: a pass that the lint flagged is still a
+                    # pass — nothing below reads this key. It is recorded
+                    # so a later round can tell a check that proved
+                    # something from one that could not have failed.
+                    lint_findings = lint_verification(
+                        declared_command, self.written_data
+                    )
+                    if lint_findings:
+                        payload["lint_findings"] = [
+                            finding.as_payload() for finding in lint_findings
+                        ]
                     self.store.append_event(
                         self.agent_id, "verification_passed", payload
                     )

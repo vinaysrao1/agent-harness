@@ -17,6 +17,11 @@ lines without become :attr:`StopReason.END_TURN`. Call ids are generated
 An optional ``"provider_stop_reason"`` key scripts the provider's verbatim
 stop string (what the agent loop records on its ``model_turn`` event); it
 defaults to ``None``, since a fake has no provider to quote.
+
+An optional ``"reasoning_tokens"`` key scripts
+:attr:`~harness.types.Usage.reasoning_tokens` on the response's usage (the
+rest of ``Usage`` stays zero); it defaults to ``0``, matching a provider that
+reports no hidden-reasoning tokens.
 """
 
 from __future__ import annotations
@@ -86,7 +91,7 @@ def _response_from_line(line: str, line_number: int) -> ModelResponse:
             content=data.get("content"),
             tool_calls=tool_calls,
         ),
-        usage=Usage(),
+        usage=Usage(reasoning_tokens=data.get("reasoning_tokens", 0) or 0),
         stop_reason=StopReason.TOOL_USE if tool_calls else StopReason.END_TURN,
         # Scriptable provenance; absent means "the fake quoted no provider".
         provider_stop_reason=data.get("provider_stop_reason"),

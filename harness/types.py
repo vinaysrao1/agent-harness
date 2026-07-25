@@ -165,12 +165,26 @@ class Usage(BaseModel):
     adapter. This matches the Anthropic API's fields directly; adapters for
     APIs whose prompt total is cache-inclusive (e.g. OpenAI ``prompt_tokens``)
     must subtract cache traffic when mapping to ``input_tokens``.
+
+    ``reasoning_tokens`` counts hidden reasoning/thinking output reported by
+    the provider (currently populated on ``openai_compat`` only, from
+    ``usage.completion_tokens_details.reasoning_tokens``; Anthropic stays 0
+    until the round-3 thinking-block passthrough lands). Unlike the cache
+    fields above, this is **not** subtracted from anything: it is a *subset*
+    of ``output_tokens``, not a sibling bucket, because the provider already
+    includes reasoning tokens in ``completion_tokens``/``output_tokens``.
+    ``output_tokens`` is therefore left as-is — do not subtract
+    ``reasoning_tokens`` from it the way ``cache_read_tokens`` /
+    ``cache_write_tokens`` are subtracted out of OpenAI's cache-inclusive
+    ``prompt_tokens`` when computing ``input_tokens``. This is pure telemetry
+    for now: it has no effect on behaviour, config, or token accounting.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
 
     def __add__(self, other: object) -> "Usage":
         """Field-wise sum, so per-call usage can be rolled up per run/agent."""
@@ -181,6 +195,7 @@ class Usage(BaseModel):
             output_tokens=self.output_tokens + other.output_tokens,
             cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
             cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
         )
 
     def __radd__(self, other: object) -> "Usage":

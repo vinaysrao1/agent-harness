@@ -123,6 +123,11 @@ __all__ = ["HarnessAgent", "resolve_model"]
 #: Default per-trial budgets, overridable via HARNESS_MAX_TURNS /
 #: HARNESS_MAX_TOKENS in the agent's ``extra_env`` (``harbor run
 #: --agent-kwarg``/config) or the process environment.
+#:
+#: This turn count is a fallback, not a policy: a Harbor trial always has a
+#: wall-clock deadline, so unless the operator sets HARNESS_MAX_TURNS
+#: explicitly the loop derives its own turn rail from that deadline and this
+#: number never binds (see :attr:`~harness.loop.Budgets.max_turns_is_hard`).
 _DEFAULT_MAX_TURNS = 80
 _DEFAULT_MAX_TOKENS = 2_000_000
 
@@ -368,6 +373,11 @@ class HarnessAgent(BaseAgent):
         adapter = get_adapter(model_config)
         budgets = Budgets(
             max_turns=self._int_setting("HARNESS_MAX_TURNS", _DEFAULT_MAX_TURNS),
+            # Presence, not value: an operator who sets HARNESS_MAX_TURNS
+            # means that ceiling, and _int_setting cannot tell a value equal
+            # to the default from no value at all. Unset leaves the loop free
+            # to derive its turn rail from the trial's wall clock.
+            max_turns_is_hard=self._setting_present("HARNESS_MAX_TURNS"),
             max_tokens=self._int_setting(
                 "HARNESS_MAX_TOKENS", _DEFAULT_MAX_TOKENS
             ),
@@ -530,6 +540,18 @@ class HarnessAgent(BaseAgent):
                 stacklevel=2,
             )
             return None
+
+    def _setting_present(self, name: str) -> bool:
+        """Whether ``name`` was supplied at all, in ``extra_env`` or the env.
+
+        Distinct from :meth:`_int_setting`, which answers "what value?" and
+        cannot distinguish "unset" from "set to exactly the default". Callers
+        that need to know whether the operator *chose* a setting — rather
+        than what it happens to equal — must ask this instead. A
+        present-but-unparseable value still counts as present: the operator
+        expressed an intent even if they typo'd the number.
+        """
+        return name in self.extra_env or name in os.environ
 
     def _int_setting(self, name: str, default: int) -> int:
         """Read an integer setting from ``extra_env`` then ``os.environ``.
