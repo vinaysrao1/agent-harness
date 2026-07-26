@@ -211,14 +211,21 @@ def _exec_cap(
 
 
 class TestLandingWindowProperty:
-    """The contract Change 0 exists to guarantee.
+    """The contract Change 0 exists to guarantee, repaired in round 3.
 
-    After any deadline-capped exec returns, ``remaining()`` is strictly
-    greater than :data:`WALL_CLOCK_STOP_FLOOR`, so the loop's hard-stop
-    check cannot fire and the agent always gets one more turn to land its
-    answer. The documented exception is a run already inside the stop
-    floor (``remaining <= floor + EXEC_CAP_FLOOR_SECONDS``), where the exec
-    floor wins and the loop is stopping regardless.
+    After any deadline-capped *exploratory* exec returns, what is left is
+    at least :data:`WALL_CLOCK_STOP_FLOOR`, so the loop's hard-stop check
+    cannot fire and the agent always gets one more turn to land its answer.
+
+    This class used to assert a weaker contract with a "documented
+    exception" for runs already inside the stop floor. The exception was
+    stated wrongly and was therefore not a boundary case at all:
+    ``allowed = max(EXEC_CAP_FLOOR_SECONDS, remaining - reserve)`` let the
+    30s floor escape the reserve as soon as ``remaining < reserve + 30``
+    (~105s), so the guarantee was void a full 30s *above* the floor — in a
+    band where the loop happily starts turns. It is now clamped, and the
+    only remaining exception is ``purpose="verification"``, which is exempt
+    on purpose (nothing is landed after a completion gate).
     """
 
     @pytest.mark.parametrize("budget", [900.0, 1200.0, 1800.0, 2400.0])
@@ -249,21 +256,52 @@ class TestLandingWindowProperty:
             elapsed = budget - remaining
             for requested in (10.0, 120.0, 300.0, 600.0, 3600.0):
                 cap = _exec_cap(deadline, requested)
-                assert cap >= EXEC_CAP_FLOOR_SECONDS or cap == requested
-                if remaining > WALL_CLOCK_STOP_FLOOR + EXEC_CAP_FLOOR_SECONDS:
-                    # The exec is bounded so that what is left when it
-                    # returns still buys a model call.
-                    assert remaining - cap > WALL_CLOCK_STOP_FLOOR
+                # The repaired contract, with no band exempted: an
+                # exploratory exec either leaves the stop floor untouched
+                # or is refused the time entirely. `cap == 0.0` is a legal
+                # answer inside the floor, where nothing new should start.
+                assert remaining - cap >= WALL_CLOCK_STOP_FLOOR or cap == 0.0
+                # The exec floor still bounds the *reserve* term, so a
+                # command with room to run never gets a spuriously tiny
+                # window: below the floor only the stop-floor clamp bites.
+                if remaining >= WALL_CLOCK_STOP_FLOOR + EXEC_CAP_FLOOR_SECONDS:
+                    assert cap >= EXEC_CAP_FLOOR_SECONDS or cap == requested
             remaining -= 10.0
 
-    def test_the_documented_exception_is_inside_the_stop_floor(self) -> None:
-        # remaining=70: `remaining - reserve` is negative, the 30s exec
-        # floor wins, and the exec can return with 40s left — below the
-        # stop floor. That is fine: at remaining=70 the loop is already
-        # within one landing turn of stopping.
+    def test_the_old_documented_exception_is_gone(self) -> None:
+        """Was ``test_the_documented_exception_is_inside_the_stop_floor``.
+
+        It asserted that at remaining=70 a 120s request became a 30s exec
+        returning with 40s left — below the stop floor — and called that
+        acceptable because "the loop is already within one landing turn of
+        stopping". Both halves were wrong: returning below the floor is
+        precisely what denies the landing turn, and the violation was not
+        confined to the floor at all. It began at ``WALL_CLOCK_STOP_FLOOR +
+        EXEC_CAP_FLOOR_SECONDS`` = 90s, a band 30s wide in which the loop
+        starts turns perfectly happily.
+        """
         deadline = Deadline(900.0, scripted_clock([0.0, 830.0]))
         assert deadline.remaining() == 70.0
-        assert _exec_cap(deadline, 120.0) == EXEC_CAP_FLOOR_SECONDS
+        assert _exec_cap(deadline, 120.0) == 10.0  # was EXEC_CAP_FLOOR_SECONDS
+        assert 70.0 - 10.0 == WALL_CLOCK_STOP_FLOOR
+        # The top of the band, 30s clear of the floor: the old arithmetic
+        # handed out the 30s floor here too and returned at 59.
+        wider = Deadline(900.0, scripted_clock([0.0, 811.0]))
+        assert wider.remaining() == 89.0
+        assert wider.remaining() > WALL_CLOCK_STOP_FLOOR
+        assert _exec_cap(wider, 120.0) == 29.0  # was EXEC_CAP_FLOOR_SECONDS
+        assert 89.0 - 29.0 == WALL_CLOCK_STOP_FLOOR
+
+    def test_verification_keeps_the_exemption_deliberately(self) -> None:
+        # The completion gate is exempt: shortening it turns a passing
+        # check into a capped, inconclusive one, and there is nothing to
+        # land after it. So it may still return inside the floor.
+        deadline = Deadline(900.0, scripted_clock([0.0, 830.0]))
+        assert deadline.remaining() == 70.0
+        assert (
+            _exec_cap(deadline, 120.0, purpose="verification")
+            == EXEC_CAP_FLOOR_SECONDS
+        )
         assert 70.0 - EXEC_CAP_FLOOR_SECONDS < WALL_CLOCK_STOP_FLOOR
 
     def test_fast_provider_keeps_its_long_decisive_exec(self) -> None:
@@ -443,9 +481,36 @@ class TestExecCap:
         )
 
     def test_the_floor_still_wins_over_the_reserve(self) -> None:
-        # remaining 70 of 900: `remaining - reserve` is negative, so the
-        # exec floor applies rather than a 0s timeout.
-        assert _at(900.0, 70.0).exec_cap(120.0) == (
+        """It does not — and that was the landing guarantee's whole hole.
+
+        Kept under its original name, with the assertion inverted. The old
+        version asserted that at remaining=70 of 900 the 30s exec floor
+        beats the reserve, so a 120s request became a 30s exec. That is the
+        bug, not a boundary case: the exec returns at remaining 40, the
+        loop's hard stop fires, and the turn the reserve was held back for
+        never happens. Two trials died exactly this way —
+        ``qemu-alpine-ssh`` seq 238 (30s exec issued at remaining 58.4,
+        stop at 28.4) and ``make-doom-for-mips`` seq 553 (issued at 46.8,
+        stop at 16.7). Neither was inside the floor when the *turn* began.
+
+        The floor now bounds only the reserve term; it can never be paid
+        out of :data:`WALL_CLOCK_STOP_FLOOR`.
+        """
+        assert _at(900.0, 70.0).exec_cap(120.0) == (10.0, True, "reserve")
+        # Not a floor-only defect. The escape ran the whole band from
+        # WALL_CLOCK_STOP_FLOOR + EXEC_CAP_FLOOR_SECONDS = 89.9s down: at
+        # remaining 89 the old arithmetic still handed out 30s and returned
+        # at 59, one second inside the floor and one turn short.
+        assert _at(900.0, 89.0).exec_cap(120.0) == (29.0, True, "reserve")
+        # And the floor still wins where it legitimately can: at or above
+        # 90s the clamp is slack, so a nearly-spent budget keeps a usable
+        # window instead of a spuriously-failing one.
+        assert _at(900.0, 90.0).exec_cap(120.0) == (
+            EXEC_CAP_FLOOR_SECONDS,
+            True,
+            "reserve",
+        )
+        assert _at(900.0, 104.0).exec_cap(120.0) == (
             EXEC_CAP_FLOOR_SECONDS,
             True,
             "reserve",
@@ -459,6 +524,505 @@ class TestExecCap:
         deadline = _at(900.0, 215.6)
         assert deadline.exec_cap(140.6) == (140.6, False, None)
         assert deadline.exec_cap(140.7)[1] is True
+
+
+
+
+# ---------------------------------------------------------------------------
+# Change 1a: the frozen round-2 exec-cap corpus
+# ---------------------------------------------------------------------------
+
+
+class _CapRow(NamedTuple):
+    """One real ``exec_capped`` event, plus what 1a does to it.
+
+    ``live_effective`` is the timeout round 2 actually applied; ``runtime``
+    and ``timed_out`` are what the command then did. Those three are
+    *observations*, checked in so the counterfactual below is arithmetic
+    over recorded facts rather than a story. ``effective`` and ``reason``
+    are what the shipping code must produce.
+    """
+
+    task: str
+    seq: int
+    budget: float
+    remaining: float
+    requested: float
+    reserve: float
+    live_effective: float
+    runtime: float
+    timed_out: bool
+    effective: float
+    reason: str | None
+
+
+#: Every ``exec_capped`` event of the 14-trial round-2 benchmark run: 63
+#: rows across 10 tasks, verbatim from the ``state.db`` event logs (the
+#: floats are rounded to 3dp; the expected outputs were computed from the
+#: rounded inputs, so the table is exact).
+#:
+#: This is the fence for every future constant change. ``EXEC_CAP_FLOOR_
+#: SECONDS``, ``LANDING_ALLOWANCE_MIN``, ``LANDING_RESERVE_FRACTION`` and
+#: ``EXEC_MAX_BUDGET_FRACTION`` are all tuned from exactly this corpus, and
+#: moving any of them re-cuts real commands — including the decisive build
+#: of a task that currently passes. Here that shows up as a diff, not as a
+#: lost trial three days later.
+_CAP_CORPUS: tuple[_CapRow, ...] = (
+
+    # -- caffe-cifar-10 ----------------------------------------------
+    _CapRow('caffe-cifar-10', 31, 1200, 1028.585, 1800, 75,
+            600, 150.951, False, 600, 'share'),
+    _CapRow('caffe-cifar-10', 47, 1200, 617.891, 600, 75,
+            463.418, 269.944, False, 463.41825, 'band'),
+    _CapRow('caffe-cifar-10', 53, 1200, 341.981, 400, 75,
+            256.485, 2.302, False, 256.48575, 'band'),
+    _CapRow('caffe-cifar-10', 64, 1200, 329.491, 250, 75,
+            247.119, 52.671, False, 247.11825, 'band'),
+    _CapRow('caffe-cifar-10', 92, 1200, 124.295, 50, 75,
+            49.295, 0.98, False, 49.295, 'reserve'),
+    _CapRow('caffe-cifar-10', 98, 1200, 87.269, 120, 75,
+            30, 0.319, False, 27.269, 'reserve'),
+    # -- compile-compcert --------------------------------------------
+    _CapRow('compile-compcert', 36, 2400, 2256.432, 1800, 75,
+            1200, 467.797, False, 1200, 'share'),
+    _CapRow('compile-compcert', 42, 2400, 1777.764, 3600, 75,
+            1200, 4.554, False, 1200, 'share'),
+    _CapRow('compile-compcert', 73, 2400, 1271.209, 3000, 75,
+            953.406, 476.1, False, 953.40675, 'band'),
+    _CapRow('compile-compcert', 79, 2400, 790.003, 3000, 75,
+            592.502, 191.303, False, 592.50225, 'band'),
+    _CapRow('compile-compcert', 85, 2400, 593.641, 1200, 75,
+            445.231, 1.47, False, 445.23075, 'band'),
+    _CapRow('compile-compcert', 91, 2400, 584.417, 3000, 75,
+            438.313, 198.91, False, 438.31275, 'band'),
+    _CapRow('compile-compcert', 99, 2400, 379.652, 380, 75,
+            304.652, 1.375, False, 304.652, 'reserve'),
+    _CapRow('compile-compcert', 105, 2400, 372.076, 2400, 75,
+            297.076, 20.493, False, 297.076, 'reserve'),
+    _CapRow('compile-compcert', 116, 2400, 338.505, 300, 75,
+            263.505, 0.619, False, 263.505, 'reserve'),
+    # -- gpt2-codegolf -----------------------------------------------
+    _CapRow('gpt2-codegolf', 32, 900, 632.219, 600, 76.896,
+            450, 1.044, False, 450, 'share'),
+    _CapRow('gpt2-codegolf', 88, 900, 397.432, 300, 83.657,
+            298.074, 0.999, False, 298.074, 'band'),
+    _CapRow('gpt2-codegolf', 119, 900, 245.493, 300, 93.707,
+            151.786, 5.802, False, 151.786, 'reserve'),
+    _CapRow('gpt2-codegolf', 130, 900, 227.151, 200, 84.927,
+            142.224, 10.233, False, 142.224, 'reserve'),
+    _CapRow('gpt2-codegolf', 136, 900, 208.799, 200, 84.927,
+            123.873, 10.263, False, 123.872, 'reserve'),
+    _CapRow('gpt2-codegolf', 142, 900, 150.176, 120, 84.927,
+            65.249, 0.818, False, 65.249, 'reserve'),
+    _CapRow('gpt2-codegolf', 148, 900, 140.846, 120, 84.927,
+            55.919, 10.434, False, 55.919, 'reserve'),
+    # -- make-doom-for-mips ------------------------------------------
+    _CapRow('make-doom-for-mips', 451, 900, 186.015, 120, 75,
+            111.015, 0.12, False, 111.015, 'reserve'),
+    _CapRow('make-doom-for-mips', 457, 900, 178.38, 120, 75,
+            103.38, 0.123, False, 103.38, 'reserve'),
+    _CapRow('make-doom-for-mips', 463, 900, 145.259, 120, 75,
+            70.259, 0.188, False, 70.259, 'reserve'),
+    _CapRow('make-doom-for-mips', 469, 900, 133.578, 60, 75,
+            58.578, 0.145, False, 58.578, 'reserve'),
+    _CapRow('make-doom-for-mips', 475, 900, 127.255, 120, 75,
+            52.255, 0.149, False, 52.255, 'reserve'),
+    _CapRow('make-doom-for-mips', 481, 900, 122.49, 120, 75,
+            47.49, 0.136, False, 47.49, 'reserve'),
+    _CapRow('make-doom-for-mips', 487, 900, 116.788, 120, 75,
+            41.788, 0.151, False, 41.788, 'reserve'),
+    _CapRow('make-doom-for-mips', 493, 900, 110.879, 120, 75,
+            35.879, 0.171, False, 35.879, 'reserve'),
+    _CapRow('make-doom-for-mips', 499, 900, 104.971, 120, 75,
+            30, 0.144, False, 30, 'reserve'),
+    _CapRow('make-doom-for-mips', 505, 900, 99.162, 120, 75,
+            30, 0.171, False, 30, 'reserve'),
+    _CapRow('make-doom-for-mips', 511, 900, 94.347, 120, 75,
+            30, 0.134, False, 30, 'reserve'),
+    _CapRow('make-doom-for-mips', 517, 900, 89.702, 120, 75,
+            30, 0.12, False, 29.702, 'reserve'),
+    _CapRow('make-doom-for-mips', 523, 900, 84.959, 120, 75,
+            30, 0.129, False, 24.959, 'reserve'),
+    _CapRow('make-doom-for-mips', 529, 900, 79.555, 120, 75,
+            30, 0.162, False, 19.555, 'reserve'),
+    _CapRow('make-doom-for-mips', 535, 900, 74.562, 120, 75,
+            30, 0.148, False, 14.562, 'reserve'),
+    _CapRow('make-doom-for-mips', 541, 900, 68.444, 120, 75,
+            30, 0.161, False, 8.444, 'reserve'),
+    _CapRow('make-doom-for-mips', 547, 900, 62.751, 120, 75,
+            30, 0.157, False, 2.751, 'reserve'),
+    _CapRow('make-doom-for-mips', 553, 900, 46.758, 120, 75,
+            30, 30.012, True, 0, 'reserve'),
+    # -- make-mips-interpreter ---------------------------------------
+    _CapRow('make-mips-interpreter', 145, 1800, 1358.576, 920, 75,
+            900, 0.611, False, 900, 'share'),
+    _CapRow('make-mips-interpreter', 182, 1800, 1304.933, 920, 75,
+            900, 0.509, False, 900, 'share'),
+    _CapRow('make-mips-interpreter', 449, 1800, 794.905, 620, 75,
+            596.179, 0.484, False, 596.17875, 'band'),
+    _CapRow('make-mips-interpreter', 505, 1800, 637.647, 520, 76.873,
+            478.235, 0.753, False, 478.23525, 'band'),
+    _CapRow('make-mips-interpreter', 549, 1800, 541.089, 520, 75,
+            405.817, 0.429, False, 405.81675, 'band'),
+    _CapRow('make-mips-interpreter', 585, 1800, 481.81, 620, 75,
+            361.357, 0.723, False, 361.3575, 'band'),
+    _CapRow('make-mips-interpreter', 623, 1800, 326.631, 260, 75,
+            251.631, 0.469, False, 251.631, 'reserve'),
+    _CapRow('make-mips-interpreter', 639, 1800, 191.498, 120, 84.379,
+            107.119, 0.136, False, 107.119, 'reserve'),
+    _CapRow('make-mips-interpreter', 650, 1800, 180.611, 100, 84.379,
+            96.232, 0.461, False, 96.232, 'reserve'),
+    _CapRow('make-mips-interpreter', 656, 1800, 172.995, 95, 84.379,
+            88.616, 75.219, False, 88.616, 'reserve'),
+    # -- mcmc-sampling-stan ------------------------------------------
+    _CapRow('mcmc-sampling-stan', 21, 1800, 1772.754, 1200, 75,
+            900, 406.774, False, 900, 'share'),
+    # -- path-tracing ------------------------------------------------
+    _CapRow('path-tracing', 248, 1800, 185.321, 120, 81.807,
+            103.514, 6.338, False, 103.514, 'reserve'),
+    # -- qemu-alpine-ssh ---------------------------------------------
+    _CapRow('qemu-alpine-ssh', 221, 900, 207.134, 400, 75,
+            132.134, 21.366, False, 132.134, 'reserve'),
+    _CapRow('qemu-alpine-ssh', 227, 900, 180.546, 125, 75,
+            105.546, 106.014, True, 105.546, 'reserve'),
+    _CapRow('qemu-alpine-ssh', 238, 900, 58.413, 125, 75,
+            30, 30.012, True, 0, 'reserve'),
+    # -- qemu-startup ------------------------------------------------
+    _CapRow('qemu-startup', 201, 900, 465.114, 660, 75,
+            348.836, 108.416, False, 348.8355, 'band'),
+    # -- write-compressor --------------------------------------------
+    _CapRow('write-compressor', 43, 900, 376.353, 600, 120,
+            256.353, 1, False, 256.353, 'reserve'),
+    _CapRow('write-compressor', 74, 900, 302.333, 600, 88.696,
+            213.637, 1.002, False, 213.637, 'reserve'),
+    _CapRow('write-compressor', 92, 900, 248.954, 280, 88.696,
+            160.258, 0.767, False, 160.258, 'reserve'),
+    _CapRow('write-compressor', 118, 900, 192.331, 280, 75,
+            117.331, 0.803, False, 117.331, 'reserve'),
+    _CapRow('write-compressor', 124, 900, 173.599, 120, 75,
+            98.599, 0.136, False, 98.599, 'reserve'),
+    _CapRow('write-compressor', 130, 900, 160.973, 120, 75,
+            85.973, 0.134, False, 85.973, 'reserve'),
+    _CapRow('write-compressor', 146, 900, 111.068, 80, 77.841,
+            33.227, 0.786, False, 33.227, 'reserve'),
+)
+
+#: The three tasks the round-2 run actually solved (grader ``reward``, not
+#: the agent's own ``verification_passed``). 1a must not touch a single one
+#: of their execs.
+_SOLVED_TASKS = frozenset(
+    {"compile-compcert", "mcmc-sampling-stan", "qemu-startup"}
+)
+
+
+def _at_reserve(row: _CapRow) -> Deadline:
+    """A deadline reproducing ``row``'s state at the moment of the exec.
+
+    One observation of ``reserve - WALL_CLOCK_STOP_FLOOR`` reproduces the
+    recorded landing reserve exactly (nearest-rank p75 of a window of one
+    is that observation, and every recorded reserve is inside the
+    allowance bounds), so the row's own reserve drives the arithmetic
+    rather than a stand-in.
+    """
+    deadline = Deadline(
+        row.budget, scripted_clock([0.0, row.budget - row.remaining])
+    )
+    deadline.observe_model_call(row.reserve - WALL_CLOCK_STOP_FLOOR)
+    return deadline
+
+
+class TestFrozenExecCapCorpus:
+    """Change 1a against all 63 real capped execs of the round-2 run.
+
+    Be clear about what this buys: **zero tasks.** Nine rows change, every
+    one of them already pinned at :data:`EXEC_CAP_FLOOR_SECONDS`; seven ran
+    for under a third of a second and two had already timed out at 30s. No
+    exec of any solved trial moves. This is a prospective repair of a
+    guarantee the reserve arithmetic was claiming and not keeping — the
+    tests below are what make the claim true, not a recovery story.
+    """
+
+    def test_the_corpus_is_the_whole_round_two_cap_log(self) -> None:
+        assert len(_CAP_CORPUS) == 63
+        assert len({(row.task, row.seq) for row in _CAP_CORPUS}) == 63
+        assert len({row.task for row in _CAP_CORPUS}) == 10
+        assert {row.reason for row in _CAP_CORPUS} == {
+            "share",
+            "band",
+            "reserve",
+        }
+        assert _SOLVED_TASKS <= {row.task for row in _CAP_CORPUS}
+
+    @pytest.mark.parametrize(
+        "row", _CAP_CORPUS, ids=[f"{r.task}-{r.seq}" for r in _CAP_CORPUS]
+    )
+    def test_corpus_row(self, row: _CapRow) -> None:
+        deadline = _at_reserve(row)
+        assert deadline.landing_reserve() == pytest.approx(row.reserve)
+        decision = deadline.exec_decision(row.requested)
+        assert decision.effective == pytest.approx(row.effective, abs=1e-6)
+        assert decision.reason == row.reason
+        assert decision.capped is (row.effective < row.requested)
+
+    @pytest.mark.parametrize(
+        "row", _CAP_CORPUS, ids=[f"{r.task}-{r.seq}" for r in _CAP_CORPUS]
+    )
+    def test_every_row_leaves_the_stop_floor_alone(self, row: _CapRow) -> None:
+        # The guarantee, on real inputs: the exec either returns with the
+        # stop floor intact or is given no time at all.
+        assert (
+            row.remaining - row.effective >= WALL_CLOCK_STOP_FLOOR
+            or row.effective == 0.0
+        )
+
+    def test_exactly_nine_rows_change_and_all_were_at_the_floor(self) -> None:
+        changed = [
+            row
+            for row in _CAP_CORPUS
+            if abs(row.effective - row.live_effective) > 0.01
+        ]
+        assert [(row.task, row.seq) for row in changed] == [
+            ("caffe-cifar-10", 98),
+            ("make-doom-for-mips", 517),
+            ("make-doom-for-mips", 523),
+            ("make-doom-for-mips", 529),
+            ("make-doom-for-mips", 535),
+            ("make-doom-for-mips", 541),
+            ("make-doom-for-mips", 547),
+            ("make-doom-for-mips", 553),
+            ("qemu-alpine-ssh", 238),
+        ]
+        # Every one of them is the max() hole itself: round 2 handed out
+        # exactly the exec floor out of the stop floor's protection.
+        for row in changed:
+            assert row.live_effective == EXEC_CAP_FLOOR_SECONDS
+            assert row.remaining < (
+                WALL_CLOCK_STOP_FLOOR + EXEC_CAP_FLOOR_SECONDS
+            )
+            assert row.effective < row.live_effective
+
+    def test_no_shortened_row_would_have_cut_a_running_command(self) -> None:
+        """The refuted objection, checked against the recorded runtimes.
+
+        v1 proposed refusing execs below ``MIN_USEFUL_EXEC_SECONDS = 5.0``.
+        The corpus says small windows are useful: the median capped exec
+        ran 0.79s. Of the nine shortened rows, seven completed in 0.12–0.32s
+        and still fit; the two that do not (doom 553, qemu-alpine 238) had
+        already timed out at 30s, so no completing command is cut short.
+        """
+        shortened = [
+            row
+            for row in _CAP_CORPUS
+            if abs(row.effective - row.live_effective) > 0.01
+        ]
+        completed = [row for row in shortened if not row.timed_out]
+        assert len(completed) == 7
+        for row in completed:
+            assert row.runtime < row.effective
+            assert row.runtime <= 0.32
+        already_lost = [row for row in shortened if row.timed_out]
+        assert [(row.task, row.seq) for row in already_lost] == [
+            ("make-doom-for-mips", 553),
+            ("qemu-alpine-ssh", 238),
+        ]
+        for row in already_lost:
+            assert row.live_effective == EXEC_CAP_FLOOR_SECONDS
+            assert row.runtime >= EXEC_CAP_FLOOR_SECONDS
+
+    def test_the_median_capped_exec_is_under_a_second(self) -> None:
+        # The number that killed MIN_USEFUL_EXEC_SECONDS. An 8.4s or a
+        # 2.8s window is not a token gesture on this corpus; it is ten
+        # times the median command.
+        runtimes = sorted(row.runtime for row in _CAP_CORPUS)
+        assert runtimes[len(runtimes) // 2] == pytest.approx(0.786, abs=1e-3)
+
+    def test_no_solved_trials_exec_is_touched(self) -> None:
+        # The risk that matters: 1a must not re-cut a command a passing
+        # task depended on. Every solved-trial cap already left >= 75s.
+        for row in _CAP_CORPUS:
+            if row.task in _SOLVED_TASKS:
+                assert row.effective == pytest.approx(
+                    row.live_effective, abs=1e-3
+                )
+                assert row.remaining - row.effective >= 75.0
+
+    def test_the_two_hard_stopped_trials_are_the_motivating_rows(self) -> None:
+        # F2: both hard-stopped trials issued their last exec *after* the
+        # model call had already spent the margin, so 1a alone converts
+        # them to a zero window. That is the loop's problem, not the tool's
+        # — see 1c's landing band in harness.loop.
+        by_key = {(row.task, row.seq): row for row in _CAP_CORPUS}
+        qemu = by_key[("qemu-alpine-ssh", 238)]
+        doom = by_key[("make-doom-for-mips", 553)]
+        for row in (qemu, doom):
+            assert row.remaining < WALL_CLOCK_STOP_FLOOR
+            assert row.live_effective == EXEC_CAP_FLOOR_SECONDS
+            assert row.effective == 0.0
+            assert row.timed_out
+
+
+class TestStopFloorClampProperty:
+    """1a's invariant, swept over a dense grid rather than sampled.
+
+    ``hypothesis`` is not a dependency of this project, so the "property"
+    is an exhaustive product over budgets, remainings, requests and
+    provider latencies — deterministic, offline, and covering the whole
+    band the clamp acts in at 1s resolution.
+    """
+
+    _BUDGETS = (300.0, 900.0, 1200.0, 1800.0, 2400.0, 12000.0)
+    _REQUESTS = (0.0, 1.0, 30.0, 120.0, 600.0, 3600.0)
+    _OBSERVATIONS = ((), (5.0,) * 4, (15.1,) * 8, (200.0,) * 4)
+
+    @pytest.mark.parametrize("budget", _BUDGETS)
+    @pytest.mark.parametrize("observations", _OBSERVATIONS)
+    def test_exploratory_execs_never_spend_the_stop_floor(
+        self, budget: float, observations: tuple[float, ...]
+    ) -> None:
+        elapsed = 0.0
+
+        def clock() -> float:
+            return elapsed
+
+        deadline = Deadline(budget, clock)
+        for seconds in observations:
+            deadline.observe_model_call(seconds)
+
+        # 1s resolution through the whole clamp band (0..150), then coarser
+        # for the rest of the budget where the clamp is provably slack.
+        points = [float(n) for n in range(0, 151)]
+        points += [float(n) for n in range(160, int(budget) + 1, 10)]
+        for remaining in points:
+            elapsed = budget - remaining
+            for requested in self._REQUESTS:
+                effective = deadline.exec_cap(requested)[0]
+                assert (
+                    remaining - effective >= WALL_CLOCK_STOP_FLOOR
+                    or effective == 0.0
+                )
+                assert effective <= requested
+                assert effective >= 0.0
+
+    @pytest.mark.parametrize("budget", _BUDGETS)
+    @pytest.mark.parametrize("observations", _OBSERVATIONS)
+    def test_the_clamp_only_ever_tightens(
+        self, budget: float, observations: tuple[float, ...]
+    ) -> None:
+        """It must not manufacture time, and must change nothing above 90s.
+
+        The oracle is the pre-change formula, spelled out here: the clamp
+        is a ``min`` against the pre-change ``allowed``, so the only
+        interesting claim is *where* it binds — below
+        ``WALL_CLOCK_STOP_FLOOR + EXEC_CAP_FLOOR_SECONDS`` and nowhere
+        else. Everything above that band, including every solved trial's
+        decisive command, is byte-identical to round 2.
+        """
+        elapsed = 0.0
+
+        def clock() -> float:
+            return elapsed
+
+        deadline = Deadline(budget, clock)
+        for seconds in observations:
+            deadline.observe_model_call(seconds)
+
+        threshold = wind_down_threshold(budget)
+        for remaining in [float(n) for n in range(0, int(budget) + 1, 5)]:
+            elapsed = budget - remaining
+            reserve = deadline.landing_reserve()
+            if remaining > threshold:
+                reserve = max(
+                    reserve,
+                    min(threshold, LANDING_RESERVE_FRACTION * remaining),
+                )
+            unclamped = max(EXEC_CAP_FLOOR_SECONDS, remaining - reserve)
+            for requested in self._REQUESTS:
+                before = min(
+                    requested, EXEC_MAX_BUDGET_FRACTION * budget, unclamped
+                )
+                after = deadline.exec_cap(requested)[0]
+                assert after <= before
+                if remaining >= (
+                    WALL_CLOCK_STOP_FLOOR + EXEC_CAP_FLOOR_SECONDS
+                ):
+                    assert after == pytest.approx(before)
+
+
+class TestAffordableExecSeconds:
+    """1b's helper: the largest exec this run can afford, right now."""
+
+    def test_none_without_a_deadline(self) -> None:
+        assert _deadline(budget=None).affordable_exec_seconds() is None
+
+    def test_asking_for_no_more_than_it_is_never_capped(self) -> None:
+        # The property the bash default relies on: pre-clamping to this
+        # number means the cap cannot bite, so no cap is ever reported for
+        # a timeout the agent did not choose.
+        for remaining in [float(n) for n in range(0, 901, 5)]:
+            deadline = _at(900.0, remaining)
+            affordable = deadline.affordable_exec_seconds()
+            assert affordable is not None
+            decision = deadline.exec_decision(min(120.0, affordable))
+            assert decision.capped is False
+            assert decision.reason is None
+            assert decision.effective == min(120.0, affordable)
+
+    def test_it_is_the_unbounded_decision_not_a_second_formula(self) -> None:
+        # Defined as exec_decision of an unbounded request, so the three
+        # bounds can never drift out of agreement with it.
+        deadline = _at(1800.0, 1706.9)
+        assert deadline.affordable_exec_seconds() == pytest.approx(900.0)
+        assert deadline.affordable_exec_seconds() == pytest.approx(
+            deadline.exec_decision(1e9).effective
+        )
+
+    def test_it_respects_the_stop_floor_clamp(self) -> None:
+        # rem 64 of 900: reserve 75, so the old floor would have said 30s.
+        # What the run can actually afford is 4s — and 4s still runs a `cp`.
+        assert _at(900.0, 64.0).affordable_exec_seconds() == pytest.approx(4.0)
+        assert _at(900.0, 30.0).affordable_exec_seconds() == 0.0
+
+    def test_verification_asks_for_its_own_exemption(self) -> None:
+        # rem 400 of 900 is above the 300s threshold, so an exploratory
+        # exec is softened to 0.25 x 400 = 100s of reserve; verification
+        # keeps the plain 75s one.
+        deadline = _at(900.0, 400.0)
+        assert deadline.affordable_exec_seconds() == pytest.approx(300.0)
+        assert deadline.affordable_exec_seconds(
+            purpose="verification"
+        ) == pytest.approx(325.0)
+        # The exemptions show up where they bite: the share cap.
+        early = _at(1800.0, 1706.9)
+        assert early.affordable_exec_seconds() == pytest.approx(900.0)
+        assert early.affordable_exec_seconds(
+            purpose="verification"
+        ) == pytest.approx(1631.9)
+
+
+class TestLandingFlag:
+    """1c's tool-side gate: explicit state, set by the loop, read by bash."""
+
+    def test_off_by_default(self) -> None:
+        assert _deadline().landing is False
+        assert _deadline(budget=None).landing is False
+
+    def test_begin_landing_is_idempotent(self) -> None:
+        deadline = _deadline()
+        assert deadline.begin_landing() is True
+        assert deadline.landing is True
+        # A second caller (a subagent's loop, or a re-check) must not be
+        # able to re-arm it and re-inject the notice.
+        assert deadline.begin_landing() is False
+        assert deadline.landing is True
+
+    def test_it_is_state_not_arithmetic(self) -> None:
+        # Nothing about remaining time sets it: only the loop does. That is
+        # what stops a harness-supplied default from ever being read as an
+        # agent asking to run something long.
+        deadline = _at(900.0, 1.0)
+        assert deadline.landing is False
+        assert deadline.exec_decision(120.0).effective == 0.0
+        assert deadline.landing is False
 
 
 class TestExecDecisionReserve:

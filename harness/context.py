@@ -7,10 +7,16 @@ turn:
 - **System prompt assembly:** base harness prompt, then loaded skill bodies,
   then recalled memory (each block wrapped in explicit delimiters labeling it
   data-not-instructions), then the rendered instruction ledger.
-- **Tool-output pruning (first eviction layer, §4.3.2):** tool results older
-  than :data:`PRUNE_KEEP_TURNS` assistant turns are collapsed at assembly time
-  to a one-line stub referencing their event ref; the transcript itself keeps
-  the full content (the retrieval backstop lives in persistence, not here).
+- **Tool-output pruning (first eviction layer, §4.3.2):** *under context
+  pressure only*, the oldest tool results are collapsed at assembly time to a
+  one-line stub referencing their event ref; the transcript itself keeps the
+  full content (the retrieval backstop lives in persistence, not here).
+  Pruning engages only once the unpruned assembly exceeds
+  :data:`PRUNE_PRESSURE_THRESHOLD` of the model window, and then sheds
+  oldest-first only as far as :data:`PRUNE_TARGET_FRACTION`; results within
+  :data:`PRUNE_KEEP_TURNS` assistant turns are never stubbed. Below the
+  pressure threshold the transcript passes through verbatim — an agent must
+  not be made to forget what it read while the window is nearly empty.
 - **Trailing system reminder (§4.5):** every ``reminder_interval`` assistant
   turns — and always on the first :meth:`ContextManager.assemble` after a
   compaction, where instructions historically get lost — the instruction
@@ -46,14 +52,28 @@ from harness.types import Message, Role, ToolResult
 __all__ = [
     "ContextManager",
     "PRUNE_KEEP_TURNS",
+    "PRUNE_PRESSURE_THRESHOLD",
+    "PRUNE_TARGET_FRACTION",
     "COMPACTION_THRESHOLD",
     "COMPACTION_SUMMARY_PREFIX",
     "MEMORY_BLOCK_BEGIN",
     "MEMORY_BLOCK_END",
 ]
 
-#: Tool results older than this many assistant turns are pruned to stubs.
+#: Tool results inside this many assistant turns are never stubbed, even
+#: under pressure. Unchanged value, changed meaning: it is now the floor of a
+#: graduated shed, not the whole policy.
 PRUNE_KEEP_TURNS = 3
+
+#: Fraction of ``max_context`` above which tool-result pruning engages at all.
+#: Below this the assembly passes through verbatim.
+PRUNE_PRESSURE_THRESHOLD = 0.50
+
+#: Target the shed aims for once engaged. Strictly below
+#: :data:`PRUNE_PRESSURE_THRESHOLD` on purpose (hysteresis): a transcript
+#: pruned back under target sits below the trigger, so the plan does not flip
+#: state turn-to-turn and destroy the provider's prompt-cache prefix.
+PRUNE_TARGET_FRACTION = 0.40
 
 #: Fraction of ``max_context`` beyond which compaction triggers (strictly >).
 COMPACTION_THRESHOLD = 0.8
@@ -139,7 +159,24 @@ class ContextManager:
         #: evicted span (resume replays it in place of the span).
         self.last_summary: str | None = None
 
+        #: Per-turn memoization. ``_raw_count_cache`` is the *unpruned*
+        #: assembly's size (the pruning pressure signal); ``_token_count_cache``
+        #: is the size of what actually goes on the wire (what compaction
+        #: reads); ``_prune_cache`` is this turn's plan, memoized so repeated
+        #: assemblies inside one turn are byte-identical and cheap. All three
+        #: are dropped by :meth:`_invalidate_counts` whenever anything that
+        #: feeds the assembly changes.
+        self._raw_count_cache: int | None = None
+        self._token_count_cache: int | None = None
+        self._prune_cache: frozenset[int] | None = None
+
     # -- state mutation ------------------------------------------------------
+
+    def _invalidate_counts(self) -> None:
+        """Drop the per-turn count/plan caches. Called by every mutator."""
+        self._raw_count_cache = None
+        self._token_count_cache = None
+        self._prune_cache = None
 
     def append(self, message: Message) -> int:
         """Append one message to the transcript and return its event ref.
@@ -159,25 +196,30 @@ class ContextManager:
         self._next_ref += 1
         self.transcript.append(message)
         self._event_refs.append(ref)
+        self._invalidate_counts()
         return ref
 
     def add_instruction(self, text: str, source: str) -> None:
         """Record one instruction-ledger entry (§4.5), e.g. a user constraint."""
         self._instructions.append((text, source))
+        self._invalidate_counts()
 
     def set_task_snapshot(self, text: str) -> None:
         """Replace the task-ledger snapshot rendered into reminders (§4.9)."""
         self._task_snapshot = text
+        self._invalidate_counts()
 
     def add_skill_body(self, body: str, name: str | None = None) -> None:
         """Splice a loaded skill's full body into the system prompt (§4.6)."""
         self._skill_bodies.append((name, body))
+        self._invalidate_counts()
 
     def add_memory_block(self, text: str) -> None:
         """Add one recalled-memory block, rendered inside explicit
         BEGIN/END RECALLED MEMORY delimiters labeled data-not-instructions
         (§4.4/§4.8)."""
         self._memory_blocks.append(text)
+        self._invalidate_counts()
 
     # -- rendering -----------------------------------------------------------
 
@@ -226,18 +268,8 @@ class ContextManager:
 
     # -- assembly ------------------------------------------------------------
 
-    def _assemble(self, consume_reminder_flag: bool) -> tuple[str, list[Message]]:
-        """Build (system, messages); optionally consume the post-compaction
-        reminder flag (only the loop-facing :meth:`assemble` consumes it, so
-        the token-count probe in :meth:`maybe_compact` never eats it)."""
-        # Map tool-call ids to tool names for pruning stubs.
-        tool_names = {
-            call.id: call.name
-            for message in self.transcript
-            if message.role is Role.ASSISTANT
-            for call in message.tool_calls
-        }
-        # ages[i] = number of assistant messages strictly after transcript[i].
+    def _message_ages(self) -> list[int]:
+        """``ages[i]`` = assistant messages strictly after ``transcript[i]``."""
         ages: list[int] = []
         seen_assistant = 0
         for message in reversed(self.transcript):
@@ -245,13 +277,103 @@ class ContextManager:
             if message.role is Role.ASSISTANT:
                 seen_assistant += 1
         ages.reverse()
+        return ages
+
+    def _tool_names(self) -> dict[str, str]:
+        """Map tool-call ids to tool names, for pruning stubs."""
+        return {
+            call.id: call.name
+            for message in self.transcript
+            if message.role is Role.ASSISTANT
+            for call in message.tool_calls
+        }
+
+    def _tool_results_oldest_first(
+        self,
+    ) -> list[tuple[int, Message, int]]:
+        """``(index, message, age)`` for every tool result, oldest first.
+
+        Ages are non-increasing along this list, so a caller shedding
+        oldest-first can stop at the first entry inside the keep window.
+        """
+        ages = self._message_ages()
+        return [
+            (index, message, age)
+            for index, (message, age) in enumerate(zip(self.transcript, ages))
+            if message.role is Role.TOOL and message.tool_result is not None
+        ]
+
+    @staticmethod
+    def _stub_saving(message: Message) -> int:
+        """Approximate tokens reclaimed by stubbing ``message``.
+
+        A ``chars // 4`` proxy, deliberately: this is a *budgeting* heuristic
+        used to order the shed and to decide when to stop, not a correctness
+        claim. It is monotone in content length, which is all the shed needs,
+        and it keeps the pass O(n) instead of re-counting tokens per
+        candidate. The one number anything acts on — what compaction reads —
+        still comes from a real :attr:`_count_tokens` call.
+        """
+        result = message.tool_result
+        return 0 if result is None else len(result.content) // 4
+
+    def _prune_plan(self) -> frozenset[int]:
+        """Transcript indices whose tool results should be stubbed this turn.
+
+        Empty — the common case — unless the *unpruned* assembly is above
+        :data:`PRUNE_PRESSURE_THRESHOLD` of the window. Above it, sheds the
+        oldest tool results until the estimated size reaches
+        :data:`PRUNE_TARGET_FRACTION`, never touching a result within
+        :data:`PRUNE_KEEP_TURNS` assistant turns. The shed can therefore fail
+        to reach target; that is correct, because compaction at
+        :data:`COMPACTION_THRESHOLD` is the next rung of the ladder.
+        """
+        if self._prune_cache is not None:
+            return self._prune_cache
+        raw = self._raw_token_count()
+        if raw <= PRUNE_PRESSURE_THRESHOLD * self._max_context:
+            plan: frozenset[int] = frozenset()
+        else:
+            budget = raw - PRUNE_TARGET_FRACTION * self._max_context
+            indices: list[int] = []
+            shed = 0
+            for index, message, age in self._tool_results_oldest_first():
+                if age <= PRUNE_KEEP_TURNS:
+                    break  # never touch the recent window
+                indices.append(index)
+                shed += self._stub_saving(message)
+                if shed >= budget:
+                    break
+            plan = frozenset(indices)
+        self._prune_cache = plan
+        return plan
+
+    def _assemble(
+        self,
+        consume_reminder_flag: bool,
+        prune: frozenset[int] | None = None,
+    ) -> tuple[str, list[Message]]:
+        """Build (system, messages); optionally consume the post-compaction
+        reminder flag (only the loop-facing :meth:`assemble` consumes it, so
+        the token-count probe in :meth:`maybe_compact` never eats it).
+
+        ``prune`` is the set of transcript indices to stub. ``None`` means
+        "ask :meth:`_prune_plan`"; an explicit set means "stub exactly these"
+        — :meth:`_raw_token_count` passes an explicit **empty** set (never
+        ``None``, which would recurse), and tests pass exact sets.
+        """
+        if prune is None:
+            prune = self._prune_plan()
+        tool_names = self._tool_names() if prune else {}
 
         messages: list[Message] = []
-        for message, ref, age in zip(self.transcript, self._event_refs, ages):
+        for index, (message, ref) in enumerate(
+            zip(self.transcript, self._event_refs)
+        ):
             if (
-                message.role is Role.TOOL
+                index in prune
+                and message.role is Role.TOOL
                 and message.tool_result is not None
-                and age > PRUNE_KEEP_TURNS
             ):
                 result = message.tool_result
                 tool = tool_names.get(result.tool_call_id, "tool")
@@ -273,8 +395,9 @@ class ContextManager:
             messages.append(
                 Message(role=Role.USER, content=self._render_reminder())
             )
-            if consume_reminder_flag:
+            if consume_reminder_flag and self._reminder_due:
                 self._reminder_due = False
+                self._invalidate_counts()
 
         return self._render_system(), messages
 
@@ -282,20 +405,42 @@ class ContextManager:
         """Build what the model sees this turn: ``(system, messages)``.
 
         ``system`` is the assembled system prompt (base + skills + memory +
-        instruction ledger); ``messages`` is the transcript with old tool
-        results pruned to stubs and, when due, a trailing system-reminder
-        user message. Synchronous by contract — call
-        :meth:`maybe_compact` first each turn.
+        instruction ledger); ``messages`` is the transcript — with the oldest
+        tool results pruned to stubs *only if the window is under pressure*
+        (see :meth:`_prune_plan`) — and, when due, a trailing system-reminder
+        user message. Synchronous by contract — call :meth:`maybe_compact`
+        first each turn.
         """
         return self._assemble(consume_reminder_flag=True)
 
     # -- compaction ----------------------------------------------------------
 
-    def _token_count(self) -> int:
-        """Count tokens of the full assembly (system message + messages)."""
-        system, messages = self._assemble(consume_reminder_flag=False)
+    def _count_assembly(self, prune: frozenset[int] | None) -> int:
+        """Count tokens of one full assembly (system message + messages)."""
+        system, messages = self._assemble(
+            consume_reminder_flag=False, prune=prune
+        )
         full = [Message(role=Role.SYSTEM, content=system), *messages]
         return self._count_tokens(full)
+
+    def _raw_token_count(self) -> int:
+        """Tokens of the assembly with **no** pruning — the pressure signal.
+
+        This is what the pruning decision reads. It must pass an explicit
+        empty prune set rather than ``None``, or :meth:`_assemble` would call
+        :meth:`_prune_plan`, which calls back here, forever.
+        """
+        if self._raw_count_cache is None:
+            self._raw_count_cache = self._count_assembly(frozenset())
+        return self._raw_count_cache
+
+    def _token_count(self) -> int:
+        """Tokens of what actually goes to the provider — i.e. *after* any
+        pruning. This is what compaction reads, so compaction triggers on
+        real wire pressure."""
+        if self._token_count_cache is None:
+            self._token_count_cache = self._count_assembly(None)
+        return self._token_count_cache
 
     def _eviction_boundary(self) -> int:
         """Compute where :meth:`compact` would split the transcript.
@@ -379,4 +524,5 @@ class ContextManager:
         self._event_refs[:half] = [self._next_ref]
         self._next_ref += 1
         self._reminder_due = True
+        self._invalidate_counts()
         return evicted

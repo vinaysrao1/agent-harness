@@ -15,7 +15,16 @@ Loop shape per turn:
    a hard failure (§4.9: "budgets are pause-points, not failures"). With a
    wall-clock deadline and no caller-chosen turn ceiling, the turn budget is
    raised to a clock-derived runaway rail (:data:`MIN_SECONDS_PER_TURN`) so a
-   turn count cannot end a run that still has time to work.
+   turn count cannot end a run that still has time to work. The wall clock
+   adds two gates here: a hard stop below
+   :data:`~harness.deadline.WALL_CLOCK_STOP_FLOOR` (nothing new starts), and
+   just above it a one-time *landing turn* (:data:`LANDING_TURN_NOTICE`,
+   persisted as ``landing_turn``) in which ``bash`` is refused so the last
+   affordable model call is spent writing the answer down rather than
+   starting work whose result can never come back. That turn is terminal:
+   the run finishes on it (``landing_finish``), through the ordinary
+   completion path so the self-verification gate still runs, rather than
+   looping on with a dead shell.
 2. ``await context.maybe_compact()`` repeatedly until the assembly is back
    under the threshold (or compaction stops shrinking the transcript) —
    each evicted span is persisted as a ``compaction`` event together with
@@ -126,6 +135,7 @@ __all__ = [
     "AgentResult",
     "AskCallable",
     "AgentLoop",
+    "LANDING_TURN_NOTICE",
     "MIN_SECONDS_PER_TURN",
     "WIND_DOWN_FRACTION",
     "WIND_DOWN_MAX_REMAINING",
@@ -210,6 +220,32 @@ WIND_DOWN_REMINDER: str = (
     "output location(s) and can actually run — a working partial answer on "
     "disk beats a perfect one you never finish. Do a quick sanity check, "
     "then conclude.\n"
+    "</system-reminder>"
+)
+
+
+#: Injected once as a user message on the run's final turn, when what
+#: remains can fund a model call but not a model call *plus* a command
+#: *plus* the reply that acts on its output (see :meth:`AgentLoop.run` step
+#: 1a). Distinct from :data:`WIND_DOWN_REMINDER`, which fires minutes
+#: earlier and still expects work to happen: this one says the work is over.
+#: Format with ``remaining=`` (whole seconds).
+#:
+#: It names the ``bash`` refusal explicitly because the refusal happens
+#: either way — a model that is told why it cannot run commands spends its
+#: last turn answering rather than retrying. It avoids
+#: :data:`harness.diligence._PROMISE_PATTERNS` phrasing for the same reason
+#: :data:`TRUNCATION_REMINDERS` does: the turn it provokes is the final
+#: answer and must not read as unfinished.
+LANDING_TURN_NOTICE: str = (
+    "<system-reminder>\n"
+    "This is your final turn: about {remaining}s remain, which is only "
+    "enough for this one reply. Shell commands will not be executed from "
+    "here on — a command started now could not finish and come back in "
+    "time. Right now, in this reply, state where your answer is: the exact "
+    "paths you have already written and what they contain. If you still "
+    "need to write something down, use write_file — it is not blocked. "
+    "Then give your answer.\n"
     "</system-reminder>"
 )
 
@@ -757,6 +793,14 @@ class AgentLoop:
         # another re-prompt can still fit in the remaining budget (step 5a).
         last_call_seconds = 0.0
         wound_down = False
+        # Whether this loop is on its landing turn (step 1a-ii). Loop-local
+        # because the notice is per-agent and must be injected at most once;
+        # the run-wide half of the flag lives on the deadline, where the
+        # bash tool can see it. Once set it stays set for exactly one
+        # iteration, because that iteration ends the run: nothing below
+        # ``continue``s while it is true, so the shell can never be dead for
+        # a turn the agent could still have used.
+        landing = False
         #: The model's currently declared verification command (§10.3 B1);
         #: set/replaced by successful ``declare_verification`` tool calls.
         #: Seeded from the constructor so resume can re-arm a declaration
@@ -812,6 +856,83 @@ class AgentLoop:
                     {"remaining_seconds": remaining},
                 )
                 return self._finish("paused_budget", None, total_usage, turns)
+
+            # 1a-ii. The landing turn. The hard stop above is checked here,
+            # at the loop top — but the exec it is protecting is issued
+            # *after* the model call has already spent part of the margin.
+            # Two observed hard-stops died exactly there: qemu-alpine-ssh
+            # seq 238 passed this check at 63.0s remaining, generated for
+            # 4.6s, and issued a 30s exec at 58.4s — already inside the
+            # floor; make-doom-for-mips seq 553 passed at 62.6s, generated
+            # for 15.8s, and issued its exec at 46.8s. Both were legitimate
+            # at the top and doomed by the time they acted. No tool-layer
+            # arithmetic can recover that: the turn was already given away.
+            #
+            # So when what remains can fund a model call but not a call plus
+            # a command plus the reply that acts on it, take one final,
+            # tool-restricted turn instead of an ordinary working turn. The
+            # width of the band is this run's own observed median call,
+            # because that is what the next call will actually cost; with an
+            # empty window (no calls yet) the band is disabled and behaviour
+            # is exactly what it was.
+            #
+            # **That turn is the run's last.** ``landing`` is a latch and
+            # ``Deadline.begin_landing`` is deliberately irreversible, so
+            # terminating on it is not a nicety — it is what stops the latch
+            # from outliving the evidence that armed it. Without the finish
+            # the loop kept issuing ordinary turns with the shell dead: a
+            # window whose median lags the provider by half its length can
+            # arm the band on a call cost that is already stale, and nothing
+            # would ever re-evaluate it. Measured on this branch before the
+            # fix: budget 3600 armed at remaining 259 on a stale 200s
+            # median, then 40 consecutive bash refusals and zero execs while
+            # the provider was actually running at 5s/call. Ending here
+            # bounds the damage at one turn *and* keeps the model's own text
+            # as the answer, which is the whole point of the landing turn —
+            # the alternative is the loop-top hard stop, which pauses with
+            # no final text at all.
+            #
+            # Honest scope: on the corpus this converts two wasted 30s execs
+            # into two final model calls, and neither trial had an answer
+            # worth landing — the expected recovery is zero tasks. What it
+            # buys is that the guarantee the reserve arithmetic has been
+            # claiming becomes true.
+            if not landing and remaining is not None and deadline is not None:
+                expected = deadline.recent_call_median()
+                if (
+                    expected is not None
+                    and remaining < WALL_CLOCK_STOP_FLOOR + expected
+                ):
+                    landing = True
+                    # Arm the tool-side gate. Explicit state, shared through
+                    # the one object the loop and the bash tool both hold —
+                    # never a rule the tool derives from a requested
+                    # timeout, which is what would let the harness's own
+                    # default masquerade as agent intent.
+                    deadline.begin_landing()
+                    self._append_message(
+                        Message(
+                            role=Role.USER,
+                            content=LANDING_TURN_NOTICE.format(
+                                remaining=int(remaining)
+                            ),
+                        )
+                    )
+                    self.store.append_event(
+                        self.agent_id,
+                        "landing_turn",
+                        {
+                            "remaining_seconds": remaining,
+                            "expected_call_seconds": expected,
+                        },
+                    )
+            # Nothing here couples ``landing`` to ``wound_down``: by the
+            # time this band can arm, 1b below has either fired long ago or
+            # fires in this same iteration (its threshold is at least 300s,
+            # or half a degenerate budget), so diligence nudges — which
+            # would spend the landing turn asking for more work — are
+            # already suppressed. Keeping the two flags independent keeps
+            # ``wound_down`` telemetry meaning what it says.
 
             # 1b. Wall-clock wind-down: once the hard external deadline is near,
             # inject a one-time reminder to stop exploring and land a working
@@ -962,7 +1083,24 @@ class AgentLoop:
                                 ),
                             },
                         )
-                continue
+                if not landing:
+                    continue
+                # Change 1c: the landing turn is the run's last, so a turn
+                # that spent itself on tool calls does not go round again —
+                # it falls through to the completion path below with
+                # whatever text it did produce. Falling through rather than
+                # returning here is what keeps the self-verification gate
+                # (5c) intact: a declaration made *on* the landing turn is
+                # still executed before the run is accepted, which is the
+                # one thing a shortcut return would silently demote.
+                self.store.append_event(
+                    self.agent_id,
+                    "landing_finish",
+                    {
+                        "tool_calls": len(response.message.tool_calls),
+                        "has_text": bool(response.message.content),
+                    },
+                )
 
             # 5a. Incomplete turn with no action: the turn produced nothing the
             # loop can act on — the model hit the output-token cap mid-thought,
@@ -971,7 +1109,12 @@ class AgentLoop:
             # would bank a non-answer as "done", so re-prompt it to act, with
             # wording matching the actual cause — bounded so a persistently
             # incomplete turn cannot loop.
-            if response.incomplete:
+            #
+            # Never on the landing turn (Change 1c): there is no second turn
+            # to re-prompt into, and spending the last of the wall-clock on
+            # a call whose reply cannot be read is the exact waste the band
+            # exists to prevent. Take the partial text as the answer.
+            if response.incomplete and not landing:
                 if truncation_continues < MAX_TRUNCATION_CONTINUES:
                     # Deadline-aware skip: a re-prompt is only worth its cost if
                     # the answer it provokes can arrive *and* be acted on. Model
@@ -1104,8 +1247,10 @@ class AgentLoop:
                 final_text, self._open_task_count()
             )
             # Once wound down, accept the final answer rather than nudging the
-            # agent back into work it no longer has time to finish.
-            if unfinished and nudges < MAX_NUDGES and not wound_down:
+            # agent back into work it no longer has time to finish. The
+            # landing turn is the harder case of the same rule: there is no
+            # turn after it to nudge into.
+            if unfinished and nudges < MAX_NUDGES and not wound_down and not landing:
                 nudges += 1
                 reminder = CONTINUE_REMINDER.format(reason=reason)
                 # Persisted as a regular 'message' event (plus the 'nudge'
@@ -1168,7 +1313,7 @@ class AgentLoop:
                     self.store.append_event(
                         self.agent_id, "verification_failed", payload
                     )
-                elif nudges < MAX_NUDGES and not wound_down:
+                elif nudges < MAX_NUDGES and not wound_down and not landing:
                     nudges += 1
                     payload["nudge_number"] = nudges
                     self.store.append_event(
@@ -1197,6 +1342,8 @@ class AgentLoop:
                         payload["nudges_exhausted"] = True
                     if wound_down:
                         payload["wound_down"] = True
+                    if landing:
+                        payload["landing"] = True
                     self.store.append_event(
                         self.agent_id, "verification_failed", payload
                     )

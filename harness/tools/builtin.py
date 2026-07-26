@@ -63,6 +63,9 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard (context is optional)
     from harness.context import ContextManager
 
 __all__ = [
+    "DEFAULT_EXEC_TIMEOUT",
+    "MIN_EXEC_SECONDS",
+    "LANDING_REFUSAL",
     "MissingArgumentError",
     "bash_tool",
     "read_file_tool",
@@ -114,11 +117,45 @@ def _require_str(tool_name: str, arguments: dict, key: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Timeout applied to a ``bash`` call that names none.
+#:
+#: Deliberately a named constant rather than an inline literal, because the
+#: distinction matters: a timeout the *harness* chose is not agent intent.
+#: 74% of observed bash calls (380 of 513) omit ``timeout`` entirely, and 24
+#: of 63 exec-cap events were raised against this bare default — telling a
+#: model it "asked for 120s" when it asked for nothing is a false diagnosis,
+#: and keying any refusal off it would strand an agent whose one-line ``cp``
+#: was going to land the answer. See the ``bash`` handler.
+DEFAULT_EXEC_TIMEOUT: float = 120.0
+
+#: Smallest timeout this tool will ever *dispatch*.
+#:
+#: :meth:`~harness.deadline.Deadline.exec_decision` may legitimately answer
+#: ``0.0`` — inside :data:`~harness.deadline.WALL_CLOCK_STOP_FLOOR` nothing
+#: new should start, and saying so honestly is the point of the clamp. But
+#: handing ``0.0`` to ``sandbox.exec`` is not "nothing started": it starts
+#: the command and kills it instantly, so it comes back as a *timeout* —
+#: a hard failure for a one-line ``cp`` that would have taken 10ms and
+#: landed the answer. That is refusal-by-arithmetic wearing an exec's
+#: clothes, which is exactly what Change 1 set out to remove, so a window
+#: that rounds to nothing is widened to this instead.
+#:
+#: 1.0s, against a measured median capped-exec runtime of 0.79s on the
+#: 63-row round-2 corpus: enough for the short commands that actually land
+#: answers, and a rounding error against the 60s stop floor it is borrowed
+#: from. A caller that explicitly asks for less than this still gets what
+#: it asked for — the floor never lengthens an agent's own choice.
+MIN_EXEC_SECONDS: float = 1.0
+
+
 #: What to tell the model when its exec timeout was cut, keyed by the
 #: ``exec_cap`` reason. The reason changes the *correct response*: a share
 #: cap early in a run means "break this work up", while a landing cap near
 #: the deadline means "stop starting long work and write your answer down".
 #: One generic note would teach the wrong lesson in one of the two cases.
+#: ``"landing"`` is not an ``exec_cap`` reason — it is the loop's explicit
+#: final-turn state — but its advice belongs in the same table so all the
+#: near-deadline wording the model ever sees is written in one place.
 _CAP_ADVICE: dict[str, str] = {
     "share": (
         "no single command may use more than half the run's total budget; "
@@ -132,7 +169,21 @@ _CAP_ADVICE: dict[str, str] = {
         "time is held back so you get a turn to land your answer before "
         "the deadline; do not start another long command"
     ),
+    "landing": (
+        "this is your final turn before the run's wall-clock deadline: "
+        "there is no longer time for a command to finish and for you to act "
+        "on its output. Do not retry — say where your answer is (the paths "
+        "you have already written), or write it now with write_file, and "
+        "then give your final answer"
+    ),
 }
+
+#: What ``bash`` returns instead of running a command once the loop has
+#: declared the landing turn. A *normal* result, not an error: the refusal
+#: is the harness's decision, not the agent's mistake, and routing it
+#: through the error path would spend nudge and truncation budget the
+#: landing turn needs.
+LANDING_REFUSAL: str = f"command not run — {_CAP_ADVICE['landing']}."
 
 
 def bash_tool(
@@ -175,6 +226,31 @@ def bash_tool(
     softener raised it. Only the pair answers the question the event exists
     to answer, since ``remaining - effective`` recovers the applied reserve
     for ``reason`` ``"band"``/``"reserve"`` but not for ``"share"``.
+
+    Two deadline behaviours beyond the cap itself:
+
+    - **An omitted ``timeout`` is the harness's number, not the agent's.**
+      74% of observed bash calls omit it, and capping the resulting bare
+      :data:`DEFAULT_EXEC_TIMEOUT` produced 24 of 63 ``exec_capped`` events
+      that told the model it had "requested 120s" when it had requested
+      nothing. So an omitted timeout is pre-shrunk to
+      :meth:`~harness.deadline.Deadline.affordable_exec_seconds` instead:
+      the command still runs, in whatever window the run can afford, and no
+      cap is reported or recorded because none bit. No refusal is ever
+      keyed off it -- the median capped exec on that corpus ran 0.79s, so
+      small windows are useful, and refusing an agent's one-line ``cp``
+      because *the harness* defaulted to 120s is exactly the failure this
+      avoids.
+    - **The landing turn.** Once the loop calls
+      :meth:`~harness.deadline.Deadline.begin_landing`, ``bash`` stops
+      executing and returns :data:`LANDING_REFUSAL` as an ordinary (not
+      ``is_error``) result. That gate reads explicit loop state and nothing
+      else; it never inspects the requested timeout.
+    - **No zero-second exec.** The cap arithmetic may legitimately answer
+      ``0.0``; dispatching that would turn a 10ms ``cp`` into a timeout,
+      so the dispatched window is floored at :data:`MIN_EXEC_SECONDS`. The
+      only two ways a command is not run are the landing refusal above and
+      the policy layer -- never a number that rounded to nothing.
     """
 
     spec = ToolSpec(
@@ -182,9 +258,10 @@ def bash_tool(
         description=(
             "Run a shell command in the sandbox workspace and return its "
             "exit code, stdout, and stderr. Times out after `timeout` "
-            "seconds (default 120). Near the run's wall-clock deadline, "
-            "this timeout may be capped shorter to preserve time to land a "
-            "final answer."
+            "seconds; omit it and the default (120s) adapts down to "
+            "whatever the run's remaining wall-clock can afford. Near the "
+            "run's wall-clock deadline, an explicit `timeout` may be capped "
+            "shorter to preserve time to land a final answer."
         ),
         input_schema={
             "type": "object",
@@ -204,7 +281,36 @@ def bash_tool(
 
     async def handler(arguments: dict) -> str:
         command = _require_str("bash", arguments, "command")
-        requested = float(arguments.get("timeout", 120))
+        if deadline is not None and deadline.landing:
+            # The loop has declared the final turn. Refuse from explicit
+            # state, before any arithmetic: nothing here inspects what
+            # timeout was asked for, so no default of the harness's own can
+            # ever be mistaken for an agent asking to run something long.
+            return LANDING_REFUSAL
+        explicit = arguments.get("timeout")
+        from_default = explicit is None
+        if from_default:
+            # An omitted timeout is the harness's number, not the agent's.
+            # Shrink it to what the run can afford instead of asking for
+            # 120s and reporting a cap: the cap then cannot bite, which is
+            # what makes "capped from your requested Ns" always true when it
+            # is printed.
+            requested = DEFAULT_EXEC_TIMEOUT
+            affordable = (
+                deadline.affordable_exec_seconds()
+                if deadline is not None
+                else None
+            )
+            if affordable is not None:
+                # Never below MIN_EXEC_SECONDS: `affordable` is 0.0 once
+                # `remaining <= WALL_CLOCK_STOP_FLOOR`, and a default the
+                # harness shrank to nothing would fail the agent's command
+                # outright instead of shortening it.
+                requested = max(
+                    MIN_EXEC_SECONDS, min(DEFAULT_EXEC_TIMEOUT, affordable)
+                )
+        else:
+            requested = float(explicit)
         remaining = deadline.remaining() if deadline is not None else None
         effective, capped, reason = requested, False, None
         if deadline is not None:
@@ -214,6 +320,41 @@ def bash_tool(
                 decision.capped,
                 decision.reason,
             )
+            # A window that rounds to nothing is widened, never dispatched
+            # (see MIN_EXEC_SECONDS). Reachable whenever `remaining` has
+            # fallen to the stop floor without the loop's landing turn
+            # arming — on a run's very first turn the call window is empty,
+            # so the band is deliberately disabled, and generation can
+            # spend the margin between the loop-top check and this exec.
+            # The cap is still *reported*: the agent asked for 30s and is
+            # getting 1s, which is true and worth saying. Only the silent
+            # sub-second window is removed.
+            #
+            # The floor is MIN_EXEC_SECONDS, not zero: `remaining` strictly
+            # between the stop floor and one second above it clamps to a
+            # positive fraction of a second, which is a window the harness's
+            # own arithmetic invented and no command can use. `min` with
+            # `requested` keeps the one documented exemption — a caller that
+            # explicitly asks for less than a second gets what it asked for,
+            # never less.
+            floor = min(requested, MIN_EXEC_SECONDS)
+            if 0.0 < requested and effective < floor:
+                effective = floor
+            # By construction the pre-clamped default is never capped; the
+            # suppression is belt-and-braces so the invariant "a reported
+            # cap names a number the agent actually chose" is enforced here
+            # rather than merely implied by the arithmetic above.
+            #
+            # `effective < requested` is the other half of the same
+            # invariant, and it is the floor above that makes it load-
+            # bearing: an explicit sub-second ask that the deadline clamped
+            # is restored to exactly `requested`, so `decision.capped` is
+            # True while no cap actually bit. Reporting one there would
+            # tell the agent "capped to 0.25s" when it asked for 0.25s and
+            # got 0.25s, and would put a row with requested == effective
+            # into the `exec_capped` corpus this docstring cites for
+            # calibration. A cap is reported only when it took something.
+            capped = capped and not from_default and effective < requested
             if capped and store is not None and agent_id is not None:
                 store.append_event(
                     agent_id,
@@ -230,6 +371,14 @@ def bash_tool(
                     },
                 )
         advice = _CAP_ADVICE.get(reason or "", "")
+        # A default the deadline shortened is worth saying — the model needs
+        # to know the window was small — but it is said as what it is, not
+        # as a cap on something the model asked for.
+        shortened_default = from_default and effective < DEFAULT_EXEC_TIMEOUT
+        short_note = (
+            f"no timeout was given, so the default was shortened to "
+            f"{effective}s to fit the ~{remaining}s of wall-clock remaining"
+        )
         result = await sandbox.exec(command, timeout=effective)
         lines = [f"exit code: {result.exit_code}"]
         if result.timed_out:
@@ -239,6 +388,11 @@ def bash_tool(
                     f"your requested {requested}s with ~{remaining}s of "
                     f"wall-clock remaining: {advice})"
                 )
+            elif shortened_default:
+                lines.append(
+                    f"(command timed out after {effective}s — {short_note}: "
+                    f"{_CAP_ADVICE['reserve']})"
+                )
             else:
                 lines.append(f"(command timed out after {effective}s)")
         elif capped:
@@ -246,6 +400,8 @@ def bash_tool(
                 f"(note: timeout was capped to {effective}s to fit the "
                 f"remaining time budget: {advice})"
             )
+        elif shortened_default:
+            lines.append(f"(note: {short_note})")
         if result.stdout:
             lines.append("--- stdout ---")
             lines.append(result.stdout)

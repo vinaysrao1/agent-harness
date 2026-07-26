@@ -21,6 +21,9 @@ from harness.sandbox.local import LocalSandbox
 from harness.skills import SkillLibrary
 from harness.context import ContextManager
 from harness.tools.builtin import (
+    DEFAULT_EXEC_TIMEOUT,
+    MIN_EXEC_SECONDS,
+    LANDING_REFUSAL,
     MissingArgumentError,
     add_instruction_tool,
     bash_tool,
@@ -359,8 +362,10 @@ class TestBashToolDeadlineCap:
 
     async def test_cap_applies_when_remaining_is_tight(self):
         # remaining=200 of 900, reserve=90 (60 floor + 30 default allowance)
-        # -> allowed 110s, below the default 120s request. In-band (200 <
-        # the 300s wind-down threshold), so the band softener does not add.
+        # -> allowed 110s, below the 120s default. In-band (200 < the 300s
+        # wind-down threshold), so the band softener does not add. Since
+        # 1b, the omitted timeout is shrunk to 110s up front rather than
+        # asked for at 120s and capped, but the exec window is identical.
         sandbox = FakeExecSandbox()
         tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, 200.0))
         await tool.handler({"command": "echo hi"})
@@ -412,9 +417,11 @@ class TestBashToolDeadlineCap:
         tool = bash_tool(
             sandbox, deadline=_fixed_deadline(900.0, 200.0)
         )  # allows 110s
-        output = await tool.handler({"command": "sleep 1000"})
+        # An *explicit* timeout: 1b makes "capped from your requested Ns"
+        # reachable only for a number the agent actually chose.
+        output = await tool.handler({"command": "sleep 1000", "timeout": 1000})
         assert "timed out after 110.0s" in output
-        assert "capped from your requested 120.0s" in output
+        assert "capped from your requested 1000.0s" in output
         assert "~200.0s of wall-clock remain" in output
         assert "do not start another long command" in output
 
@@ -476,6 +483,355 @@ class TestBashToolDeadlineCap:
         )  # in-band: reserve, not share
         output = await tool.handler({"command": "make", "timeout": 120})
         assert "land your answer" in output
+
+
+class TestBashToolDeadlineAwareDefault:
+    """Change 1b: an omitted ``timeout`` is the harness's number.
+
+    380 of 513 observed bash calls (74%) named no timeout, and 24 of the 63
+    ``exec_capped`` events were raised against the resulting bare 120s
+    default — telling the model it "requested 120s" when it requested
+    nothing. The default now shrinks to what the run can afford instead, so
+    the command still runs and no cap is reported for a number the agent
+    never chose.
+    """
+
+    async def test_default_is_the_named_constant_without_a_deadline(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox)
+        await tool.handler({"command": "echo hi"})
+        assert sandbox.received_timeout == DEFAULT_EXEC_TIMEOUT
+
+    async def test_ample_remaining_leaves_the_default_alone(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(10_000.0))
+        output = await tool.handler({"command": "echo hi"})
+        assert sandbox.received_timeout == DEFAULT_EXEC_TIMEOUT
+        assert "no timeout was given" not in output
+
+    async def test_default_shrinks_to_what_the_run_can_afford(self):
+        # remaining 200 of 900: affordable = 200 - 90 = 110s.
+        sandbox = FakeExecSandbox()
+        deadline = _fixed_deadline(900.0, 200.0)
+        tool = bash_tool(sandbox, deadline=deadline)
+        output = await tool.handler({"command": "echo hi"})
+        assert sandbox.received_timeout == min(
+            DEFAULT_EXEC_TIMEOUT, deadline.affordable_exec_seconds()
+        )
+        assert sandbox.received_timeout == 110.0
+        # It is described as what it is, never as a cap on a request.
+        assert "capped from your requested" not in output
+        assert "no timeout was given" in output
+
+    async def test_no_exec_capped_event_for_a_shrunk_default(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(
+            sandbox,
+            deadline=_fixed_deadline(900.0, 200.0),
+            store=run_store,
+            agent_id=agent_id,
+        )
+        await tool.handler({"command": "echo hi"})
+        assert [
+            event
+            for event in run_store.load_events(agent_id)
+            if event.kind == "exec_capped"
+        ] == []
+
+    async def test_an_explicit_timeout_is_still_capped_and_recorded(
+        self, run_store: RunStore, run_id: str
+    ):
+        # The other half: intent the agent did express is still bounded,
+        # still reported, still telemetry.
+        agent_id = run_store.create_agent(run_id, "goal")
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(
+            sandbox,
+            deadline=_fixed_deadline(900.0, 200.0),
+            store=run_store,
+            agent_id=agent_id,
+        )
+        output = await tool.handler({"command": "echo hi", "timeout": 400})
+        assert sandbox.received_timeout == 110.0
+        assert "timeout was capped to 110.0s" in output
+        (event,) = [
+            event
+            for event in run_store.load_events(agent_id)
+            if event.kind == "exec_capped"
+        ]
+        assert event.payload["requested"] == 400.0
+        assert event.payload["effective"] == 110.0
+
+    async def test_a_quick_copy_still_runs_at_sixty_four_seconds_left(self):
+        """The F3 anti-regression: v1 would have refused this.
+
+        At remaining 64s of 900 an agent writing its answer out issues
+        ``cp /tmp/answer.txt /app/`` with no timeout. v1's proposal refused
+        any exec whose window fell below MIN_USEFUL_EXEC_SECONDS = 5.0,
+        keyed on ``requested`` — which here is the harness's own 120s
+        default, not intent. The corpus says otherwise: the median capped
+        exec ran 0.79s, and this one is a file copy. It must execute.
+        """
+        sandbox = FakeExecSandbox()
+        deadline = _fixed_deadline(900.0, 64.0, observations=(5.0,) * 4)
+        tool = bash_tool(sandbox, deadline=deadline)
+        output = await tool.handler({"command": "cp /tmp/answer.txt /app/"})
+        # Reserve 75 -> the old floor would have said 30s and eaten the
+        # stop floor; 1a says 4s, and 4s copies a file.
+        assert sandbox.received_timeout == pytest.approx(4.0)
+        assert sandbox.received_timeout > 0.0
+        assert "exit code: 0" in output
+        assert "capped from your requested" not in output
+
+    async def test_a_shrunk_default_that_times_out_says_why_honestly(self):
+        sandbox = FakeExecSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, 200.0))
+        output = await tool.handler({"command": "sleep 1000"})
+        assert "timed out after 110.0s" in output
+        assert "no timeout was given" in output
+        assert "capped from your requested" not in output
+
+    async def test_description_mentions_the_adaptive_default(self):
+        description = bash_tool(FakeExecSandbox()).spec.description.lower()
+        assert "omit it" in description
+        assert "remaining wall-clock" in description
+
+
+class TestBashToolNeverDispatchesAZeroWindow:
+    """The exec cap may answer 0.0; the tool must never *run* a 0.0.
+
+    ``affordable_exec_seconds()`` is exactly 0.0 once ``remaining`` reaches
+    :data:`WALL_CLOCK_STOP_FLOOR`, which is reachable with the landing band
+    disarmed — on a run's first turn the call window is empty by
+    construction, and generation can spend the margin between the loop-top
+    check and the exec. Dispatching that 0.0 does not decline to run the
+    command: it runs it and kills it instantly, so an agent's one-line
+    ``cp`` comes back as a *timeout* where before the wind-down work it
+    would simply have succeeded. A refusal is at least honest; an instant
+    timeout is refusal-by-arithmetic wearing an exec's clothes.
+    """
+
+    async def test_an_omitted_timeout_inside_the_stop_floor_still_runs(self):
+        # The exact reviewed repro: Deadline(3600) at remaining 59.0, no
+        # landing declared, no timeout given.
+        sandbox = FakeExecSandbox()
+        deadline = _fixed_deadline(3600.0, 59.0)
+        assert deadline.affordable_exec_seconds() == 0.0
+        tool = bash_tool(sandbox, deadline=deadline)
+        output = await tool.handler({"command": "cp /tmp/answer.txt /app/"})
+        assert sandbox.received_timeout == MIN_EXEC_SECONDS
+        assert sandbox.received_timeout > 0.0
+        assert "exit code: 0" in output
+        # Still never reported as a cap on a number the agent never chose.
+        assert "capped from your requested" not in output
+        assert "shortened to 0.0s" not in output
+
+    async def test_an_explicit_timeout_inside_the_stop_floor_still_runs(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, 59.0))
+        output = await tool.handler({"command": "cp a b", "timeout": 30})
+        assert sandbox.received_timeout == MIN_EXEC_SECONDS
+        # The agent asked for 30 and got 1: that is a real cap and is said.
+        assert "timeout was capped to 1.0s" in output
+
+    async def test_the_floor_never_lengthens_an_explicit_short_timeout(self):
+        # The floor exists to stop the arithmetic reaching zero, not to
+        # overrule an agent that deliberately wants a very short command.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, 59.0))
+        await tool.handler({"command": "cp a b", "timeout": 0.25})
+        assert sandbox.received_timeout == 0.25
+
+    async def test_a_floor_restored_ask_is_not_reported_as_a_cap(self):
+        # The floor lifts an explicit sub-second ask back to exactly what
+        # was requested, so `exec_decision` says "capped" while nothing was
+        # taken. Saying so would tell the agent its 0.25s was "capped to
+        # 0.25s" — and the timed-out spelling contradicts itself inside a
+        # single sentence.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, 59.0))
+        output = await tool.handler({"command": "cp a b", "timeout": 0.25})
+        assert sandbox.received_timeout == 0.25
+        assert "capped" not in output
+        # A cap that really bit is still reported, unchanged.
+        capped_out = await bash_tool(
+            FakeExecSandbox(), deadline=_fixed_deadline(3600.0, 59.0)
+        ).handler({"command": "cp a b", "timeout": 30})
+        assert "timeout was capped to 1.0s" in capped_out
+
+    async def test_a_floor_restored_ask_records_no_exec_capped_event(
+        self, run_store: RunStore, run_id: str
+    ):
+        # The same falsehood as telemetry: a corpus row with
+        # requested == effective would mis-calibrate every reader of the
+        # exec_capped series.
+        agent_id = run_store.create_agent(run_id, "goal")
+        tool = bash_tool(
+            FakeExecSandbox(),
+            deadline=_fixed_deadline(3600.0, 59.0),
+            store=run_store,
+            agent_id=agent_id,
+        )
+        await tool.handler({"command": "cp a b", "timeout": 0.25})
+        assert [
+            event
+            for event in run_store.load_events(agent_id)
+            if event.kind == "exec_capped"
+        ] == []
+
+    @pytest.mark.parametrize("timeout", [0.05, 0.25, 0.5, 0.999, 1.0])
+    async def test_no_explicit_sub_second_ask_is_ever_a_false_cap(
+        self, timeout: float
+    ):
+        # Every explicit timeout in (0, MIN_EXEC_SECONDS] is restored by the
+        # floor once `remaining` is inside the reserve; none of them may
+        # claim a cap. Swept, because the band is a whole interval rather
+        # than the one value the repro used.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, 59.0))
+        output = await tool.handler({"command": "cp a b", "timeout": timeout})
+        assert sandbox.received_timeout == timeout
+        assert "capped" not in output
+
+    @pytest.mark.parametrize("remaining", [0.5, 5.0, 30.0, 59.0, 60.0])
+    async def test_no_reachable_remaining_produces_a_zero_window(
+        self, remaining: float
+    ):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, remaining))
+        await tool.handler({"command": "ls"})
+        assert sandbox.received_timeout >= MIN_EXEC_SECONDS
+
+    @pytest.mark.parametrize("remaining", [60.001, 60.1, 60.5, 60.9, 60.999])
+    async def test_the_band_just_above_the_stop_floor_is_not_sub_second(
+        self, remaining: float
+    ):
+        # `remaining` strictly between the stop floor and one second above
+        # it clamps to a *positive fraction of a second* — a window no
+        # command can use, and a number the agent never chose. Guarding
+        # only the exact 0.0 left this one-second-wide band dispatching
+        # e.g. 0.0999s, which is the same instant timeout in a different
+        # spelling. The floor is MIN_EXEC_SECONDS, as its docstring says.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, remaining))
+        await tool.handler({"command": "cp a b"})
+        assert sandbox.received_timeout == MIN_EXEC_SECONDS
+
+    @pytest.mark.parametrize("remaining", [0.25, 1.0, 59.5, 60.1, 60.75, 61.5])
+    async def test_the_floor_holds_across_the_whole_wind_down_tail(
+        self, remaining: float
+    ):
+        # The invariant stated by MIN_EXEC_SECONDS, swept rather than
+        # spot-checked: an omitted timeout is never dispatched below a
+        # second, whatever the arithmetic produces.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, remaining))
+        await tool.handler({"command": "ls"})
+        assert sandbox.received_timeout is not None
+        assert sandbox.received_timeout >= MIN_EXEC_SECONDS
+
+    @pytest.mark.parametrize("remaining", [60.1, 60.9])
+    async def test_an_explicit_sub_second_ask_is_still_honoured_in_the_band(
+        self, remaining: float
+    ):
+        # The one documented exemption survives the widened floor: a caller
+        # that explicitly asks for less than a second gets what it asked
+        # for — never less, and never lengthened to the floor.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, remaining))
+        await tool.handler({"command": "cp a b", "timeout": 0.25})
+        assert sandbox.received_timeout == 0.25
+
+    async def test_a_zero_window_is_still_a_normal_exec_not_a_refusal(self):
+        # The landing refusal is the *only* way bash declines to run, and
+        # it comes from explicit loop state. Arithmetic never refuses.
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(3600.0, 1.0))
+        output = await tool.handler({"command": "ls"})
+        assert output != LANDING_REFUSAL
+        assert sandbox.received_timeout == MIN_EXEC_SECONDS
+
+
+class TestBashToolLandingRefusal:
+    """Change 1c, tool side: the loop's final turn disables the shell.
+
+    The gate is :attr:`Deadline.landing` — explicit state the loop sets —
+    and nothing else. No arithmetic on the requested timeout is involved,
+    which is what makes the F3 failure (refusing an agent because of a
+    number the *harness* supplied) impossible by construction.
+    """
+
+    async def test_bash_refuses_without_touching_the_sandbox(self):
+        sandbox = FakeExecSandbox()
+        deadline = _fixed_deadline(900.0, 62.0)
+        deadline.begin_landing()
+        tool = bash_tool(sandbox, deadline=deadline)
+        output = await tool.handler({"command": "make test", "timeout": 5})
+        assert output == LANDING_REFUSAL
+        assert sandbox.received_timeout is None
+
+    async def test_the_refusal_tells_the_model_what_to_do_instead(self):
+        deadline = _fixed_deadline(900.0, 62.0)
+        deadline.begin_landing()
+        tool = bash_tool(FakeExecSandbox(), deadline=deadline)
+        output = await tool.handler({"command": "ls"})
+        assert "final turn" in output
+        assert "write_file" in output
+        assert "Do not retry" in output
+
+    async def test_the_refusal_is_a_normal_result_not_an_error(self):
+        # It must not spend nudge or truncation budget: the landing turn is
+        # the one turn the run cannot afford to have re-prompted.
+        registry = ToolRegistry()
+        deadline = _fixed_deadline(900.0, 62.0)
+        deadline.begin_landing()
+        registry.register(bash_tool(FakeExecSandbox(), deadline=deadline))
+        result = await registry.dispatch(
+            ToolCall(id="c1", name="bash", arguments={"command": "ls"})
+        )
+        assert result.is_error is False
+        assert result.content == LANDING_REFUSAL
+
+    async def test_nothing_is_refused_before_the_loop_declares_landing(self):
+        sandbox = FakeExecSandbox()
+        # Deep inside the stop floor, but the loop has not declared the
+        # landing turn: the tool does not decide this for itself. The
+        # command runs — in the smallest window the tool will dispatch,
+        # never in a 0s one, which would fail it outright.
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, 5.0))
+        output = await tool.handler({"command": "ls"})
+        assert output != LANDING_REFUSAL
+        assert sandbox.received_timeout == MIN_EXEC_SECONDS
+
+    async def test_no_deadline_means_no_gate(self):
+        sandbox = FakeExecSandbox()
+        tool = bash_tool(sandbox)
+        assert await tool.handler({"command": "ls"}) != LANDING_REFUSAL
+        assert sandbox.received_timeout == DEFAULT_EXEC_TIMEOUT
+
+    async def test_a_refusal_records_no_exec_capped_event(
+        self, run_store: RunStore, run_id: str
+    ):
+        agent_id = run_store.create_agent(run_id, "goal")
+        deadline = _fixed_deadline(900.0, 62.0)
+        deadline.begin_landing()
+        tool = bash_tool(
+            FakeExecSandbox(),
+            deadline=deadline,
+            store=run_store,
+            agent_id=agent_id,
+        )
+        await tool.handler({"command": "make", "timeout": 600})
+        assert [
+            event
+            for event in run_store.load_events(agent_id)
+            if event.kind == "exec_capped"
+        ] == []
 
 
 class TestBashToolExecCappedEvent:
@@ -1450,7 +1806,12 @@ class TestDeclareVerificationLint:
         (payload,) = self._lint_events(run_store, agent_id)
         assert payload["command"] == command
         assert payload["action"] == "warn"
-        assert [f["kind"] for f in payload["findings"]] == ["tautology"]
+        # The echoed file is both the source of the literal (tautology)
+        # and a file nothing ever ran to produce (no_execution, T1).
+        assert [f["kind"] for f in payload["findings"]] == [
+            "tautology",
+            "no_execution",
+        ]
 
     async def test_neutralized_exit_is_warned_not_rejected(
         self, run_store: RunStore, run_id: str
