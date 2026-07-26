@@ -35,6 +35,23 @@ which the tautology detector needs. Nothing here rejects a declaration or
 changes control flow — the lint appends an advisory to the tool result and
 emits a ``verification_lint`` event, building the labelled corpus a later
 round needs before any of this can be made to block.
+
+Round 3 (T1) adds two more shapes to the same warn-only lint, purely to
+grow that corpus: a command that never runs anything at all *and* only
+inspects files this run wrote by hand (``no_execution`` — the same
+read-vs-produced provenance rule detector 1 uses, so an honest check that
+greps output a program produced is not flagged), and a command that runs
+a checker script the agent wrote *this run*
+(``self_authored_checker``) — a real tautology class the
+other detectors cannot see, because the circular literal lives inside the
+checker's own logic rather than in a file the command's operands name. A
+verification-*strength* classifier able to act on either signal was
+scoped for this round and cut: round-2's real declared commands have no
+principled split between "strong" and "weak" on the tools this lint has
+(``_split_segments`` can even hand back shell comparison operators like
+``-eq``/``-lt`` as segment heads, not command names, when a command
+substitution sits inside a ``test`` expression). Nothing reads these two
+detectors' findings.
 """
 
 from __future__ import annotations
@@ -318,9 +335,10 @@ class LintFinding:
     """One verification-quality warning.
 
     ``kind`` is the stable machine label (``"tautology"``,
-    ``"neutralized_exit"``, ``"existence_only"``), ``message`` is the
-    advisory shown to the model, and ``details`` carries the structured
-    evidence a later round mines from the ``verification_lint`` corpus.
+    ``"neutralized_exit"``, ``"existence_only"``, ``"no_execution"``,
+    ``"self_authored_checker"``), ``message`` is the advisory shown to the
+    model, and ``details`` carries the structured evidence a later round
+    mines from the ``verification_lint`` corpus.
     """
 
     kind: str
@@ -372,7 +390,7 @@ def lint_verification(
 ) -> list[LintFinding]:
     """Lint a declared verification command. **Warn-only, never rejects.**
 
-    Three deliberately narrow detectors, in decreasing severity:
+    Five deliberately narrow detectors:
 
     1. **tautology** — the command greps for (or string-compares against) a
        literal that the agent itself wrote *into the file the command
@@ -385,12 +403,29 @@ def lint_verification(
        tokenization rather than a warning heuristic.
     3. **existence_only** — the whole command is one ``test -f``/``ls``,
        which proves a path exists and nothing about its content.
+    4. **no_execution** (round 3, T1) — every segment head is a known
+       read-only file predicate (``test``/``cat``/``grep``/``cmp``/``ls``/
+       ...) or a comparison-operator artifact :func:`_split_segments` can
+       hand back from inside a command substitution, *and* at least one
+       path the command reads is one this run wrote a literal into. So
+       nothing in the check runs the solution and nothing it reads was
+       produced by running it. An unrecognized segment head counts
+       *against* the finding, never for it, and an operand of unknown
+       provenance yields nothing — see :func:`_lint_no_execution`. Needs
+       ``written_data``.
+    5. **self_authored_checker** (round 3, T1) — the command runs
+       ``<interpreter> <script>`` (``perl verify.pl``) where ``script`` is
+       a path the agent wrote *this run* (present in ``written_data``). A
+       checker script the agent authored can assert anything; a tautology
+       inside its own logic is invisible to detector 1, which only looks
+       at what the command's own operands compare against, never at what a
+       script it invokes does internally. Needs ``written_data``.
 
-    Everything else — ``pytest``, ``make``, ``cmp``, ``python3 -c ...`` —
-    is never analyzed. Returns ``[]`` for an empty command, and gives up
-    silently (no findings from the affected detector) on anything it cannot
-    confidently tokenize or that carries variables or command substitution
-    in the operand it would have to reason about.
+    ``pytest``, ``make``, ``python3 -c ...`` and similar are never
+    analyzed by any detector above. Returns ``[]`` for an empty command,
+    and gives up silently (no findings from the affected detector) on
+    anything it cannot confidently tokenize or that carries variables or
+    command substitution in the operand it would have to reason about.
     """
     if not command or not command.strip():
         return []
@@ -401,6 +436,9 @@ def lint_verification(
         findings.extend(_lint_tautology(segments, written_data))
     findings.extend(_lint_neutralized_exit(command, tokens))
     findings.extend(_lint_existence_only(segments))
+    if written_data is not None:
+        findings.extend(_lint_no_execution(segments, written_data))
+        findings.extend(_lint_self_authored_checker(segments, written_data))
     return findings
 
 
@@ -428,10 +466,21 @@ def format_lint_advisory(findings: Sequence[LintFinding]) -> str:
 
 # -- tokenization ------------------------------------------------------------
 
+#: Process substitution openers, which ``punctuation_chars`` mode emits as
+#: single tokens. What follows one is a *command*, not an operand: in
+#: ``grep -q PASS <(python3 solve.py)`` the solution is executed and its
+#: output is what grep reads. They are segment separators for exactly that
+#: reason — splitting there puts the inner ``python3`` in head position, so
+#: every head-based detector sees the execution, and the script name stops
+#: being mistaken for a file the check merely read. (A redirect entry would
+#: not do: ``<`` is followed by a path, ``<(`` by a command line.)
+_PROCESS_SUBSTITUTIONS: Final[frozenset[str]] = frozenset({"<(", ">("})
+
 #: Tokens that end one command segment. ``punctuation_chars`` mode emits
 #: operator runs (``&&``, ``||``) as single tokens.
-_SEGMENT_SEPARATORS: Final[frozenset[str]] = frozenset(
-    {";", ";;", "&&", "||", "|", "|&", "&", "(", ")", "{", "}"}
+_SEGMENT_SEPARATORS: Final[frozenset[str]] = (
+    frozenset({";", ";;", "&&", "||", "|", "|&", "&", "(", ")", "{", "}"})
+    | _PROCESS_SUBSTITUTIONS
 )
 
 #: Shell keywords skipped at the head of a segment so ``if grep -q X f``
@@ -440,7 +489,9 @@ _LEADING_KEYWORDS: Final[frozenset[str]] = frozenset(
     {"if", "then", "else", "elif", "do", "while", "until", "!", "time"}
 )
 
-#: Redirect operators, recognized when scanning a segment.
+#: Redirect operators, recognized when scanning a segment. Process
+#: substitution is absent on purpose: it is split on instead
+#: (:data:`_PROCESS_SUBSTITUTIONS`), so it never reaches a segment scan.
 _REDIRECTS: Final[frozenset[str]] = frozenset({">", ">>", "<", "<<", "<<<"})
 
 
@@ -837,6 +888,429 @@ def _lint_existence_only(
             details={"probe": probe},
         )
     ]
+
+
+# -- detector 4: no_execution -------------------------------------------------
+
+#: Segment heads recognized as pure file-reading/inspection predicates —
+#: nothing in this set can run the solution under test. Deliberately small:
+#: an unrecognized head (a real interpreter, a compiled binary, an
+#: unfamiliar path) must count *against* the finding, never for it.
+_NO_EXECUTION_SAFE_HEADS: Final[frozenset[str]] = frozenset(
+    {
+        "test",
+        "[",
+        "[[",
+        "cat",
+        "grep",
+        "egrep",
+        "fgrep",
+        "head",
+        "tail",
+        "wc",
+        "cmp",
+        "diff",
+        "ls",
+        "stat",
+        "file",
+        "md5sum",
+        "sha1sum",
+        "sha256sum",
+        "sha512sum",
+        "true",
+        "false",
+    }
+)
+
+
+def _is_non_executing_artifact(head: str) -> bool:
+    """Whether ``head`` cannot possibly be a real command invocation.
+
+    ``_split_segments`` splits on ``(``/``)`` as well as ``;``/``&&``/etc.,
+    so a command substitution containing a redirect — ``test $(wc -c <
+    f) -lt 5000`` — gets its inner space-separated words split apart by
+    the substitution's own parens, and the trailing comparison operator
+    (``-lt``, ``-eq``, ``=``, ...) is handed back as if it were a fresh
+    segment head. No shell can invoke a program named ``-eq`` or ``=``, so
+    a head shaped like one is evidence of exactly this tokenizer artifact,
+    not of an unrecognized command that might execute something.
+    """
+    if head in ("=", "==", "!="):
+        return True
+    return len(head) > 1 and head.startswith("-")
+
+
+def _read_operand_paths(segments: Sequence[Sequence[str]]) -> list[str]:
+    """Path-shaped operands the segments *read*, best-effort.
+
+    Everything that is not the segment head, not a flag, not a ``test``
+    bracket, and carries no variable or command substitution counts as a
+    candidate path, plus the inner path of a ``$(cat PATH)`` substitution
+    (:data:`_CAT_SUBSTITUTION`). A redirect *target* (``> f``) is skipped:
+    that file is written, not read.
+
+    Candidates are only ever looked up in a :class:`WrittenData` map, so a
+    token that is not really a path simply matches nothing. Deliberately
+    approximate in the harmless direction.
+    """
+    paths: list[str] = []
+    for segment in segments:
+        skip_next = False
+        for index, token in enumerate(segment):
+            if skip_next:
+                skip_next = False
+                continue
+            if token in (">", ">>"):
+                skip_next = True
+                continue
+            if token in _REDIRECTS:
+                continue
+            match = _CAT_SUBSTITUTION.match(token)
+            if match is not None:
+                inner = match.group("paren") or match.group("tick") or ""
+                if inner:
+                    paths.append(inner)
+                continue
+            if index == 0 or token in ("]", "]]"):
+                continue
+            if token.startswith("-") and len(token) > 1:
+                continue
+            if "$" in token or "`" in token:
+                continue
+            paths.append(token)
+    return paths
+
+
+#: A candidate operand recognizable as a filename: it contains a directory
+#: separator, or its basename carries an extension. A guess, and applied
+#: only to heads whose operands genuinely might not be files at all —
+#: ``test``/``[``/``wc``-style segments, where a comparison literal
+#: (``100``, ``flag{gc0d3_iz_ch4LLenGiNg}``) sits in the same position a
+#: path would. Heads with a real grammar are parsed instead of guessed at
+#: (:func:`_parse_grep`, :func:`_compare_operand_paths`), because dropping
+#: a genuine operand here is not free: an unnamed file is an unrecorded
+#: producer, which *causes* a false ``no_execution`` finding.
+_PATH_SHAPED: Final[re.Pattern[str]] = re.compile(
+    r"^(?:[^\s]*/[^\s]*|[A-Za-z0-9_@%~+-]+(?:\.[A-Za-z0-9_+-]+)+)$"
+)
+
+#: Heads whose argument list :func:`_parse_grep` can split into a pattern
+#: and file operands. ``fgrep`` parses identically; only the pattern's
+#: dialect differs, which does not matter for naming the files.
+_GREP_LIKE_COMMANDS: Final[frozenset[str]] = _GREP_COMMANDS | {"fgrep"}
+
+#: Heads that compare *files and nothing else*. Unlike ``test``, whose
+#: operands may be literals (``test $(cat f) = ok``), every non-flag
+#: operand of one of these is a filename by definition, whatever its
+#: shape — which is why :func:`_compare_operand_paths` can name them
+#: without the :data:`_PATH_SHAPED` guess.
+_PURE_COMPARE_COMMANDS: Final[frozenset[str]] = frozenset({"cmp", "diff"})
+
+#: Short options that consume the *following* token as their argument,
+#: **keyed by command** — the two tools disagree and a head-agnostic set is
+#: wrong in the dangerous direction. ``cmp -i SKIP`` and ``cmp -n LIMIT``
+#: take an argument; ``diff -i`` (``--ignore-case``) and ``diff -n``
+#: (``--rcs``) take none, so skipping after them swallows a real file
+#: operand.
+#:
+#: Direction of error matters here. *Under*-skipping is safe: an argument
+#: mistaken for a file lands in the unknown set, which only ever suppresses
+#: a finding. *Over*-skipping is not: dropping a real operand can empty the
+#: unknown set and emit a false ``no_execution`` advisory — telling the
+#: model a command "reads only what you wrote" about a command that reads a
+#: program's output. So each set stays conservative for its own command.
+_COMPARE_FLAGS_WITH_ARG_BY_HEAD: Final[dict[str, frozenset[str]]] = {
+    "cmp": frozenset({"-i", "-n"}),
+    "diff": frozenset({"-I", "-D", "-S", "-W", "-x", "-X", "-F"}),
+}
+
+#: Fallback for a compare-shaped segment whose head we did not recognise:
+#: the intersection, i.e. only flags that take an argument for *every*
+#: known command, so an unknown head can never over-skip.
+_COMPARE_FLAGS_WITH_ARG: Final[frozenset[str]] = frozenset(
+    _COMPARE_FLAGS_WITH_ARG_BY_HEAD["cmp"] & _COMPARE_FLAGS_WITH_ARG_BY_HEAD["diff"]
+)
+
+
+def _compare_operand_paths(segment: Sequence[str]) -> list[str]:
+    """Every file operand of a pure comparison (``cmp``/``diff``).
+
+    The counterpart of :func:`_parse_grep` for the compare heads: it exists
+    so :func:`_unknown_provenance_paths` can name the program-produced side
+    of a golden-file check even when that side is a bare word. ``cmp
+    expected.bin out`` compares two *files*; ``out`` carries no extension
+    and no separator, so :data:`_PATH_SHAPED` cannot recognize it, and
+    dropping it would leave the segment looking like a check whose only
+    operand is hand-authored — the false ``no_execution`` finding this
+    parser removes.
+
+    Tokens carrying a variable or command substitution are still dropped,
+    since their expansion is unknown, except ``$(cat PATH)``, whose inner
+    path :data:`_CAT_SUBSTITUTION` recovers. A redirect *target* is skipped
+    for the same reason as in :func:`_read_operand_paths`: it is written,
+    not read.
+    """
+    paths: list[str] = []
+    skip_next = False
+    # Which short options consume the next token depends on WHICH compare
+    # command this is: ``cmp -i`` takes a byte count, ``diff -i`` takes
+    # nothing. An unrecognised head falls back to the intersection so it can
+    # never over-skip and swallow a real operand.
+    head = segment[0] if segment else ""
+    flags_with_arg = _COMPARE_FLAGS_WITH_ARG_BY_HEAD.get(
+        head.rsplit("/", 1)[-1], _COMPARE_FLAGS_WITH_ARG
+    )
+    for index, token in enumerate(segment):
+        if skip_next:
+            skip_next = False
+            continue
+        if token in (">", ">>"):
+            skip_next = True
+            continue
+        if token in _REDIRECTS:
+            continue
+        match = _CAT_SUBSTITUTION.match(token)
+        if match is not None:
+            inner = match.group("paren") or match.group("tick") or ""
+            if inner:
+                paths.append(inner)
+            continue
+        if index == 0:
+            continue
+        if token.startswith("-") and len(token) > 1:
+            if token in flags_with_arg:
+                skip_next = True
+            continue
+        if "$" in token or "`" in token:
+            continue
+        paths.append(token)
+    return paths
+
+
+def _unknown_provenance_paths(
+    segments: Sequence[Sequence[str]], written_data: WrittenData
+) -> list[str]:
+    """Files the segments read that this run never wrote into.
+
+    An operand the harness never saw written has *unknown* provenance, not
+    innocent provenance: a program may well have produced it. Naming those
+    separately is what lets :func:`_lint_no_execution` require that every
+    file a check reads be agent-authored instead of settling for one of
+    them.
+
+    Stricter than :func:`_read_operand_paths`, because here a wrong answer
+    is not harmless *in either direction*. A non-path counted as an unknown
+    file suppresses a true finding; an operand of a real file dropped for
+    not looking like one *causes* a false finding, since
+    :func:`_lint_no_execution` reads an empty unknown set as "nothing
+    produced any of this". Each head therefore gets the parser its grammar
+    allows:
+
+    * grep-shaped segments are split by :func:`_parse_grep`, so the
+      *pattern* is never mistaken for a file that is read —
+      ``grep -q '^Qwen/Qwen3-Embedding-8B$' result.txt`` reads exactly one.
+    * ``cmp``/``diff`` operands are all files by definition
+      (:func:`_compare_operand_paths`), so an extensionless one — the
+      ``out`` of ``cmp expected.bin out`` — is named as the file it is.
+    * everything else keeps the :data:`_PATH_SHAPED` guess, because a
+      ``test``/``[`` operand may be a bare literal to compare against
+      rather than a file, and there the shape is all there is to go on.
+
+    Segments whose operands cannot be named this confidently contribute
+    nothing.
+    """
+    unknown: set[str] = set()
+    for segment in segments:
+        if not segment:
+            continue
+        head = segment[0].rsplit("/", 1)[-1]
+        candidates: list[str]
+        if head in _GREP_LIKE_COMMANDS:
+            parsed = _parse_grep(segment)
+            if parsed is None:
+                # No file operand this parser is willing to name (a
+                # pipeline's grep reads stdin, ``-f`` reads its pattern
+                # from a file): claim nothing about this segment.
+                continue
+            candidates = list(parsed[1])
+        elif head in _PURE_COMPARE_COMMANDS:
+            candidates = _compare_operand_paths(segment)
+        else:
+            candidates = [
+                token
+                for token in _read_operand_paths([segment])
+                if _PATH_SHAPED.match(token)
+            ]
+        unknown.update(
+            path for path in candidates if not written_data.lines_for(path)
+        )
+    return sorted(unknown)
+
+
+def _lint_no_execution(
+    segments: Sequence[Sequence[str]], written_data: WrittenData
+) -> list[LintFinding]:
+    """Warn when a check neither runs anything nor reads anything a run
+    produced.
+
+    Two independent conditions, both required:
+
+    **Structure.** Every segment head is in
+    :data:`_NO_EXECUTION_SAFE_HEADS` or is a tokenizer artifact
+    (:func:`_is_non_executing_artifact`); any other head means the command
+    might run something, so nothing is reported — match conservatively and
+    give up rather than guess. At least one segment must be a recognized
+    read predicate, not merely an operator artifact.
+
+    **Provenance.** *Every* file the command reads must be one this run
+    wrote a literal into (:class:`WrittenData`) — at least one, and no
+    operand of unknown provenance beside it
+    (:func:`_unknown_provenance_paths`). One-authored-operand-is-enough
+    would condemn the standard golden-file shape, ``cmp expected.bin
+    build/out.bin``: its expectation is hand-written by construction, and
+    the other side is the program's output, so an authored operand there is
+    the check working as designed rather than evidence of circularity. An
+    operand this run never wrote *is* the evidence that something ran.
+    This is the same read-vs-produced distinction :func:`_lint_tautology`
+    rests on, and it is what keeps the harness's own documented honest
+    shape — ``python3 solve.py > test.log`` on one turn, ``grep -q PASS
+    test.log`` on the next — off this list: ``test.log`` exists *only
+    because the solution ran*, so a check reading it is inspecting real
+    output, and telling the model otherwise would be a false diagnosis in
+    text the model actually reads. A file the agent echoed or
+    ``write_file``-d is
+    the opposite case: nothing ran, at any point, between the literal
+    being invented and the check confirming it.
+
+    Provenance is positive evidence, never an assumption: an operand this
+    run never touched (a task-supplied fixture, a file written before the
+    map's LRU horizon) yields no finding, because the honest and circular
+    readings are indistinguishable from here.
+
+    A program-produced operand is by construction absent from
+    ``written_data`` — :func:`_record_bash_writes` records only
+    ``echo``/``printf``/heredoc redirects — so it can never satisfy the
+    rule. The residual imprecision is a path first echoed and later
+    overwritten by a program's output, which over-warns; that is the same
+    bounded imprecision detector 1 already carries, and this lint warns
+    only.
+    """
+    if not segments:
+        return []
+    matched_real = False
+    for segment in segments:
+        if not segment:
+            return []
+        head = segment[0].rsplit("/", 1)[-1]
+        if head in _NO_EXECUTION_SAFE_HEADS:
+            matched_real = True
+            continue
+        if _is_non_executing_artifact(head):
+            continue
+        return []
+    if not matched_real:
+        return []
+    operands = _read_operand_paths(segments)
+    authored = sorted(
+        {path for path in operands if written_data.lines_for(path)}
+    )
+    if not authored:
+        return []
+    if _unknown_provenance_paths(segments, written_data):
+        # A file this run never wrote sits beside the authored one — the
+        # golden-file compare. Something produced that side; say nothing.
+        return []
+    return [
+        LintFinding(
+            kind="no_execution",
+            message=(
+                "every segment of this check only reads or compares "
+                "existing files or state; nothing in it runs the solution "
+                f"itself, and {', '.join(authored)} holds content this run "
+                "wrote directly rather than output a program produced. A "
+                "check that executes the program under test — or that "
+                "reads a file running it produced — proves more."
+            ),
+            details={
+                "segment_count": len(segments),
+                "authored_paths": authored,
+            },
+        )
+    ]
+
+
+# -- detector 5: self_authored_checker -----------------------------------------
+
+#: Interpreters whose next non-flag operand is typically a script path.
+_SCRIPT_INTERPRETERS: Final[frozenset[str]] = frozenset(
+    {
+        "perl",
+        "python",
+        "python2",
+        "python3",
+        "ruby",
+        "node",
+        "nodejs",
+        "php",
+        "bash",
+        "sh",
+        "zsh",
+    }
+)
+
+#: Flags that take inline code as their argument rather than a script path
+#: (``python3 -c "..."``, ``perl -e '...'``) — that argument is not a path
+#: this detector can look up in :class:`WrittenData`, so give up rather
+#: than treat the inline body as if it were one.
+_INLINE_CODE_FLAGS: Final[frozenset[str]] = frozenset({"-e", "-c", "-m"})
+
+
+def _lint_self_authored_checker(
+    segments: Sequence[Sequence[str]], written_data: WrittenData
+) -> list[LintFinding]:
+    """Warn when the command runs a script the agent wrote earlier this run.
+
+    Matches ``<interpreter> <script>`` segments (``perl verify.pl``) where
+    ``script`` names a path :class:`WrittenData` holds content for — i.e.
+    the agent authored the checker itself via ``write_file``/``edit_file``
+    or a bash echo/heredoc, rather than the checker shipping with the
+    task. Inline code (``-e``/``-c``/``-m``) is skipped: it is not a script
+    path, and guessing would be exactly the kind of unsafe assumption the
+    tokenizer caveat on :func:`_lint_no_execution` warns against.
+    """
+    findings: list[LintFinding] = []
+    for segment in segments:
+        if not segment:
+            continue
+        head = segment[0].rsplit("/", 1)[-1]
+        if head not in _SCRIPT_INTERPRETERS:
+            continue
+        if any(token in _INLINE_CODE_FLAGS for token in segment[1:]):
+            continue
+        script = next(
+            (token for token in segment[1:] if not token.startswith("-")),
+            None,
+        )
+        if script is None:
+            continue
+        if not written_data.lines_for(script):
+            continue
+        findings.append(
+            LintFinding(
+                kind="self_authored_checker",
+                message=(
+                    f"this check runs {script!r} via {head}, and "
+                    f"{script!r} was written by the agent earlier in this "
+                    "run rather than shipped with the task. A "
+                    "self-authored checker can hide a tautology inside its "
+                    "own logic where a literal-written-into-a-data-file "
+                    "check cannot see it — read the script before trusting "
+                    "a pass."
+                ),
+                details={"interpreter": head, "script": script},
+            )
+        )
+    return findings
 
 
 # -- bash write extraction ---------------------------------------------------

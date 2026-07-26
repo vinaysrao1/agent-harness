@@ -15,7 +15,11 @@ any single sandbox exec so that when a long command returns there is still
 time for one more model call — the turn in which the agent writes its
 answer down. The reserve is the hard-stop floor plus an adaptive allowance
 derived from this run's own observed model-call durations, so it tracks the
-provider instead of guessing (see :meth:`Deadline.landing_reserve`).
+provider instead of guessing (see :meth:`Deadline.landing_reserve`). The
+reserve is arithmetic, so it can only protect the time an exec would spend;
+the loop declares the landing *turn* itself through
+:meth:`Deadline.begin_landing`, which is how the ``bash`` tool learns to
+stop starting work the run can no longer act on.
 
 On top of that reserve, :meth:`Deadline.exec_cap` adds the two bounds that
 keep a single command from owning the run: a **share cap** (no exec larger
@@ -217,6 +221,9 @@ class Deadline:
         self._clock = clock
         self._start = clock()
         self._call_seconds: deque[float] = deque(maxlen=MODEL_CALL_WINDOW)
+        #: Set once by the loop when the run enters its landing turn; read
+        #: by the ``bash`` tool. See :attr:`landing`.
+        self._landing = False
 
     def remaining(self) -> float | None:
         """Seconds left before the deadline, clamped at zero.
@@ -271,11 +278,27 @@ class Deadline:
         strictly more than the stop floor left, so the agent always gets a
         turn to write its answer down after a long command.
 
-        The one documented exception: when ``remaining`` is already so small
+        The exception, stated correctly. When ``remaining`` is small enough
         that ``remaining - landing_reserve()`` falls below
-        :data:`EXEC_CAP_FLOOR_SECONDS`, the floor wins (a 0s timeout would
-        fail even ``echo``) and the guarantee can be violated — but only
-        inside the stop floor, where the loop pauses anyway.
+        :data:`EXEC_CAP_FLOOR_SECONDS`, :meth:`exec_decision`'s ``max()``
+        lets the floor win (a 0s timeout would fail even ``echo``). An
+        earlier revision of this docstring claimed the resulting violation
+        happened "only inside the stop floor, where the loop pauses
+        anyway". **That was false.** The floor escapes the reserve as soon
+        as ``remaining < landing_reserve() + EXEC_CAP_FLOOR_SECONDS`` (105s
+        at the base reserve), and from ``WALL_CLOCK_STOP_FLOOR +
+        EXEC_CAP_FLOOR_SECONDS`` — 90s — downwards that escape costs the
+        landing turn: a 30s exec issued at 80s remaining returns with 50s
+        left and the loop hard-stops. The guarantee was void across a band
+        a full :data:`EXEC_CAP_FLOOR_SECONDS` wide *above* the floor, where
+        the loop is still perfectly willing to start turns.
+
+        :meth:`exec_decision` now clamps ``purpose="exploratory"`` execs so
+        the stop floor is never handed out (see there). ``purpose=
+        "verification"`` is deliberately left exempt and can still return
+        inside the floor — there is nothing to land after a completion
+        gate, and clamping it would silently demote a passing gate to a
+        capped, inconclusive one.
         """
         return WALL_CLOCK_STOP_FLOOR + self.landing_allowance()
 
@@ -334,6 +357,16 @@ class Deadline:
         which is what keeps ``effective <= 0.5 * budget`` unconditional for
         exploratory execs.)
 
+        **Stop-floor clamp** (``purpose="exploratory"`` only). The floor
+        above is capped so it can never be paid out of
+        :data:`WALL_CLOCK_STOP_FLOOR`: an exploratory decision always
+        satisfies ``remaining - effective >= WALL_CLOCK_STOP_FLOOR`` or
+        returns ``0.0``. Without it the floor escaped the reserve 30s above
+        the stop floor and the landing guarantee was void there — see
+        :meth:`landing_reserve`. This is a guarantee repair with no measured
+        recovery: on the corpus it changes only execs that were already
+        finishing in a fraction of a second or timing out regardless.
+
         ``purpose="verification"`` is exempt from the share cap *and* the
         band softener, and gets the plain ``remaining - landing_reserve()``
         shape. Verification runs at completion by definition: shortening it
@@ -358,6 +391,22 @@ class Deadline:
             share = EXEC_MAX_BUDGET_FRACTION * self.budget
 
         allowed = max(EXEC_CAP_FLOOR_SECONDS, remaining - reserve)
+        if purpose == "exploratory":
+            # Close the max() hole. EXEC_CAP_FLOOR_SECONDS is a floor on the
+            # *reserve* arithmetic, not a licence to spend the stop floor:
+            # without this clamp the 30s floor escapes the reserve as soon
+            # as remaining drops below reserve + 30 (~105s at the base
+            # reserve), and from 90s downwards it is paid out of the stop
+            # floor itself — an exec issued at 80s remaining returns with
+            # 50s left and the loop hard-stops. Measured on a 63-row corpus
+            # of real capped execs this changes 9 rows, every one of them
+            # already pinned at the floor: 7 ran under a third of a second
+            # and the other 2 had timed out anyway.
+            # 0.0 is a legal answer: inside the stop floor nothing new
+            # should start at all. Keeping tiny windows rather than refusing
+            # them is deliberate — the median capped exec on that corpus ran
+            # 0.79s, so 8.4s or 2.8s is genuinely useful.
+            allowed = min(allowed, max(0.0, remaining - WALL_CLOCK_STOP_FLOOR))
         effective = min(requested, share, allowed)
         if effective >= requested:
             return ExecCapDecision(requested, False, None, reserve)
@@ -366,6 +415,60 @@ class Deadline:
         return ExecCapDecision(
             effective, True, "band" if softened else "reserve", reserve
         )
+
+    def affordable_exec_seconds(
+        self, *, purpose: ExecPurpose = "exploratory"
+    ) -> float | None:
+        """The largest exec timeout this run can afford right now.
+
+        ``None`` when there is no deadline, so a caller can tell "no bound"
+        from "a bound of zero". Defined as :meth:`exec_decision` of an
+        unbounded request rather than as its own arithmetic: a caller that
+        asks for no more than this is guaranteed not to be capped, and the
+        guarantee cannot rot into a second, drifting implementation of the
+        three bounds.
+
+        This exists for the caller that has *no* timeout to bound — the
+        ``bash`` tool's own default, which carries no agent intent and so
+        must never be reported back as "capped from your requested Ns".
+        """
+        if self.budget is None:
+            return None
+        return self.exec_decision(math.inf, purpose=purpose).effective
+
+    @property
+    def landing(self) -> bool:
+        """Whether the run has entered its final, landing turn.
+
+        Set once by the agent loop (:data:`harness.loop.LANDING_TURN_NOTICE`)
+        when the remaining wall-clock can no longer fund a model call *and*
+        a command *and* the reply that acts on it. It lives here rather than
+        on the loop because it has to reach the ``bash`` tool, and the
+        deadline is the one run-scoped object both of them already hold —
+        including subagents, which share it deliberately: a subagent
+        starting a 30s command while the run is landing is exactly the waste
+        this refuses.
+
+        It is explicit state, never arithmetic. Nothing derives it from a
+        requested timeout, which is what keeps the tool from ever refusing
+        an agent because of a number the *harness* supplied.
+        """
+        return self._landing
+
+    def begin_landing(self) -> bool:
+        """Declare the landing turn; return whether this call armed it.
+
+        Idempotent, so a second check (or a subagent's loop) cannot re-arm
+        it and re-inject the notice. There is deliberately no way to clear
+        it, and that is only safe because the loop *finishes* on the turn
+        it arms (:mod:`harness.loop`, step 1a-ii): a latch that outlived
+        its turn would leave the agent shell-less for the rest of the run
+        on a call-cost estimate nothing re-evaluates.
+        """
+        if self._landing:
+            return False
+        self._landing = True
+        return True
 
     def recent_call_median(self) -> float | None:
         """Median of the recent model-call window; ``None`` when empty.

@@ -19,8 +19,10 @@ from harness.adapters.fake import FakeAdapter
 from harness.config import PermissionMode
 from harness.context import COMPACTION_SUMMARY_PREFIX, ContextManager
 from harness.deadline import WALL_CLOCK_STOP_FLOOR, Deadline
+from harness.diligence import looks_unfinished
 from harness.loop import (
     DROPPED_ARGUMENTS_PREFIX_CHARS,
+    LANDING_TURN_NOTICE,
     AgentLoop,
     AgentResult,
     Budgets,
@@ -29,7 +31,7 @@ from harness.loop import (
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
 from harness.sandbox.local import LocalSandbox
-from harness.tools.builtin import bash_tool
+from harness.tools.builtin import LANDING_REFUSAL, bash_tool
 from harness.tools.registry import Tool, ToolRegistry
 from harness.types import (
     DroppedToolCall,
@@ -897,6 +899,90 @@ class TestCompaction:
         assert len(h.adapter.calls) == 1
         assert len(h.adapter.calls[0].messages) < 14
 
+    async def test_low_utilization_run_never_prunes_a_tool_result(
+        self, tmp_path: Path
+    ) -> None:
+        """G1 end-to-end fence: 25 tool turns with 2 KB results against a
+        1M-token window is ~1% utilization, so nothing the model already saw
+        may be replaced by a stub on any later call. Pre-G1 every result
+        older than three assistant turns was stubbed regardless."""
+        payload = "x" * 2048
+        script = [
+            resp(f"step {i}", [call(f"c{i}", "echo", text=payload)])
+            for i in range(25)
+        ] + [resp(CLEAN_FINISH)]
+        adapter = FakeAdapter(script)
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=adapter.count_tokens,
+            max_context=1_000_000,
+            summarize=stub_summarize,
+        )
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("echo")],
+            context=context,
+            budgets=Budgets(max_turns=30),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        assert len(h.adapter.calls) == 26
+        for index, recorded in enumerate(h.adapter.calls):
+            for message in recorded.messages:
+                content = message.content or (
+                    message.tool_result.content
+                    if message.tool_result is not None
+                    else ""
+                )
+                assert "[pruned:" not in content, f"call {index} saw a stub"
+        # The very first result is still verbatim in the final call.
+        final = [
+            m.tool_result.content
+            for m in h.adapter.calls[-1].messages
+            if m.tool_result is not None
+        ]
+        assert final[0] == f"echo:{payload}"
+        assert not h.events("compaction")
+
+    async def test_pruning_engages_and_hands_off_to_compaction_under_pressure(
+        self, tmp_path: Path
+    ) -> None:
+        """The other end of the ladder: the same script against an
+        8,000-token window prunes *and* eventually compacts."""
+        payload = "x" * 2048
+        script = [
+            resp(f"step {i}", [call(f"c{i}", "echo", text=payload)])
+            for i in range(25)
+        ] + [resp(CLEAN_FINISH)]
+        adapter = FakeAdapter(script)
+        context = ContextManager(
+            base_system_prompt="You are a test agent.",
+            count_tokens=adapter.count_tokens,
+            max_context=8_000,
+            summarize=stub_summarize,
+        )
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[simple_tool("echo")],
+            context=context,
+            budgets=Budgets(max_turns=30),
+        )
+        result = await h.loop.run(GOAL)
+
+        assert result.status == "completed"
+        stubs = [
+            m.tool_result.content
+            for recorded in h.adapter.calls
+            for m in recorded.messages
+            if m.tool_result is not None
+            and m.tool_result.content.startswith("[pruned:")
+        ]
+        assert stubs
+        assert h.events("compaction")
+
     async def test_summarizer_adapter_error_ends_run_with_error(
         self, tmp_path: Path
     ) -> None:
@@ -1600,8 +1686,16 @@ class TestExecCapEndsTheBandSkip:
     ]
 
     def _run_shape(
-        self, tmp_path: Path, budget: float, remaining: float, requested: float
+        self,
+        tmp_path: Path,
+        budget: float,
+        remaining: float,
+        requested: float,
+        seconds_per_call: float = 0.0,
     ):
+        """Wire one shape. ``seconds_per_call`` makes model calls cost
+        wall-clock, which is what lets the run actually reach the end of its
+        budget — with free calls the clock only moves inside ``exec``."""
         clock = _MovableClock()
         deadline = Deadline(budget, clock)
         clock.now = budget - remaining
@@ -1621,6 +1715,10 @@ class TestExecCapEndsTheBandSkip:
             deadline=deadline,
             budgets=Budgets(max_turns=100),
         )
+        if seconds_per_call:
+            h.loop.adapter = _TimedFakeAdapter(  # type: ignore[assignment]
+                script, clock, seconds_per_call
+            )
         return h, sandbox, deadline
 
     @pytest.mark.parametrize(
@@ -1628,18 +1726,32 @@ class TestExecCapEndsTheBandSkip:
         [shape[1:] for shape in SHAPES],
         ids=[shape[0] for shape in SHAPES],
     )
-    async def test_wind_down_always_precedes_the_hard_stop(
+    async def test_wind_down_always_precedes_the_landing_turn(
         self, tmp_path: Path, budget: float, remaining: float, requested: float
     ) -> None:
+        # 5s model calls, so the run really does spend its budget rather
+        # than looping for free once the exec windows reach zero.
         h, sandbox, _deadline = self._run_shape(
-            tmp_path, budget, remaining, requested
+            tmp_path, budget, remaining, requested, seconds_per_call=5.0
         )
-        await h.loop.run(GOAL)
+        result = await h.loop.run(GOAL)
 
         kinds = h.event_kinds()
-        assert "wall_clock_stop" in kinds  # the shape does exhaust the clock
         assert "wind_down" in kinds
-        assert kinds.index("wind_down") < kinds.index("wall_clock_stop")
+        # Change 1c: every one of these shapes now ends on the landing turn
+        # instead of on the hard stop. The wind-down reminder still has to
+        # come first — it is what pushes the answer to disk while there is
+        # still a shell — and the landing turn is where the run ends: the
+        # agent gets its last model call and the loop finishes on the text
+        # it produced, so the bare `wall_clock_stop` pause (no final text
+        # at all) never happens.
+        assert "landing_turn" in kinds
+        assert kinds.index("wind_down") < kinds.index("landing_turn")
+        assert kinds.index("landing_finish") > kinds.index("landing_turn")
+        assert "wall_clock_stop" not in kinds
+        assert result.status == "completed"
+        # And it really is the last turn: nothing runs after it.
+        assert kinds.index("landing_finish") == len(kinds) - 1
 
     @pytest.mark.parametrize(
         "budget,remaining,requested",
@@ -1650,7 +1762,7 @@ class TestExecCapEndsTheBandSkip:
         self, tmp_path: Path, budget: float, remaining: float, requested: float
     ) -> None:
         h, sandbox, _deadline = self._run_shape(
-            tmp_path, budget, remaining, requested
+            tmp_path, budget, remaining, requested, seconds_per_call=5.0
         )
         await h.loop.run(GOAL)
 
@@ -1659,11 +1771,13 @@ class TestExecCapEndsTheBandSkip:
         # four failing trials never got.
         assert len(sandbox.log) >= 2
         assert len(h.events("model_turn")) >= 2
-        # Every exec but the last leaves more than the stop floor behind
-        # it, which is what makes the next turn startable. (The last one
-        # runs out the clock by construction — that is the hard stop.)
-        for before, timeout in sandbox.log[:-1]:
-            assert before - timeout > WALL_CLOCK_STOP_FLOOR
+        # Change 1a strengthened this: it now holds for *every* exec, not
+        # every exec but the last. The old version had to exempt the last
+        # one because the exec floor could be paid out of the stop floor —
+        # that escape is what closed. `>=` rather than `>` because the
+        # clamp lands exactly on the floor when it binds.
+        for before, timeout in sandbox.log:
+            assert before - timeout >= WALL_CLOCK_STOP_FLOOR
 
     async def test_mcmc_regains_control_mid_install(self, tmp_path: Path) -> None:
         # The headline number: the runaway `while pgrep ...; do sleep 20;
@@ -1690,6 +1804,386 @@ class TestExecCapEndsTheBandSkip:
             if "half the run's total budget" in (payload.get("content") or "")
         ]
         assert results
+
+
+class TestLandingTurnBand:
+    """Change 1c: the loop-side half of the landing guarantee.
+
+    The hard stop is checked at the loop top; the exec it protects is
+    issued *after* the model call has already spent part of the margin.
+    Both round-2 hard-stops died in that gap — ``qemu-alpine-ssh`` seq 238
+    passed the check at 63.0s remaining, generated for 4.55s and issued a
+    30s exec at 58.4s; ``make-doom-for-mips`` seq 553 passed at 62.6s,
+    generated for 15.83s and issued at 46.8s. No amount of tool-layer
+    arithmetic recovers a turn the loop has already given away, which is
+    why 1a alone buys nothing here.
+
+    So the loop takes one explicit final turn instead: below
+    ``WALL_CLOCK_STOP_FLOOR + recent_call_median()`` it injects
+    :data:`LANDING_TURN_NOTICE`, persists ``landing_turn``, and arms the
+    ``bash`` refusal — from state, not from arithmetic on any requested
+    timeout.
+
+    **Expected recovery on the measured corpus: zero tasks.** Neither trial
+    had an answer worth landing. This makes the guarantee true; it does not
+    claim a win.
+    """
+
+    def _wire(
+        self,
+        tmp_path: Path,
+        script: list[ModelResponse],
+        *,
+        remaining: float,
+        budget: float = 900.0,
+        observations: tuple[float, ...] = (),
+        tools: list[Tool] | None = None,
+    ):
+        """A run frozen at ``remaining`` with a clock only ``exec`` moves.
+
+        ``observations`` pre-loads the deadline's call window, which is what
+        sets the band's width. Model calls are free here on purpose: the
+        band's *arming* is what is under test, and a free call keeps the
+        arithmetic exact.
+        """
+        clock = _MovableClock()
+        deadline = Deadline(budget, clock)
+        clock.now = budget - remaining
+        for seconds in observations:
+            deadline.observe_model_call(seconds)
+        sandbox = _RecordingBurnSandbox(clock, deadline)
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=(
+                tools
+                if tools is not None
+                else [bash_tool(sandbox, deadline=deadline)]  # type: ignore[arg-type]
+            ),
+            clock=clock,
+            deadline=deadline,
+            budgets=Budgets(max_turns=20),
+        )
+        return h, sandbox, deadline
+
+    async def test_landing_turn_refuses_bash_and_lands_the_answer(
+        self, tmp_path: Path
+    ) -> None:
+        # remaining 75 with a 20s typical call: 75 < 60 + 20, so the very
+        # next turn is the landing turn — and it is the last one, so the
+        # text it carries alongside its (refused) command is the answer.
+        script = [
+            resp(
+                "my answer is in /app/out.txt",
+                [call("c1", "bash", command="./slow")],
+            ),
+            resp("never reached"),
+        ]
+        h, sandbox, deadline = self._wire(
+            tmp_path, script, remaining=75.0, observations=(20.0,) * 16
+        )
+        result = await h.loop.run(GOAL)
+
+        # Armed exactly once, with the numbers that justified it.
+        (event,) = h.events("landing_turn")
+        assert event["remaining_seconds"] == pytest.approx(75.0)
+        assert event["expected_call_seconds"] == pytest.approx(20.0)
+        assert deadline.landing is True
+        # The notice rode the very next model call.
+        first_call_messages = [
+            message.content for message in h.adapter.calls[0].messages
+        ]
+        assert LANDING_TURN_NOTICE.format(remaining=75) in first_call_messages
+        # The bash call was refused without the sandbox ever being asked.
+        assert sandbox.log == []
+        (tool_result,) = h.events("tool_result")
+        assert tool_result["content"] == LANDING_REFUSAL
+        assert tool_result["is_error"] is False
+        # And the run ends on the model's own words, not a budget pause.
+        assert result.status == "completed"
+        assert result.final_text == "my answer is in /app/out.txt"
+        assert h.events("wall_clock_stop") == []
+        # The landing turn is the last turn: the loop does not go round
+        # again, so the second scripted response is never asked for.
+        (finish,) = h.events("landing_finish")
+        assert finish == {"tool_calls": 1, "has_text": True}
+        assert len(h.adapter.calls) == 1
+        assert result.turns == 1
+
+    async def test_the_landing_turn_is_the_last_turn(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: ``landing`` is a latch and
+        :meth:`Deadline.begin_landing` has no reset, so the loop must stop
+        on the landing turn. Before this fix it kept issuing ordinary turns
+        with the shell permanently dead — the agent was stranded, not
+        landed."""
+        script = [
+            resp("checking", [call("c1", "bash", command="./a")]),
+            resp("checking again", [call("c2", "bash", command="./b")]),
+            resp("done: /app/out.txt"),
+        ]
+        h, sandbox, _deadline = self._wire(
+            tmp_path, script, remaining=75.0, observations=(20.0,) * 16
+        )
+        result = await h.loop.run(GOAL)
+
+        assert len(h.events("landing_turn")) == 1
+        notice = LANDING_TURN_NOTICE.format(remaining=75)
+        messages = [
+            payload.get("content") for payload in h.events("message")
+        ]
+        assert messages.count(notice) == 1
+        # Exactly one turn happens after the notice, so exactly one command
+        # is refused — a second refusal would mean a turn the agent spent
+        # without a shell it could still have used.
+        assert sandbox.log == []
+        assert [r["content"] for r in h.events("tool_result")] == [
+            LANDING_REFUSAL
+        ]
+        assert len(h.adapter.calls) == 1
+        assert result.turns == 1
+        assert result.status == "completed"
+
+    async def test_a_stale_call_median_cannot_strand_the_agent(
+        self, tmp_path: Path
+    ) -> None:
+        """The reviewed failure, verbatim: a 16-call window whose median
+        lags the provider arms the band on evidence that is already stale,
+        and the latch can never re-evaluate it. What must be bounded is the
+        *consequence* — one turn, not the rest of the run.
+
+        Before the fix this produced 40 consecutive bash refusals and zero
+        execs while the provider was running at 5s/call, burning 200s of
+        wall-clock the agent could have worked in.
+        """
+        clock = _MovableClock()
+        deadline = Deadline(3600.0, clock)
+        clock.now = 3600.0 - 259.0
+        for _ in range(16):
+            deadline.observe_model_call(200.0)  # stale: the provider is fast now
+        sandbox = _RecordingBurnSandbox(clock, deadline)
+        script = [
+            resp(
+                f"attempt {i}: answer at /app/out.txt",
+                [call(f"c{i}", "bash", command="./probe", timeout=5)],
+            )
+            for i in range(40)
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox, deadline=deadline)],  # type: ignore[arg-type]
+            clock=clock,
+            deadline=deadline,
+            budgets=Budgets(max_turns=100),
+        )
+        h.loop.adapter = _TimedFakeAdapter(script, clock, 5.0)  # type: ignore[assignment]
+        result = await h.loop.run(GOAL)
+
+        # The band still arms — 259 < 60 + 200 is what the evidence says.
+        assert len(h.events("landing_turn")) == 1
+        # But it costs exactly one turn and one refusal, not forty.
+        refusals = [
+            payload
+            for payload in h.events("tool_result")
+            if payload["content"] == LANDING_REFUSAL
+        ]
+        assert len(refusals) == 1
+        assert sandbox.log == []
+        assert len(h.loop.adapter.calls) == 1  # type: ignore[attr-defined]
+        # And the run ends with the model's own answer rather than spinning
+        # down to a bare pause with no final text.
+        assert result.status == "completed"
+        assert result.final_text == "attempt 0: answer at /app/out.txt"
+        assert h.events("wall_clock_stop") == []
+        assert deadline.remaining() == pytest.approx(254.0)
+
+    async def test_an_empty_call_window_disables_the_band(
+        self, tmp_path: Path
+    ) -> None:
+        # No model call has been observed yet, so there is no evidence for
+        # how wide the band should be. Behaviour is exactly today's: the
+        # command runs.
+        script = [
+            resp("working", [call("c1", "bash", command="./a", timeout=5)]),
+            resp(CLEAN_FINISH),
+        ]
+        h, sandbox, deadline = self._wire(tmp_path, script, remaining=75.0)
+        assert deadline.recent_call_median() is None
+        result = await h.loop.run(GOAL)
+
+        assert h.events("landing_turn") == []
+        assert deadline.landing is False
+        assert len(sandbox.log) == 1
+        assert result.status == "completed"
+
+    async def test_no_deadline_means_no_band(self, tmp_path: Path) -> None:
+        script = [
+            resp("working", [call("c1", "bash", command="./a", timeout=5)]),
+            resp(CLEAN_FINISH),
+        ]
+        clock = _MovableClock()
+        sandbox = _BurnsItsWindowSandbox(clock)
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[bash_tool(sandbox)],  # type: ignore[arg-type]
+            clock=clock,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert h.events("landing_turn") == []
+        assert sandbox.received_timeout == 5.0
+        assert result.status == "completed"
+
+    async def test_the_band_does_not_arm_above_it(self, tmp_path: Path) -> None:
+        # remaining 81 with a 20s typical call: 81 >= 60 + 20, so turn 1 is
+        # an ordinary working turn and the shell stays available. The 5s
+        # exec then carries the run to 76, which *is* inside the band — so
+        # the event that eventually appears records 76, never 81.
+        script = [
+            resp("working", [call("c1", "bash", command="./a", timeout=5)]),
+            resp(CLEAN_FINISH),
+        ]
+        h, sandbox, _deadline = self._wire(
+            tmp_path, script, remaining=81.0, observations=(20.0,) * 16
+        )
+        result = await h.loop.run(GOAL)
+
+        assert len(sandbox.log) == 1
+        remaining_before, timeout = sandbox.log[0]
+        assert remaining_before == pytest.approx(81.0)
+        assert timeout == 5.0  # ran in full, nothing refused, nothing capped
+        assert [
+            event["remaining_seconds"] for event in h.events("landing_turn")
+        ] == [pytest.approx(76.0)]
+        assert result.status == "completed"
+
+    async def test_the_band_tracks_the_provider_not_a_constant(
+        self, tmp_path: Path
+    ) -> None:
+        # The same remaining, a fast provider: a 2s typical call means the
+        # run can still afford a working turn where a slow one could not.
+        script = [
+            resp("working", [call("c1", "bash", command="./a", timeout=5)]),
+            resp(CLEAN_FINISH),
+        ]
+        h, sandbox, _deadline = self._wire(
+            tmp_path, script, remaining=70.0, observations=(2.0,) * 16
+        )
+        await h.loop.run(GOAL)
+        assert h.events("landing_turn") == []
+        assert len(sandbox.log) == 1
+
+        slow_h, slow_sandbox, _slow = self._wire(
+            tmp_path / "slow", script, remaining=70.0, observations=(30.0,) * 16
+        )
+        await slow_h.loop.run(GOAL)
+        assert len(slow_h.events("landing_turn")) == 1
+        assert slow_sandbox.log == []
+
+    async def test_the_refusal_costs_no_nudge_or_truncation_budget(
+        self, tmp_path: Path
+    ) -> None:
+        # A normal ToolResult, so the loop treats the landing turn as a
+        # working turn that produced a result — not as an error to
+        # re-prompt, which is the one thing the final turn cannot afford.
+        script = [
+            resp("trying", [call("c1", "bash", command="./a")]),
+            resp("answer at /app/out.txt"),
+        ]
+        h, _sandbox, _deadline = self._wire(
+            tmp_path, script, remaining=75.0, observations=(20.0,) * 16
+        )
+        result = await h.loop.run(GOAL)
+
+        assert h.events("truncation_continue") == []
+        assert h.events("nudge") == []
+        assert result.status == "completed"
+
+    async def test_a_truncated_landing_turn_is_not_re_prompted(
+        self, tmp_path: Path
+    ) -> None:
+        # 5a normally re-prompts a turn that ran to the output cap. On the
+        # landing turn there is no turn left to re-prompt into, and the
+        # re-prompt would spend the last of the wall-clock on a reply
+        # nobody can read. Take the partial text as the answer instead.
+        script = [
+            resp(
+                "the answer is at /app/out.txt and it cont",
+                stop_reason=StopReason.MAX_TOKENS,
+            ),
+            resp("never reached"),
+        ]
+        h, _sandbox, _deadline = self._wire(
+            tmp_path, script, remaining=75.0, observations=(20.0,) * 16
+        )
+        result = await h.loop.run(GOAL)
+
+        assert len(h.events("landing_turn")) == 1
+        assert h.events("truncation_continue") == []
+        assert result.status == "completed"
+        assert result.final_text == "the answer is at /app/out.txt and it cont"
+        assert result.turns == 1
+
+    async def test_a_landing_turn_that_looks_unfinished_is_not_nudged(
+        self, tmp_path: Path
+    ) -> None:
+        # Same rule for the diligence nudge: "I will now verify" reads as
+        # unfinished, but nudging spends a turn the run does not have.
+        script = [
+            resp("I will now verify the output at /app/out.txt"),
+            resp("never reached"),
+        ]
+        h, _sandbox, _deadline = self._wire(
+            tmp_path, script, remaining=75.0, observations=(20.0,) * 16
+        )
+        result = await h.loop.run(GOAL)
+
+        assert looks_unfinished(script[0].message.content, 0)[0] is True
+        assert len(h.events("landing_turn")) == 1
+        assert h.events("nudge") == []
+        assert result.status == "completed"
+        assert result.turns == 1
+
+    async def test_verification_still_runs_on_the_landing_turn(
+        self, tmp_path: Path
+    ) -> None:
+        # The completion gate is not the shell: it is the loop's own exec,
+        # exempt by design, and disarming it would silently demote a
+        # passing gate to a non-gate.
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        real_sandbox = LocalSandbox(workspace)
+        from harness.tools.builtin import declare_verification_tool
+
+        clock = _MovableClock()
+        deadline = Deadline(900.0, clock)
+        clock.now = 825.0  # remaining 75
+        for _ in range(16):
+            deadline.observe_model_call(20.0)
+        script = [
+            resp("declaring", [call("v1", "declare_verification",
+                                    command="true", description="it works")]),
+            resp("answer at /app/out.txt"),
+        ]
+        h = make_harness(
+            tmp_path,
+            script,
+            tools=[
+                bash_tool(real_sandbox, deadline=deadline),
+                declare_verification_tool(),
+            ],
+            clock=clock,
+            deadline=deadline,
+            sandbox=real_sandbox,
+        )
+        result = await h.loop.run(GOAL)
+
+        assert len(h.events("landing_turn")) == 1
+        assert len(h.events("verification_passed")) == 1
+        assert result.status == "completed"
 
 
 class TestVerificationIsExemptFromTheExecCap:
@@ -3524,13 +4018,25 @@ class TestVerificationLint:
         (lint,) = h.events("verification_lint")
         assert lint["command"] == self.MTEB_CHECK
         assert lint["action"] == "warn"
-        assert [f["kind"] for f in lint["findings"]] == ["tautology"]
+        # Both provenance detectors fire: the literal was echoed into the
+        # very file the grep reads (tautology), and nothing between the
+        # echo and the grep ran anything at all (no_execution, T1).
+        assert [f["kind"] for f in lint["findings"]] == [
+            "tautology",
+            "no_execution",
+        ]
 
         # 3. The gate recorded the pass *and* that it was flagged weak.
         (passed,) = h.events("verification_passed")
         assert passed["exit_code"] == 0
-        assert [f["kind"] for f in passed["lint_findings"]] == ["tautology"]
+        assert [f["kind"] for f in passed["lint_findings"]] == [
+            "tautology",
+            "no_execution",
+        ]
         assert passed["lint_findings"][0]["details"]["path"] == "result.txt"
+        assert passed["lint_findings"][1]["details"]["authored_paths"] == [
+            "result.txt"
+        ]
 
     async def test_honest_check_is_never_flagged(self, tmp_path: Path) -> None:
         """The X9 acceptance case end to end: the agent writes a program
@@ -3572,6 +4078,18 @@ class TestVerificationLint:
         (passed,) = h.events("verification_passed")
         assert passed["exit_code"] == 0
         assert "lint_findings" not in passed
+        # Regression (T1 review): the advisory is model-facing text, so a
+        # detector firing here does not merely mislabel a corpus row — it
+        # tells the model, in the transcript, that a correct check proves
+        # nothing. Nothing in what the model saw may say so.
+        tool_results = [
+            payload.get("content") or ""
+            for payload in h.events("tool_result")
+        ]
+        assert not any("Advisory" in content for content in tool_results)
+        assert not any(
+            "runs the solution" in content for content in tool_results
+        )
 
     async def test_written_data_ignores_failed_tool_calls(
         self, tmp_path: Path
@@ -3646,4 +4164,7 @@ class TestVerificationLint:
         assert result.status == "completed"
         assert h.events("verification_lint") == []  # no store wired in
         (passed,) = h.events("verification_passed")
-        assert [f["kind"] for f in passed["lint_findings"]] == ["tautology"]
+        assert [f["kind"] for f in passed["lint_findings"]] == [
+            "tautology",
+            "no_execution",
+        ]

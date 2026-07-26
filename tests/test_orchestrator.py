@@ -992,8 +992,13 @@ async def test_loaded_skill_body_rides_system_prompt_for_rest_of_run(
     orchestrator: Orchestrator, store: RunStore, home: Path
 ) -> None:
     """Regression (§4.6): load_skill splices the body into the system
-    prompt (immune to tool-result pruning), not just into a tool result
-    that gets pruned after 3 assistant turns."""
+    prompt (immune to tool-result pruning and compaction), not just into a
+    tool result that could later be stubbed.
+
+    Since G1 made pruning pressure-gated, FakeAdapter's 1M-token window keeps
+    this run far below PRUNE_PRESSURE_THRESHOLD, so the load_skill result is
+    *not* stubbed here — that is the new correct behaviour. The property
+    under test is the durable one: the body rides the system prompt."""
     body = _add_skill(home)
     script = [
         resp(
@@ -1014,14 +1019,20 @@ async def test_loaded_skill_body_rides_system_prompt_for_rest_of_run(
     assert result.status == "completed"
 
     final_call = adapter.calls[-1]
-    # The tool result itself has been pruned to a stub by now ...
+    # Nothing is stubbed at ~0% utilization (G1: pruning is pressure-gated) ...
     stubbed = [
         m.tool_result.content
         for m in final_call.messages
         if m.tool_result is not None and "[pruned:" in m.tool_result.content
     ]
-    assert stubbed, "expected the old load_skill result to be pruned"
-    # ... but the body still applies, via the system prompt.
+    assert not stubbed, "no pruning should occur below the pressure threshold"
+    # ... and the load_skill result was never the carrier anyway: it is a
+    # short acknowledgment, while the body applies via the system prompt.
+    assert not any(
+        body in m.tool_result.content
+        for m in final_call.messages
+        if m.tool_result is not None
+    )
     assert body in (final_call.system or "")
 
 

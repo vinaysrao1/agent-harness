@@ -13,16 +13,41 @@ from harness.context import (
     COMPACTION_THRESHOLD,
     MEMORY_BLOCK_BEGIN,
     MEMORY_BLOCK_END,
+    PRUNE_KEEP_TURNS,
+    PRUNE_PRESSURE_THRESHOLD,
+    PRUNE_TARGET_FRACTION,
     ContextManager,
 )
 from harness.types import Message, Role, ToolCall, ToolResult
 
 BASE_PROMPT = "You are a diligent harness agent."
 
+#: A ``max_context`` small enough that the legacy pruning fixtures below (a
+#: dozen-odd 100-token messages) sit above ``PRUNE_PRESSURE_THRESHOLD``.
+#: Pruning is pressure-gated now, so every test that asserts a stub must
+#: create the pressure that licenses it.
+UNDER_PRESSURE_CONTEXT = 1_000
+
 
 def fake_count_tokens(messages: list[Message]) -> int:
     """Deterministic fake counter: 100 tokens per message."""
     return 100 * len(messages)
+
+
+def char_count_tokens(messages: list[Message]) -> int:
+    """Chars-per-4 counter, matching the adapters' default (base.py:167).
+
+    Used by the pressure tests, where the shed's own ``chars // 4`` budgeting
+    proxy has to be commensurate with the counter for the arithmetic to mean
+    anything.
+    """
+    chars = 0
+    for message in messages:
+        if message.content:
+            chars += len(message.content)
+        if message.tool_result is not None:
+            chars += len(message.tool_result.content)
+    return chars // 4
 
 
 async def stub_summarize(messages: list[Message]) -> str:
@@ -139,7 +164,8 @@ def test_recent_transcript_passes_through_verbatim() -> None:
 
 
 def test_pruning_boundary_exactly_three_turns_kept() -> None:
-    cm = make_cm()
+    """Under pressure, PRUNE_KEEP_TURNS is the floor of the shed."""
+    cm = make_cm(max_context=UNDER_PRESSURE_CONTEXT)
     cm.append(user("goal"))  # ref 1
     for i in range(1, 6):  # refs 2..11
         cm.append(assistant_turn(i))
@@ -160,7 +186,8 @@ def test_pruning_boundary_exactly_three_turns_kept() -> None:
 
 
 def test_pruning_boundary_shifts_with_each_new_assistant_turn() -> None:
-    cm = make_cm()
+    """Under pressure, the keep window slides forward with the turns."""
+    cm = make_cm(max_context=UNDER_PRESSURE_CONTEXT)
     cm.append(user("goal"))
     for i in range(1, 7):  # one more turn than the boundary test
         cm.append(assistant_turn(i))
@@ -173,7 +200,7 @@ def test_pruning_boundary_shifts_with_each_new_assistant_turn() -> None:
 
 
 def test_pruning_does_not_mutate_transcript() -> None:
-    cm = make_cm()
+    cm = make_cm(max_context=UNDER_PRESSURE_CONTEXT)
     cm.append(user("goal"))
     for i in range(1, 6):
         cm.append(assistant_turn(i))
@@ -185,7 +212,7 @@ def test_pruning_does_not_mutate_transcript() -> None:
 
 
 def test_pruning_stub_uses_generic_name_for_unknown_call() -> None:
-    cm = make_cm()
+    cm = make_cm(max_context=UNDER_PRESSURE_CONTEXT)
     cm.append(user("goal"))
     orphan = Message(
         role=Role.TOOL,
@@ -199,6 +226,249 @@ def test_pruning_stub_uses_generic_name_for_unknown_call() -> None:
     stub = messages[1].tool_result
     assert stub is not None
     assert stub.content == "[pruned: tool result, 42 chars; event ref 2]"
+
+
+# -- pressure-gated pruning (G1) ----------------------------------------------
+
+
+def pressure_cm(
+    *,
+    max_context: int,
+    turns: int,
+    result_chars,
+    reminder_interval: int = 1_000_000,
+) -> ContextManager:
+    """Goal + ``turns`` × (assistant tool call, tool result) on a chars/4
+    counter. ``result_chars`` is an int or a callable of the 1-based turn."""
+    cm = make_cm(
+        max_context=max_context,
+        count_tokens=char_count_tokens,
+        reminder_interval=reminder_interval,
+    )
+    cm.append(user("goal"))
+    for i in range(1, turns + 1):
+        cm.append(assistant_turn(i))
+        size = result_chars(i) if callable(result_chars) else result_chars
+        cm.append(tool_result(i, "x" * size))
+    return cm
+
+
+def stub_count(messages: list[Message]) -> int:
+    return sum(
+        1
+        for m in messages
+        if m.role is Role.TOOL
+        and m.tool_result is not None
+        and m.tool_result.content.startswith("[pruned:")
+    )
+
+
+def test_no_pruning_below_the_pressure_threshold() -> None:
+    """THE REGRESSION FENCE. Before G1 this failed.
+
+    A 25-turn transcript at ~9.5% window utilization must reach the model
+    intact — including tool results twenty turns old. The pre-G1 assembler
+    stubbed every tool result older than PRUNE_KEEP_TURNS unconditionally,
+    with no reference to max_context, while compaction (the pressure-driven
+    mechanism) never fired once across all fourteen round-2 benchmark
+    trials. The harness was discarding evidence at under 13% utilization.
+    """
+    cm = pressure_cm(max_context=100_000, turns=25, result_chars=1500)
+    raw = cm._raw_token_count()
+    assert raw < 0.5 * PRUNE_PRESSURE_THRESHOLD * 100_000  # ~10% utilization
+
+    _, messages = cm.assemble()
+    assert cm._prune_plan() == frozenset()
+    assert stub_count(messages) == 0
+    for message in messages:
+        text = message.content or (
+            message.tool_result.content if message.tool_result else ""
+        )
+        assert "[pruned:" not in text
+    # The twenty-turn-old result is still there, verbatim.
+    oldest = [m for m in messages if m.role is Role.TOOL][0]
+    assert oldest.tool_result is not None
+    assert oldest.tool_result.content == "x" * 1500
+
+
+def test_pressure_engages_shedding_oldest_first_down_to_target() -> None:
+    """Above the threshold the shed engages: oldest first, never inside the
+    keep window, stopping once the estimate reaches PRUNE_TARGET_FRACTION."""
+    cm = pressure_cm(max_context=100_000, turns=14, result_chars=16_000)
+    raw = cm._raw_token_count()
+    assert raw > PRUNE_PRESSURE_THRESHOLD * 100_000
+
+    plan = cm._prune_plan()
+    assert plan  # stubs appear
+    candidates = cm._tool_results_oldest_first()
+    eligible = [i for i, _, age in candidates if age > PRUNE_KEEP_TURNS]
+    # Exactly a prefix of the oldest eligible results, nothing newer.
+    assert sorted(plan) == eligible[: len(plan)]
+    assert len(plan) < len(eligible)  # graduated, not "everything old"
+    # Nothing inside the keep window was touched.
+    recent = {i for i, _, age in candidates if age <= PRUNE_KEEP_TURNS}
+    assert not (plan & recent)
+    # The shed reached target (it did not bottom out on the keep window).
+    assert cm._token_count() <= PRUNE_TARGET_FRACTION * 100_000
+
+    _, messages = cm.assemble()
+    assert stub_count(messages) == len(plan)
+
+
+def test_shedding_is_graduated_not_a_cliff() -> None:
+    """More pressure sheds strictly more; 0.55 utilization is not 0.75."""
+    low = pressure_cm(max_context=100_000, turns=14, result_chars=16_000)
+    high = pressure_cm(max_context=100_000, turns=19, result_chars=16_000)
+    assert 0.5 < low._raw_token_count() / 100_000 < 0.6
+    assert 0.7 < high._raw_token_count() / 100_000 < 0.8
+    assert len(low._prune_plan()) < len(high._prune_plan())
+
+
+def test_pressure_signal_is_measured_before_pruning_not_after() -> None:
+    """The second defect: pre-G1, ``_token_count`` (what compaction reads)
+    was computed on an assembly that had *already* pruned, so the cheap
+    destructive mechanism suppressed the trigger for the careful one.
+
+    Now there are two distinct counts: ``_raw_token_count`` (no pruning —
+    the pruning decision's input) and ``_token_count`` (post-pruning — what
+    goes on the wire, and what compaction reads). Neither recurses.
+    """
+    seen: list[list[Message]] = []
+
+    def recording(messages: list[Message]) -> int:
+        seen.append(list(messages))
+        return char_count_tokens(messages)
+
+    cm = pressure_cm(max_context=100_000, turns=14, result_chars=16_000)
+    cm._count_tokens = recording  # type: ignore[assignment]
+    cm._invalidate_counts()
+
+    assert cm._token_count() > 0
+    # Exactly two assemblies were counted — no recursion, no re-entry.
+    assert len(seen) == 2
+    # The first (the pruning decision's signal) saw no stubs at all ...
+    assert stub_count(seen[0]) == 0
+    # ... the second (compaction's signal) saw the live plan.
+    assert stub_count(seen[1]) == len(cm._prune_plan())
+    assert cm._raw_token_count() > cm._token_count()
+    # Both are memoized for the turn: no further counter calls.
+    cm._token_count()
+    cm._raw_token_count()
+    cm._prune_plan()
+    assert len(seen) == 2
+
+
+def test_hysteresis_consecutive_assemblies_are_byte_identical() -> None:
+    """A transcript that has not changed must assemble identically, so the
+    provider's prompt-cache prefix survives. Without the 0.50/0.40 gap a
+    transcript hovering at the trigger would flip stub state turn-to-turn.
+
+    Growth only *extends* the plan — already-stubbed indices stay stubbed —
+    so the shared prefix is preserved as the run goes on.
+    """
+    cm = pressure_cm(max_context=100_000, turns=13, result_chars=16_000)
+    assert 0.5 < cm._raw_token_count() / 100_000 < 0.55
+
+    first_plan = cm._prune_plan()
+    first = cm.assemble()
+    second_plan = cm._prune_plan()
+    second = cm.assemble()
+    assert first_plan == second_plan
+    assert first == second
+
+    cm.append(assistant_turn(14))
+    cm.append(tool_result(14, "x" * 16_000))
+    grown = cm._prune_plan()
+    assert first_plan <= grown  # prefix-stable: only ever extends
+
+
+async def test_ladder_hands_off_to_compaction_when_the_shed_cannot_reach_target(
+) -> None:
+    """Rung three. The keep window is inviolable, so a transcript whose
+    *recent* results alone exceed the window cannot be shed to target; the
+    post-prune count stays above COMPACTION_THRESHOLD and compaction takes
+    over. The compact-to-fixpoint pass must still terminate."""
+    cm = pressure_cm(
+        max_context=100_000,
+        turns=5,
+        result_chars=lambda i: 40_000 if i <= 2 else 120_000,
+    )
+    assert cm._prune_plan()  # pruning engaged ...
+    assert cm._token_count() > COMPACTION_THRESHOLD * 100_000  # ... and lost
+
+    evicted = []
+    for _ in range(20):  # fixpoint, with a fuse
+        span = await cm.maybe_compact()
+        if span is None:
+            break
+        evicted.append(span)
+    else:  # pragma: no cover - the fuse blowing is the failure
+        raise AssertionError("compact-to-fixpoint did not terminate")
+    assert evicted
+
+
+def test_single_oversized_result_is_shed_in_one_pass() -> None:
+    """One result larger than the entire budget: stubbed on the first
+    iteration, and the pass stops there."""
+    cm = pressure_cm(
+        max_context=100_000,
+        turns=5,
+        result_chars=lambda i: 500_000 if i == 1 else 100,
+    )
+    plan = cm._prune_plan()
+    assert len(plan) == 1
+    _, messages = cm.assemble()
+    results = [m for m in messages if m.role is Role.TOOL]
+    assert results[0].tool_result is not None
+    assert results[0].tool_result.content.startswith("[pruned: bash result")
+    for result in results[1:]:
+        assert result.tool_result is not None
+        assert result.tool_result.content == "x" * 100
+
+
+def test_ranged_read_survives_twenty_unrelated_turns_at_a_real_window() -> None:
+    """The make-doom-for-mips fence.
+
+    In that round-2 trial 66 of 90 ranged reads (73%) re-read a byte range
+    the agent had already read, and one ``sed -n`` range over /app/vm.js
+    issued at seq 49 was re-read in overlapping fragments twelve times
+    (seqs 157, 182, 212, 262, 307, 317, 347, 429, 497, 509, 515, 545);
+    93 of the trial's 106 bash calls (88%) were pure inspection. The
+    transcript had been erased under it. At the provider's real window
+    (openai_compat max_context = 128,000) reading a range once must be
+    enough.
+    """
+    range_a = "\n".join(f"{n}: line of vm.js" for n in range(1740, 1831))
+    cm = make_cm(max_context=128_000, count_tokens=char_count_tokens)
+    cm.append(user("port doom to mips"))
+    cm.append(assistant_turn(0))
+    cm.append(tool_result(0, range_a))
+    for i in range(1, 21):
+        cm.append(assistant_turn(i))
+        cm.append(tool_result(i, f"unrelated output {i}"))
+
+    assert cm._prune_plan() == frozenset()
+    _, messages = cm.assemble()
+    contents = [
+        m.tool_result.content for m in messages if m.tool_result is not None
+    ]
+    assert range_a in contents
+
+
+def test_solved_trial_sized_transcripts_never_prune() -> None:
+    """Safety assertion for the three round-2 solves (compile-compcert,
+    mcmc-sampling-stan, qemu-startup): all peaked under 6,000 input tokens
+    against a 128,000-token window, so G1 must be a no-op for them — an
+    empty plan on *every* turn, not merely at the end."""
+    cm = make_cm(max_context=128_000, count_tokens=char_count_tokens)
+    cm.append(user("solve the task"))
+    for i in range(1, 61):
+        cm.append(assistant_turn(i))
+        cm.append(tool_result(i, "x" * 380))
+        assert cm._prune_plan() == frozenset(), f"pruned on turn {i}"
+        _, messages = cm.assemble()
+        assert stub_count(messages) == 0
+    assert cm._raw_token_count() < 6_000
 
 
 # -- reminder cadence ---------------------------------------------------------
@@ -438,7 +708,7 @@ async def test_compact_on_tiny_transcript_is_a_no_op() -> None:
 
 
 async def test_event_refs_stable_across_compaction_for_pruning_stubs() -> None:
-    cm = make_cm()
+    cm = make_cm(max_context=UNDER_PRESSURE_CONTEXT)
     cm.append(user("goal"))  # ref 1
     for i in range(1, 10):  # refs 2..19
         cm.append(assistant_turn(i))
