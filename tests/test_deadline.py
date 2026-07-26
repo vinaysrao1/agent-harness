@@ -16,8 +16,8 @@ from harness.deadline import (
     LANDING_ALLOWANCE_DEFAULT,
     LANDING_ALLOWANCE_MAX,
     LANDING_ALLOWANCE_MIN,
-    LANDING_RESERVE_FRACTION,
     MODEL_CALL_WINDOW,
+    REMAINING_RESERVE_FRACTION,
     WALL_CLOCK_STOP_FLOOR,
     WIND_DOWN_FRACTION,
     WIND_DOWN_MAX_REMAINING,
@@ -383,7 +383,7 @@ _SIMULATION: tuple[_Row, ...] = (
     _Row("caffe-cifar-10", 1200, 619.7, 600, "exploratory", 464.775, True, "band"),
     _Row("compcert-3600", 2400, 1241.9, 3600, "exploratory", 931.425, True, "band"),
     # The decisive `make -j 6` of a SOLVED task: it ran 208.9s and keeps
-    # 435.975s (2.1x). LANDING_RESERVE_FRACTION = 0.5 would leave 1.4x.
+    # 435.975s (2.1x). REMAINING_RESERVE_FRACTION = 0.5 would leave 1.4x.
     _Row("compcert-make-j6", 2400, 581.3, 3600, "exploratory", 435.975, True, "band"),
     _Row("compcert-1200", 2400, 713.6, 1200, "exploratory", 535.2, True, "band"),
     _Row("write-compressor", 900, 335.5, 300, "exploratory", 251.625, True, "band"),
@@ -562,7 +562,7 @@ class _CapRow(NamedTuple):
 #: rounded inputs, so the table is exact).
 #:
 #: This is the fence for every future constant change. ``EXEC_CAP_FLOOR_
-#: SECONDS``, ``LANDING_ALLOWANCE_MIN``, ``LANDING_RESERVE_FRACTION`` and
+#: SECONDS``, ``LANDING_ALLOWANCE_MIN``, ``REMAINING_RESERVE_FRACTION`` and
 #: ``EXEC_MAX_BUDGET_FRACTION`` are all tuned from exactly this corpus, and
 #: moving any of them re-cuts real commands — including the decisive build
 #: of a task that currently passes. Here that shows up as a diff, not as a
@@ -706,6 +706,83 @@ _CAP_CORPUS: tuple[_CapRow, ...] = (
     _CapRow('write-compressor', 146, 900, 111.068, 80, 77.841,
             33.227, 0.786, False, 33.227, 'reserve'),
 )
+
+#: Every ``exec_capped`` event of the round-3 rerun: 22 rows across 8
+#: tasks, extracted from the same ``state.db`` shape as
+#: :data:`_CAP_CORPUS` (``jobs/round3-rerun/2026-07-25__21-19-27``). Kept
+#: as its own tuple rather than appended to :data:`_CAP_CORPUS` so the
+#: round-2 fence above stays byte-identical: the two corpora answer
+#: different questions, and only this one carries a caveat.
+#:
+#: **The caveat**: 8 of the 14 round-3 trials ran with a contaminated
+#: clock, so ``runtime`` here (the ``exec_capped`` → next ``tool_result``
+#: delta) is an upper bound, not a measurement — ``compile-compcert`` 98
+#: reads 1901s against a 600.9s cap and did not time out. Nothing below
+#: draws a conclusion from a round-3 runtime; the counterfactual's
+#: load-bearing rows are round-2 ones, whose timings are clean.
+_R3_CAP_CORPUS: tuple[_CapRow, ...] = (
+    # -- caffe-cifar-10 ----------------------------------------------
+    _CapRow('caffe-cifar-10', 26, 1200, 973.17, 1800, 75,
+            600, 116.49, False, 600, 'share'),
+    _CapRow('caffe-cifar-10', 47, 1200, 687.641, 590, 75,
+            515.731, 16.931, False, 515.73075, 'band'),
+    _CapRow('caffe-cifar-10', 53, 1200, 662.689, 590, 75,
+            497.017, 218.818, False, 497.01675, 'band'),
+    _CapRow('caffe-cifar-10', 64, 1200, 429.235, 590, 75,
+            321.926, 5.144, False, 321.92625, 'band'),
+    _CapRow('caffe-cifar-10', 105, 1200, 335.987, 590, 75,
+            251.99, 8.347, False, 251.99025, 'band'),
+    # The defect case: capped to 239.8s at 319.7s remaining, so it came
+    # back with 79.9s against its own 300s wind-down threshold.
+    _CapRow('caffe-cifar-10', 111, 1200, 319.684, 300, 75,
+            239.763, 240.016, True, 239.763, 'band'),
+    # -- compile-compcert --------------------------------------------
+    _CapRow('compile-compcert', 61, 2400, 2181.666, 1800, 75,
+            1200, 480.955, False, 1200, 'share'),
+    _CapRow('compile-compcert', 82, 2400, 984.309, 1200, 75,
+            738.232, 151.301, False, 738.23175, 'band'),
+    _CapRow('compile-compcert', 98, 2400, 801.23, 700, 75,
+            600.922, 1901.296, False, 600.9225, 'band'),
+    # -- gpt2-codegolf -----------------------------------------------
+    _CapRow('gpt2-codegolf', 31, 900, 717.083, 600, 75,
+            450, 0.271, False, 450, 'share'),
+    _CapRow('gpt2-codegolf', 132, 900, 196.78, 120, 83.608,
+            113.172, 0.551, False, 113.172, 'reserve'),
+    _CapRow('gpt2-codegolf', 140, 900, 162.999, 120, 87.279,
+            75.719, 4.012, False, 75.72, 'reserve'),
+    _CapRow('gpt2-codegolf', 151, 900, 132.82, 60, 87.279,
+            45.54, 3.923, False, 45.541, 'reserve'),
+    _CapRow('gpt2-codegolf', 157, 900, 120.279, 45, 87.279,
+            33, 3.898, False, 33, 'reserve'),
+    _CapRow('gpt2-codegolf', 163, 900, 103.384, 40, 87.279,
+            30, 3.891, False, 30, 'reserve'),
+    # -- make-doom-for-mips ------------------------------------------
+    # The one row the shipping arithmetic does not reproduce on its own:
+    # `bash`'s MIN_EXEC_SECONDS floor (harness.tools.builtin) turns this
+    # 0.0 into the 1.0 that was actually handed out.
+    _CapRow('make-doom-for-mips', 103, 900, 15.802, 240, 114.758,
+            1, 1.016, True, 0, 'reserve'),
+    # -- mcmc-sampling-stan ------------------------------------------
+    _CapRow('mcmc-sampling-stan', 49, 1800, 1484.811, 1200, 75,
+            900, 1930.706, False, 900, 'share'),
+    _CapRow('mcmc-sampling-stan', 117, 1800, 583.675, 600, 75,
+            437.756, 400.176, False, 437.75625, 'band'),
+    # -- mteb-leaderboard --------------------------------------------
+    _CapRow('mteb-leaderboard', 146, 3600, 2979.286, 3000, 75,
+            1800, 961.89, False, 1800, 'share'),
+    # -- qemu-alpine-ssh ---------------------------------------------
+    _CapRow('qemu-alpine-ssh', 138, 900, 279.86, 260, 75,
+            204.86, 170.398, False, 204.86, 'reserve'),
+    _CapRow('qemu-alpine-ssh', 154, 900, 84.428, 40, 75,
+            24.428, 1.49, False, 24.428, 'reserve'),
+    # -- write-compressor --------------------------------------------
+    _CapRow('write-compressor', 48, 900, 361.712, 300, 87.565,
+            271.284, 0.177, False, 271.284, 'band'),
+)
+
+#: Both rounds: the 85 real capped execs every claim about this arithmetic
+#: is measured against.
+_ALL_CAP_ROWS: tuple[_CapRow, ...] = _CAP_CORPUS + _R3_CAP_CORPUS
 
 #: The three tasks the round-2 run actually solved (grader ``reward``, not
 #: the agent's own ``verification_passed``). 1a must not touch a single one
@@ -861,6 +938,196 @@ class TestFrozenExecCapCorpus:
             assert row.timed_out
 
 
+def _strict_band_effective(row: _CapRow) -> float:
+    """Candidate B: what a *real* band guarantee would have handed out.
+
+    The repair this project keeps being tempted by — reserve the whole
+    :func:`wind_down_threshold` whenever ``remaining`` is above it, instead
+    of a quarter of what remains — with the same
+    :data:`EXEC_CAP_FLOOR_SECONDS` softening and stop-floor clamp the
+    shipping arithmetic uses, so the two differ only in the one term. It
+    lives here, not in ``harness.deadline``, because it is a rejected
+    design kept only as evidence.
+    """
+    deadline = _at_reserve(row)
+    reserve = deadline.landing_reserve()
+    threshold = wind_down_threshold(row.budget)
+    if row.remaining > threshold:
+        reserve = max(reserve, threshold)
+    allowed = max(EXEC_CAP_FLOOR_SECONDS, row.remaining - reserve)
+    allowed = min(allowed, max(0.0, row.remaining - WALL_CLOCK_STOP_FLOOR))
+    return min(row.requested, EXEC_MAX_BUDGET_FRACTION * row.budget, allowed)
+
+
+class TestTheBandIsNotAGuarantee:
+    """The honest contract, pinned so it cannot quietly become a promise.
+
+    ``harness.deadline`` used to document a **band guarantee**: "an exec
+    started above the wind-down threshold hands control back with enough
+    time to actually wind down". The arithmetic never did that. It reserves
+    ``min(threshold, REMAINING_RESERVE_FRACTION * remaining)`` — a
+    *proportional* bound whose ceiling happens to be the threshold — and
+    since :func:`wind_down_threshold` floors at 300s, the proportion is the
+    binding term throughout the wind-down region of every budget this
+    harness has run (``4 * threshold >= 1200``).
+
+    Round 5 fixed the documentation and the sentence the *model* reads
+    (``harness.tools.builtin._CAP_ADVICE["band"]``) and deliberately left
+    the arithmetic alone. These tests are the reason for the second half of
+    that decision.
+    """
+
+    @pytest.mark.parametrize(
+        "row", _ALL_CAP_ROWS, ids=[f"{r.task}-{r.seq}" for r in _ALL_CAP_ROWS]
+    )
+    def test_the_true_invariant_holds_on_every_corpus_row(
+        self, row: _CapRow
+    ) -> None:
+        """What an exploratory exec really promises, on all 85 real rows.
+
+        ``effective <= max(remaining - landing_reserve(), (1 -
+        REMAINING_RESERVE_FRACTION) * remaining)`` and ``effective <= 0.5 *
+        budget``. Note what is *not* asserted: nothing of the form
+        ``remaining - effective >= wind_down_threshold(budget)``.
+        """
+        deadline = _at_reserve(row)
+        decision = deadline.exec_decision(row.requested)
+        # The shipping arithmetic reproduces every recorded row, so an
+        # accidental change to it fails here rather than in production.
+        assert decision.effective == pytest.approx(row.effective, abs=1e-6)
+        assert decision.reason == row.reason
+
+        proportional = (1.0 - REMAINING_RESERVE_FRACTION) * row.remaining
+        assert decision.effective <= max(
+            row.remaining - deadline.landing_reserve(), proportional
+        ) + 1e-9
+        assert decision.effective <= EXEC_MAX_BUDGET_FRACTION * row.budget
+
+    def test_the_wind_down_band_is_not_guaranteed_and_we_say_so(self) -> None:
+        """The negative test: the band is a ceiling, not a promise.
+
+        caffe-cifar-10 round 3 seq 111, verbatim: budget 1200 (threshold
+        300), 319.68s remaining, a 300s command. The cap hands out 239.76s
+        — three quarters of what was left — and the trial came back with
+        79.92s against its own 300s wind-down threshold, which is exactly
+        the turn it was documented to be given and was not.
+
+        A future change that "repairs" the guarantee will fail this test.
+        Before repairing it, read
+        :meth:`test_strict_band_would_have_killed_a_solved_trials_build`:
+        the repair was measured and it costs a solved trial.
+        """
+        deadline = _at(1200.0, 319.68, observations=(15.0,))
+        threshold = wind_down_threshold(1200.0)
+        assert threshold == 300.0
+        decision = deadline.exec_decision(300.0)
+
+        assert decision.effective == pytest.approx(239.76, abs=0.01)
+        assert decision.reason == "band"
+        # Three quarters of what remained, not "everything above the
+        # threshold" — the reserve is 0.25 x 319.68, well under the 300s
+        # threshold it is named after.
+        assert decision.reserve == pytest.approx(
+            REMAINING_RESERVE_FRACTION * 319.68
+        )
+        assert decision.reserve < threshold
+        # The claim that was false, asserted as false.
+        assert 319.68 - decision.effective < threshold
+
+    #: The counterfactual, checked in. ``(corpus, task, seq, strict,
+    #: verdict)`` where ``strict`` is what :func:`_strict_band_effective`
+    #: would have handed out. ``verdict`` is ``"kills"`` when the command
+    #: actually ran longer than ``strict`` — i.e. a real band guarantee
+    #: would have SIGKILLed a command that completed.
+    _COUNTERFACTUAL: tuple[tuple[str, str, int, float, str], ...] = (
+        # THE row. A `make -j 6` on a trial that graded reward=1.0: it ran
+        # 198.9s and returned exit 0 inside its 438.3s cap. Strict band
+        # enforcement gives it 104.4s and kills it mid-build.
+        ("R2", "compile-compcert", 91, 104.417, "kills"),
+        ("R2", "caffe-cifar-10", 64, 30.0, "kills"),
+        # The trial the repair was proposed *for*: it would have been cut
+        # from 239.8s to 30s and still not have finished.
+        ("R3", "caffe-cifar-10", 111, 30.0, "shortened"),
+        ("R3", "mcmc-sampling-stan", 117, 223.675, "kills"),
+        ("R3", "compile-compcert", 98, 321.23, "shortened"),
+        # Solved-trial execs that survive B but lose most of their margin.
+        ("R2", "compile-compcert", 73, 791.209, "shortened"),
+        ("R2", "compile-compcert", 79, 310.003, "shortened"),
+        ("R2", "compile-compcert", 85, 113.641, "shortened"),
+        ("R2", "qemu-startup", 201, 165.114, "shortened"),
+        ("R3", "write-compressor", 48, 61.712, "shortened"),
+    )
+
+    @pytest.mark.parametrize(
+        "corpus,task,seq,strict,verdict",
+        _COUNTERFACTUAL,
+        ids=[f"{c}-{t}-{s}" for c, t, s, _e, _v in _COUNTERFACTUAL],
+    )
+    def test_strict_band_would_have_killed_a_solved_trials_build(
+        self,
+        corpus: str,
+        task: str,
+        seq: int,
+        strict: float,
+        verdict: str,
+    ) -> None:
+        """Why the arithmetic stays proportional. Measured, not assumed.
+
+        Over all 85 rows, reserving the whole threshold changes 26 of them
+        — and on ``compile-compcert`` round 2 seq 91 it converts a command
+        that completed on a *solved* trial into one that is killed. That is
+        the price of the guarantee, and it buys nothing: the trial that
+        motivated the repair (caffe round 3 seq 111) times out either way.
+        """
+        rows = _CAP_CORPUS if corpus == "R2" else _R3_CAP_CORPUS
+        (row,) = [r for r in rows if r.task == task and r.seq == seq]
+        assert _strict_band_effective(row) == pytest.approx(strict, abs=0.01)
+        assert strict < row.effective  # every one of these is a cut
+        if verdict == "kills":
+            # The command ran longer than the strict cap would have
+            # allowed, so it would have been killed mid-flight.
+            assert row.runtime > strict
+            if corpus == "R2":
+                # Round-2 timings are clean, so this is the strong claim:
+                # it completed inside the shipping cap and would not have
+                # completed inside the strict one.
+                assert not row.timed_out
+                assert row.runtime < row.effective
+
+    def test_the_repair_would_change_twenty_six_of_eighty_five_rows(
+        self,
+    ) -> None:
+        # The scale of the change, so "it only affects a pathological case"
+        # cannot be asserted without checking.
+        assert len(_ALL_CAP_ROWS) == 85
+        changed = [
+            row
+            for row in _ALL_CAP_ROWS
+            if abs(_strict_band_effective(row) - row.effective) > 0.01
+        ]
+        assert len(changed) == 26
+        # And it is one-directional: strict enforcement only ever takes
+        # time away.
+        for row in changed:
+            assert _strict_band_effective(row) < row.effective
+
+    def test_the_solved_trials_build_is_the_decisive_row(self) -> None:
+        # Named separately from the table so `git log -S` finds it: this is
+        # the row that rejected the design.
+        (row,) = [
+            r
+            for r in _CAP_CORPUS
+            if r.task == "compile-compcert" and r.seq == 91
+        ]
+        assert row.task in _SOLVED_TASKS
+        assert row.effective == pytest.approx(438.31275)
+        assert row.runtime == pytest.approx(198.91)
+        assert row.timed_out is False
+        strict = _strict_band_effective(row)
+        assert strict == pytest.approx(104.417, abs=0.01)
+        assert strict < row.runtime < row.effective
+
+
 class TestStopFloorClampProperty:
     """1a's invariant, swept over a dense grid rather than sampled.
 
@@ -933,7 +1200,7 @@ class TestStopFloorClampProperty:
             if remaining > threshold:
                 reserve = max(
                     reserve,
-                    min(threshold, LANDING_RESERVE_FRACTION * remaining),
+                    min(threshold, REMAINING_RESERVE_FRACTION * remaining),
                 )
             unclamped = max(EXEC_CAP_FLOOR_SECONDS, remaining - reserve)
             for requested in self._REQUESTS:
@@ -1029,10 +1296,10 @@ class TestExecDecisionReserve:
     """Regression: the decision reports the reserve it *applied*.
 
     ``exec_cap`` returns only ``(effective, capped, reason)``, so the only
-    reserve telemetry could name was the un-softened
-    :meth:`Deadline.landing_reserve` — while the band softener routinely
-    holds back several times that. Since
-    :data:`LANDING_RESERVE_FRACTION` is the constant round 3 retunes from
+    reserve telemetry could name was the un-raised
+    :meth:`Deadline.landing_reserve` — while the remaining-share reserve
+    routinely holds back several times that. Since
+    :data:`REMAINING_RESERVE_FRACTION` is the constant retuned from
     exactly this telemetry, the applied number has to be reported, not
     reconstructed: ``remaining - effective`` recovers it for reason
     ``"band"``/``"reserve"`` and not at all for ``"share"``.
@@ -1046,7 +1313,7 @@ class TestExecDecisionReserve:
         assert decision.reason == "band"
         assert decision.reserve == pytest.approx(154.925)
         assert decision.reserve == pytest.approx(
-            LANDING_RESERVE_FRACTION * 619.7
+            REMAINING_RESERVE_FRACTION * 619.7
         )
         assert decision.effective == pytest.approx(464.775)
 
@@ -1121,7 +1388,9 @@ class TestExecCapProperties:
             remaining -= 10.0
 
     @pytest.mark.parametrize("budget", _BUDGETS)
-    def test_band_guarantee_holds_above_the_threshold(self, budget: float) -> None:
+    def test_the_remaining_share_reserve_holds_above_the_threshold(
+        self, budget: float
+    ) -> None:
         threshold = wind_down_threshold(budget)
         remaining = budget
         while remaining > 0.0:
@@ -1129,11 +1398,11 @@ class TestExecCapProperties:
             for requested in self._REQUESTS:
                 cap = deadline.exec_cap(requested)[0]
                 if remaining > threshold:
-                    # What is left when the exec returns is enough to wind
-                    # down: the threshold itself, softened to a quarter of
-                    # what remained.
+                    # What is held back is a quarter of what remained,
+                    # ceilinged by the threshold — *not* enough to wind
+                    # down, in general. See TestTheBandIsNotAGuarantee.
                     held_back = min(
-                        threshold, LANDING_RESERVE_FRACTION * remaining
+                        threshold, REMAINING_RESERVE_FRACTION * remaining
                     )
                     assert remaining - cap >= held_back - 1e-9
             remaining -= 10.0
@@ -1164,7 +1433,7 @@ class TestWindDownThresholdMovedHere:
         assert WIND_DOWN_MIN_REMAINING == 300.0
         assert WIND_DOWN_MAX_REMAINING == 600.0
         assert EXEC_MAX_BUDGET_FRACTION == 0.5
-        assert LANDING_RESERVE_FRACTION == 0.25
+        assert REMAINING_RESERVE_FRACTION == 0.25
 
     @pytest.mark.parametrize(
         "budget,expected",

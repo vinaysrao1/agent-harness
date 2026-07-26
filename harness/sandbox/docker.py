@@ -36,6 +36,7 @@ from harness.sandbox.base import (
     ExecResult,
     Sandbox,
     SandboxError,
+    WriteMode,
     read_workspace_file,
     truncate_output,
     write_workspace_file,
@@ -343,6 +344,12 @@ class DockerSandbox(Sandbox):
         """Read a text file at ``path`` via the host side of the bind mount."""
         return await read_workspace_file(self._workspace, path)
 
-    async def write_file(self, path: str, content: str) -> None:
-        """Write a text file at ``path`` via the host side of the bind mount."""
-        await write_workspace_file(self._workspace, path, content)
+    async def write_file(
+        self, path: str, content: str, *, mode: WriteMode = "overwrite"
+    ) -> None:
+        """Write a text file at ``path`` via the host side of the bind mount.
+
+        ``mode="append"`` adds to an existing file (creating it if absent)
+        instead of replacing its contents; see :data:`WriteMode`.
+        """
+        await write_workspace_file(self._workspace, path, content, mode=mode)

@@ -21,7 +21,7 @@ from __future__ import annotations
 import abc
 import asyncio
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -31,6 +31,7 @@ __all__ = [
     "SandboxPathError",
     "ExecResult",
     "Sandbox",
+    "WriteMode",
     "apply_edit",
     "resolve_workspace_path",
     "truncate_output",
@@ -40,6 +41,17 @@ __all__ = [
 
 #: Per-stream truncation limit for `exec` output (DESIGN.md §4.7).
 MAX_OUTPUT_BYTES: Final[int] = 100_000
+
+#: `write_file`'s two modes: `"overwrite"` (default, replaces the file's
+#: contents) or `"append"` (adds to them, creating the file if it doesn't
+#: exist yet). This is a **capability addition, not a defect repair** — the
+#: agent loop advises writing a large file "in smaller pieces across
+#: multiple calls" (harness/loop.py), but an overwrite-only `write_file`
+#: makes that advice unactionable: piece 2 destroys piece 1, and a file
+#: larger than one response's `max_output_tokens` window (~30KB) was
+#: unproducible by the tool the advice names. `"overwrite"` stays the
+#: default everywhere so every existing call site remains valid unchanged.
+WriteMode = Literal["overwrite", "append"]
 
 
 class SandboxError(Exception):
@@ -156,16 +168,24 @@ async def read_workspace_file(workspace: Path, path: str) -> str:
     return await asyncio.to_thread(_read)
 
 
-async def write_workspace_file(workspace: Path, path: str, content: str) -> None:
+async def write_workspace_file(
+    workspace: Path, path: str, content: str, *, mode: WriteMode = "overwrite"
+) -> None:
     """Write ``content`` to the text file at ``path`` inside ``workspace``.
 
-    Creates parent directories as needed; overwrites an existing file.
+    Creates parent directories as needed. ``mode="overwrite"`` (the
+    default, kept for backward compatibility with every existing call
+    site) replaces the file's contents; ``mode="append"`` adds ``content``
+    to the end, creating the file if it doesn't exist yet (see
+    :data:`WriteMode`).
     """
     resolved = resolve_workspace_path(workspace, path)
+    file_mode = "a" if mode == "append" else "w"
 
     def _write() -> None:
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        with resolved.open(file_mode, encoding="utf-8") as f:
+            f.write(content)
 
     await asyncio.to_thread(_write)
 
@@ -248,11 +268,16 @@ class Sandbox(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def write_file(self, path: str, content: str) -> None:
+    async def write_file(
+        self, path: str, content: str, *, mode: WriteMode = "overwrite"
+    ) -> None:
         """Write ``content`` to the file at ``path``, creating it if needed.
 
-        Creates any missing parent directories. Raises
-        :class:`SandboxPathError` if ``path`` escapes the workspace root.
+        Creates any missing parent directories. ``mode="overwrite"`` (the
+        default) replaces the file's contents; ``mode="append"`` adds
+        ``content`` to the end, creating the file if it doesn't exist (see
+        :data:`WriteMode`). Raises :class:`SandboxPathError` if ``path``
+        escapes the workspace root.
         """
 
     async def edit_file(
@@ -268,14 +293,17 @@ class Sandbox(abc.ABC):
         Default implementation: read the file, apply :func:`apply_edit`
         (which enforces the exact-match / uniqueness contract — see its
         docstring for the exact error conditions), and write the result
-        back. Expressed purely in terms of :meth:`read_file` and
-        :meth:`write_file`, so backends never need to override it.
+        back with ``mode="overwrite"`` (an edit always replaces the whole
+        file with its edited content, regardless of what a caller might
+        pass to `write_file` elsewhere). Expressed purely in terms of
+        :meth:`read_file` and :meth:`write_file`, so backends never need to
+        override it.
         """
         content = await self.read_file(path)
         new_content = apply_edit(
             content, old_string, new_string, replace_all=replace_all
         )
-        await self.write_file(path, new_content)
+        await self.write_file(path, new_content, mode="overwrite")
 
     async def __aenter__(self) -> "Sandbox":
         """Enter the async context manager: calls :meth:`start`."""

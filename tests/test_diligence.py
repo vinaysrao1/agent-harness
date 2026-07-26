@@ -300,6 +300,29 @@ class TestWrittenData:
         record_written_data(written, "bash", {"command": None})
         assert written.paths() == ()
 
+    def test_appended_chunks_union_rather_than_replace(self) -> None:
+        # write_file's new `mode="append"` needs no coupling fix here:
+        # WrittenData.record unions a path's lines into a set and never
+        # clears it, which is exactly correct once a file can be built from
+        # more than one write_file call -- the file really does contain
+        # both chunks' content. record_written_data itself is agnostic to
+        # the `mode` key (it only ever reads `path`/`content`), so calling
+        # it twice for two chunks of the same path is the whole story.
+        written = WrittenData()
+        record_written_data(
+            written,
+            "write_file",
+            {"path": "/app/solve.py", "content": "FIRST_CHUNK_LITERAL"},
+        )
+        record_written_data(
+            written,
+            "write_file",
+            {"path": "/app/solve.py", "content": "SECOND_CHUNK_LITERAL"},
+        )
+        assert written.lines_for("/app/solve.py") == frozenset(
+            {"FIRST_CHUNK_LITERAL", "SECOND_CHUNK_LITERAL"}
+        )
+
 
 class TestTautologyLint:
     """A literal written into the file the check *reads* is circular."""
@@ -316,6 +339,33 @@ class TestTautologyLint:
         )
         # A bare grep of a written file is also a no_execution case (T1):
         # the command only reads, it never runs the solution.
+        assert [f.kind for f in findings] == ["tautology", "no_execution"]
+        assert findings[0].details["literal"] == "Qwen/Qwen3-Embedding-8B"
+        assert findings[0].details["path"] == "/app/result.txt"
+
+    def test_still_fires_on_a_literal_from_the_first_of_two_appended_chunks(
+        self,
+    ) -> None:
+        # The checked-in proof that write_file's `mode="append"` needed no
+        # coupling fix in the lint itself: a check against a literal from
+        # the *first* write_file call must still be flagged as circular
+        # even after a second chunk was appended to the same path -- the
+        # union in WrittenData.record (see TestWrittenData) keeps the first
+        # chunk's lines around rather than dropping them.
+        written = WrittenData()
+        record_written_data(
+            written,
+            "write_file",
+            {"path": "/app/result.txt", "content": "Qwen/Qwen3-Embedding-8B"},
+        )
+        record_written_data(
+            written,
+            "write_file",
+            {"path": "/app/result.txt", "content": "SECOND_CHUNK_LITERAL"},
+        )
+        findings = lint_verification(
+            "grep -q '^Qwen/Qwen3-Embedding-8B$' /app/result.txt", written
+        )
         assert [f.kind for f in findings] == ["tautology", "no_execution"]
         assert findings[0].details["literal"] == "Qwen/Qwen3-Embedding-8B"
         assert findings[0].details["path"] == "/app/result.txt"

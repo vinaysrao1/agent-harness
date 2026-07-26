@@ -23,11 +23,18 @@ stop starting work the run can no longer act on.
 
 On top of that reserve, :meth:`Deadline.exec_cap` adds the two bounds that
 keep a single command from owning the run: a **share cap** (no exec larger
-than :data:`EXEC_MAX_BUDGET_FRACTION` of the whole budget) and a **band
-guarantee** (an exec started above the wind-down threshold hands control
-back with enough time to actually wind down). The wind-down threshold lives
-here, next to them, rather than in ``harness.loop`` — the loop re-exports it
-— so the tools layer can reach it without importing the loop.
+than :data:`EXEC_MAX_BUDGET_FRACTION` of the whole budget) and a
+**remaining-share reserve** (no exploratory exec may consume more than
+``1 - REMAINING_RESERVE_FRACTION`` of what is *left*, and never more than
+:func:`wind_down_threshold` is held back). The second one is deliberately
+*not* a guarantee that an exec started above the wind-down threshold hands
+control back inside the band — an earlier revision of this docstring said
+it was, and it was false for every budget this harness has ever run. See
+:data:`REMAINING_RESERVE_FRACTION` for what the bound is, and for the
+measured reason it was not "repaired" into a real guarantee. The wind-down
+threshold lives here, next to them, rather than in ``harness.loop`` — the
+loop re-exports it — so the tools layer can reach it without importing the
+loop.
 """
 
 from __future__ import annotations
@@ -48,8 +55,8 @@ __all__ = [
     "LANDING_ALLOWANCE_DEFAULT",
     "LANDING_ALLOWANCE_MAX",
     "LANDING_ALLOWANCE_MIN",
-    "LANDING_RESERVE_FRACTION",
     "MODEL_CALL_WINDOW",
+    "REMAINING_RESERVE_FRACTION",
     "WALL_CLOCK_STOP_FLOOR",
     "WIND_DOWN_FRACTION",
     "WIND_DOWN_MAX_REMAINING",
@@ -58,10 +65,10 @@ __all__ = [
 ]
 
 #: What an exec cap is *for*: an ``"exploratory"`` command is one the agent
-#: issued while still working, so it is subject to both the share cap and the
-#: band guarantee; a ``"verification"`` command is the completion gate the
-#: loop re-runs, which runs at completion by definition and is exempt from
-#: both (see :meth:`Deadline.exec_cap`).
+#: issued while still working, so it is subject to both the share cap and
+#: the remaining-share reserve; a ``"verification"`` command is the
+#: completion gate the loop re-runs, which runs at completion by definition
+#: and is exempt from both (see :meth:`Deadline.exec_cap`).
 ExecPurpose = Literal["exploratory", "verification"]
 
 #: The smallest exec timeout the cap will ever impose: capping below this
@@ -106,21 +113,57 @@ MODEL_CALL_WINDOW = 16
 #: runaway: a command issued at the very start of a run has almost the whole
 #: budget "remaining", so every reserve-based bound still permits it to eat
 #: nearly all of it (one observed trial spent 1647s of its 1800s budget
-#: inside a single command; the band guarantee alone would still have
-#: allowed 1347s). Expressed against :attr:`Deadline.budget`, not against
+#: inside a single command; the remaining-share reserve alone would still
+#: have allowed 1347s). Expressed against :attr:`Deadline.budget`, not against
 #: what remains, deliberately: a cumulative counter would penalize a run for
 #: one legitimate early build.
 EXEC_MAX_BUDGET_FRACTION = 0.5
 
-#: Softener on the band guarantee: an exploratory exec started above the
-#: wind-down threshold always keeps at least this share of what remains.
+#: The proportional bound on one exploratory exec: an exec started above
+#: :func:`wind_down_threshold` may consume at most ``1 - REMAINING_RESERVE_
+#: FRACTION`` of the wall-clock that is *left* — a quarter of what remains
+#: is held back, so the agent gets at least one more turn.
 #:
-#: Without it, an exec starting just above the threshold would be chopped
-#: back to the threshold itself. 0.25 rather than 0.5 because at 0.5 the
-#: decisive build of a currently-passing task retains only 1.4x headroom
-#: over its observed runtime, versus 2.1x at 0.25. Named so round 3 can
-#: retune it from ``exec_capped`` telemetry without touching the formula.
-LANDING_RESERVE_FRACTION = 0.25
+#: Read that as written: it is a share of what remains, **not** a promise
+#: about the wind-down band. :meth:`Deadline.exec_decision` holds back
+#: ``min(wind_down_threshold(budget), REMAINING_RESERVE_FRACTION *
+#: remaining)``, so the threshold is only a *ceiling* on the proportion —
+#: whichever of the two is smaller is what is actually reserved. The
+#: quarter is the smaller one whenever ``remaining < threshold /
+#: REMAINING_RESERVE_FRACTION`` (1200s at the 300s threshold floor), and
+#: since :func:`wind_down_threshold` clamps at 300s that condition covers
+#: the whole wind-down region of every budget this harness has run: for
+#: ``budget <= 3600`` the band term has never once contributed a guarantee,
+#: only the proportion. An exec capped by it can and does carry the run
+#: past the wind-down threshold.
+#:
+#: 0.25 rather than 0.5 because at 0.5 the decisive build of a
+#: currently-passing task retains only 1.4x headroom over its observed
+#: runtime, versus 2.1x at 0.25. Retuned again in round 5 against the
+#: 85-row ``exec_capped`` corpus (0.30/0.35/0.40/0.50 all tried): raising
+#: it buys the one pathological trial 50–80s more wind-down while cutting
+#: solved trials' headroom roughly in half, so the value stands.
+REMAINING_RESERVE_FRACTION = 0.25
+
+# Why not a real band guarantee.
+#
+# The honest repair looks obvious — reserve the whole threshold whenever
+# `remaining > threshold`, so an exec really does hand control back inside
+# the wind-down band. It was measured against all 85 recorded `exec_capped`
+# rows of rounds 2 and 3 before being rejected: it changes 26 of them, and
+# on compile-compcert round 2 seq 91 it cuts a `make -j 6` from 438.3s to
+# 104.4s. That command ran 198.9s and returned exit 0 on a trial that
+# graded reward=1.0 — strict enforcement SIGKILLs it mid-build and loses
+# the trial. Four more solved-trial execs lose most of their margin
+# (compcert 79: 3.1x headroom -> 1.6x; qemu-startup 201: 3.2x -> 1.5x).
+# It buys nothing measurable in exchange: the trial that motivated the
+# repair (caffe-cifar-10 round 3 seq 111) would have had its 300s command
+# cut to 30s instead, and it timed out either way.
+#
+# So the arithmetic stays proportional and the documentation stops
+# claiming otherwise. The counterfactual is checked in as a test —
+# ``TestTheBandIsNotAGuarantee`` in ``tests/test_deadline.py`` — so the
+# repair cannot be re-proposed without meeting the compcert row first.
 
 #: Fraction of the wall-clock budget remaining at which the loop injects the
 #: one-time wind-down reminder, clamped by the two bounds that follow — see
@@ -162,17 +205,26 @@ class ExecCapDecision(NamedTuple):
     :meth:`Deadline.exec_cap` returns only ``(effective, capped, reason)``;
     this is the same decision with ``reserve`` — the number the arithmetic
     *actually* held back, i.e. :meth:`Deadline.landing_reserve` normally and
-    the softened band reserve (:data:`LANDING_RESERVE_FRACTION` of what
-    remains) whenever the band guarantee raised it.
+    the raised remaining-share reserve (``min(wind_down_threshold(budget),
+    REMAINING_RESERVE_FRACTION * remaining)``) whenever that bound bit.
 
     It is reported for every decision, including the ones where some other
-    bound ended up binding, because that is the number round 3 retunes
-    :data:`LANDING_RESERVE_FRACTION` from. A consumer cannot reconstruct it:
-    ``remaining - effective`` recovers it only for ``reason`` ``"band"`` and
-    ``"reserve"``, and not at all for ``"share"`` — which is precisely the
-    case where "the softener bit hard" and "only the base reserve bit" would
-    otherwise be indistinguishable. ``0.0`` on the no-deadline passthrough,
-    where no reserve is held back at all.
+    bound ended up binding, because that is the number
+    :data:`REMAINING_RESERVE_FRACTION` is retuned from. A consumer cannot
+    reconstruct it: ``remaining - effective`` recovers it only for
+    ``reason`` ``"band"`` and ``"reserve"``, and not at all for ``"share"``
+    — which is precisely the case where "the proportional reserve bit hard"
+    and "only the base reserve bit" would otherwise be indistinguishable.
+    ``0.0`` on the no-deadline passthrough, where no reserve is held back at
+    all.
+
+    ``reason="band"`` is a wire value with history: it names the wind-down
+    band the ceiling is *derived from*, not a promise that the exec hands
+    control back inside that band (:data:`REMAINING_RESERVE_FRACTION`
+    explains why there is no such promise). It is kept verbatim because the
+    round-2 and round-3 ``exec_capped`` corpora are the fence for every
+    future constant change, and comparability across rounds is worth more
+    than a tidier label.
     """
 
     effective: float
@@ -342,12 +394,16 @@ class Deadline:
         contains a long command issued while the budget is still nearly
         whole.
 
-        **Band guarantee** (``purpose="exploratory"`` only). An exec started
-        *above* :func:`wind_down_threshold` must not carry the run past that
-        threshold without the agent getting a turn, so the reserve is raised
-        to the threshold — softened to at least
-        :data:`LANDING_RESERVE_FRACTION` of what remains, so a command
-        starting just above the threshold is not chopped back to it.
+        **Remaining-share reserve** (``purpose="exploratory"`` only). An
+        exec started *above* :func:`wind_down_threshold` may consume at most
+        ``1 - REMAINING_RESERVE_FRACTION`` of what is left: the reserve is
+        raised to ``min(threshold, REMAINING_RESERVE_FRACTION * remaining)``.
+        This is **not** a guarantee that the exec hands control back above
+        the wind-down threshold. The threshold is a ceiling on the
+        proportion, not a floor on what is held back, and for every budget
+        this harness has run it is the proportion that binds — see
+        :data:`REMAINING_RESERVE_FRACTION`, which also records why the
+        stricter reading was measured and rejected.
 
         **Landing reserve.** Always applied: :meth:`landing_reserve`, so the
         agent gets one more model call after the command returns. Never
@@ -367,9 +423,19 @@ class Deadline:
         recovery: on the corpus it changes only execs that were already
         finishing in a fraction of a second or timing out regardless.
 
+        **The invariant this actually keeps**, stated so nothing has to
+        infer it from the prose: for ``purpose="exploratory"``,
+        ``effective <= max(remaining - landing_reserve(), (1 -
+        REMAINING_RESERVE_FRACTION) * remaining)`` and ``effective <=
+        EXEC_MAX_BUDGET_FRACTION * budget``, with the
+        :data:`EXEC_CAP_FLOOR_SECONDS` and stop-floor clamps above. There is
+        no invariant of the form "the run re-enters the loop with more than
+        ``wind_down_threshold`` left", and there never was.
+
         ``purpose="verification"`` is exempt from the share cap *and* the
-        band softener, and gets the plain ``remaining - landing_reserve()``
-        shape. Verification runs at completion by definition: shortening it
+        remaining-share reserve, and gets the plain
+        ``remaining - landing_reserve()`` shape. Verification runs at
+        completion by definition: shortening it
         would turn a legitimate check into a capped timeout, which the loop
         reads as *inconclusive* and accepts — silently converting a passing
         gate into a non-gate.
@@ -384,7 +450,15 @@ class Deadline:
         if purpose == "exploratory":
             threshold = wind_down_threshold(self.budget)
             if remaining > threshold:
-                band = min(threshold, LANDING_RESERVE_FRACTION * remaining)
+                # `min`, not `max`: the threshold is a ceiling on the
+                # proportion held back, so this reserves a quarter of what
+                # remains everywhere the wind-down region actually lives.
+                # The reason string below is still "band" — it names the
+                # band this ceiling is derived from, not a promise that the
+                # exec returns above it. Renaming the wire value would break
+                # comparability of the round-2/round-3 `exec_capped` corpora,
+                # which are the fence for every future constant change.
+                band = min(threshold, REMAINING_RESERVE_FRACTION * remaining)
                 if band > reserve:
                     reserve = band
                     softened = True

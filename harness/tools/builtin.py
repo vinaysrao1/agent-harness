@@ -66,6 +66,7 @@ __all__ = [
     "DEFAULT_EXEC_TIMEOUT",
     "MIN_EXEC_SECONDS",
     "LANDING_REFUSAL",
+    "TIMEOUT_KILL_NOTE",
     "MissingArgumentError",
     "bash_tool",
     "read_file_tool",
@@ -161,9 +162,18 @@ _CAP_ADVICE: dict[str, str] = {
         "no single command may use more than half the run's total budget; "
         "break the work into smaller steps rather than re-running this"
     ),
+    # The wire reason is "band" for corpus comparability, but the advice
+    # says what the arithmetic actually does: hold back a quarter of what
+    # remains. It used to promise "a turn to wind down before the
+    # deadline", which the cap does not guarantee and cannot — one observed
+    # trial read that sentence and came back with 79.7s against its own
+    # 300s wind-down threshold. See harness.deadline.
+    # REMAINING_RESERVE_FRACTION.
     "band": (
-        "time is held back so you get a turn to wind down and land your "
-        "answer before the deadline; do not start another long command"
+        "no single command may use more than three quarters of the "
+        "wall-clock still remaining; the rest is held back so you get at "
+        "least one more turn. Break this into shorter steps, or start "
+        "landing your answer"
     ),
     "reserve": (
         "time is held back so you get a turn to land your answer before "
@@ -184,6 +194,20 @@ _CAP_ADVICE: dict[str, str] = {
 #: through the error path would spend nudge and truncation budget the
 #: landing turn needs.
 LANDING_REFUSAL: str = f"command not run — {_CAP_ADVICE['landing']}."
+
+#: Appended to every timed-out ``bash`` result. A timeout is a *kill*, and
+#: the model cannot see that from an empty output stream: the observed
+#: failure is an agent that timed out a download, then untarred the
+#: half-written file and spent its last turns on "unexpected end of file".
+#: The kill is also best-effort by construction — the Harbor backend signals
+#: the container-side process group, but a child that detached itself
+#: survives — so the note says both halves honestly rather than promising a
+#: clean stop.
+TIMEOUT_KILL_NOTE: str = (
+    "the command was killed, so anything it was writing is incomplete; and "
+    "if the kill did not reach every child, some of its work may still be "
+    "in progress. Re-check any file it produced before using it"
+)
 
 
 def bash_tool(
@@ -395,6 +419,7 @@ def bash_tool(
                 )
             else:
                 lines.append(f"(command timed out after {effective}s)")
+            lines.append(f"({TIMEOUT_KILL_NOTE})")
         elif capped:
             lines.append(
                 f"(note: timeout was capped to {effective}s to fit the "
@@ -549,15 +574,33 @@ def read_file_tool(sandbox: Sandbox) -> Tool:
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 
 
+#: Valid values for `write_file`'s `mode` argument (mirrors
+#: :data:`~harness.sandbox.base.WriteMode`).
+_WRITE_FILE_MODES = ("overwrite", "append")
+
+
 def write_file_tool(sandbox: Sandbox) -> Tool:
-    """Build the ``write_file`` tool: writes/overwrites a file in ``sandbox``."""
+    """Build the ``write_file`` tool: writes/overwrites/appends a file in ``sandbox``.
+
+    ``mode`` is a **capability addition, not a defect repair**: the loop
+    tells the model that a large file should be "written in smaller pieces
+    across multiple calls" (harness/loop.py), but an overwrite-only
+    `write_file` made that advice unactionable -- piece 2 would destroy
+    piece 1, and a file bigger than one response's `max_output_tokens`
+    window (~30KB) was unproducible by the tool the advice names.
+    ``mode="overwrite"`` stays the default so every existing call (every
+    call that omits `mode`) keeps behaving exactly as before.
+    """
 
     spec = ToolSpec(
         name="write_file",
         description=(
             "Write content to a file in the sandbox workspace, creating it "
-            "(and any missing parent directories) if needed, or overwriting "
-            "it if it already exists."
+            "(and any missing parent directories) if needed. `mode` "
+            "defaults to 'overwrite' (replaces the file's contents, or "
+            "creates it); use 'append' to add to a file across multiple "
+            "calls -- e.g. when writing a large file in pieces because the "
+            "content exceeds what fits in one response."
         ),
         input_schema={
             "type": "object",
@@ -568,7 +611,16 @@ def write_file_tool(sandbox: Sandbox) -> Tool:
                 },
                 "content": {
                     "type": "string",
-                    "description": "The full text content to write.",
+                    "description": "The text content to write.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": list(_WRITE_FILE_MODES),
+                    "description": (
+                        "'overwrite' (default) replaces the file's contents; "
+                        "'append' adds to the end, creating the file if it "
+                        "doesn't exist yet."
+                    ),
                 },
             },
             "required": ["path", "content"],
@@ -578,9 +630,16 @@ def write_file_tool(sandbox: Sandbox) -> Tool:
     async def handler(arguments: dict) -> str:
         path = _require_str("write_file", arguments, "path")
         content = _require_str("write_file", arguments, "content")
-        await sandbox.write_file(path, content)
+        mode = arguments.get("mode", "overwrite")
+        if mode not in _WRITE_FILE_MODES:
+            raise ValueError(
+                f"'write_file' argument 'mode' must be one of "
+                f"{_WRITE_FILE_MODES!r}, got {mode!r}"
+            )
+        await sandbox.write_file(path, content, mode=mode)
         size = len(content.encode("utf-8"))
-        return f"wrote {size} bytes to {path}"
+        verb = "appended" if mode == "append" else "wrote"
+        return f"{verb} {size} bytes to {path}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 

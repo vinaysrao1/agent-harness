@@ -21,9 +21,11 @@ from harness.sandbox.local import LocalSandbox
 from harness.skills import SkillLibrary
 from harness.context import ContextManager
 from harness.tools.builtin import (
+    _CAP_ADVICE,
     DEFAULT_EXEC_TIMEOUT,
     MIN_EXEC_SECONDS,
     LANDING_REFUSAL,
+    TIMEOUT_KILL_NOTE,
     MissingArgumentError,
     add_instruction_tool,
     bash_tool,
@@ -459,9 +461,9 @@ class TestBashToolDeadlineCap:
         await tool.handler({"command": "R CMD INSTALL rstan", "timeout": 1800})
         assert sandbox.received_timeout == 900.0
 
-    async def test_band_guarantee_binds_above_the_threshold(self):
+    async def test_remaining_share_reserve_binds_above_the_threshold(self):
         # remaining 335.5 of 900 is above the 300s wind-down threshold, so
-        # the softener holds back 0.25 x 335.5 = 83.875s.
+        # the proportional reserve holds back 0.25 x 335.5 = 83.875s.
         sandbox = FakeExecSandbox()
         deadline = _fixed_deadline(
             900.0, 335.5, observations=(5.0, 5.0, 5.0, 5.0)
@@ -469,6 +471,61 @@ class TestBashToolDeadlineCap:
         tool = bash_tool(sandbox, deadline=deadline)
         await tool.handler({"command": "./compress", "timeout": 300})
         assert sandbox.received_timeout == pytest.approx(251.625)
+
+    async def test_band_advice_states_the_bound_that_actually_applies(self):
+        """The one behavioural half of round 5's change 1.
+
+        The ``"band"`` advice used to say "time is held back so you get a
+        turn to wind down and land your answer before the deadline". The
+        cap does not guarantee that (see
+        :class:`tests.test_deadline.TestTheBandIsNotAGuarantee`), and one
+        observed trial read that sentence and came back with 79.7s against
+        its own 300s wind-down threshold. It now states the bound that is
+        actually enforced: three quarters of what remains.
+        """
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="ok", stderr=""))
+        deadline = _fixed_deadline(
+            900.0, 335.5, observations=(5.0, 5.0, 5.0, 5.0)
+        )
+        tool = bash_tool(sandbox, deadline=deadline)
+        output = await tool.handler({"command": "./compress", "timeout": 300})
+
+        assert "three quarters of the wall-clock still remaining" in output
+        assert "at least one more turn" in output
+        # 335.5 - 251.625 = 83.875s held back, which is what "three
+        # quarters" means here — and is nowhere near the 300s threshold.
+        assert sandbox.received_timeout == pytest.approx(251.625)
+
+    async def test_band_advice_promises_no_wind_down_turn(self):
+        # The regression guard for the false claim itself: the harness must
+        # not tell the model it is being handed a wind-down turn, because
+        # the arithmetic does not reserve one.
+        sandbox = FakeExecSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+        deadline = _fixed_deadline(
+            1200.0, 319.68, observations=(15.0, 15.0, 15.0, 15.0)
+        )
+        tool = bash_tool(sandbox, deadline=deadline)
+        # The caffe-cifar-10 row: capped to 239.76s, returning with 79.9s
+        # against a 300s wind-down threshold.
+        output = await tool.handler(
+            {"command": "./get_cifar10.sh", "timeout": 300}
+        )
+        assert sandbox.received_timeout == pytest.approx(239.76, abs=0.01)
+        assert "wind down" not in output
+        assert "three quarters of the wall-clock still remaining" in output
+
+    def test_the_band_advice_string_is_the_honest_one(self):
+        # Pinned at the table so a rewrite has to come past this test.
+        assert "wind down" not in _CAP_ADVICE["band"]
+        assert _CAP_ADVICE["band"].startswith(
+            "no single command may use more than three quarters"
+        )
+        # The other two reasons keep their own wording: the table exists to
+        # give a share cap and a near-deadline cap different advice.
+        assert _CAP_ADVICE["band"] != _CAP_ADVICE["reserve"]
+        assert _CAP_ADVICE["band"] != _CAP_ADVICE["share"]
 
     async def test_cap_message_names_the_share_reason(self):
         sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="ok", stderr=""))
@@ -600,6 +657,64 @@ class TestBashToolDeadlineAwareDefault:
         description = bash_tool(FakeExecSandbox()).spec.description.lower()
         assert "omit it" in description
         assert "remaining wall-clock" in description
+
+
+class TestTimeoutSaysTheOutputIsIncomplete:
+    """A timeout is a kill, and the model cannot tell that from the result.
+
+    The observed failure: an agent's download was cut off mid-flight, and
+    seven seconds later it untarred the half-written file and read
+    ``gzip: stdin: unexpected end of file`` — then spent both remaining
+    turns on that file. The kill is also best-effort (a detached child
+    survives the container-side process-group signal), so the note carries
+    both halves rather than promising a clean stop.
+    """
+
+    def _timed_out(self) -> FakeExecSandbox:
+        return FakeExecSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+
+    async def test_plain_timeout_warns(self):
+        tool = bash_tool(self._timed_out())
+        output = await tool.handler({"command": "sleep 1000", "timeout": 10})
+        assert "timed out after 10.0s" in output
+        assert TIMEOUT_KILL_NOTE in output
+
+    async def test_capped_timeout_warns(self):
+        tool = bash_tool(self._timed_out(), deadline=_fixed_deadline(900.0, 200.0))
+        output = await tool.handler({"command": "sleep 1000", "timeout": 1000})
+        assert "capped from your requested 1000.0s" in output
+        assert TIMEOUT_KILL_NOTE in output
+
+    async def test_shortened_default_timeout_warns(self):
+        tool = bash_tool(self._timed_out(), deadline=_fixed_deadline(900.0, 200.0))
+        output = await tool.handler({"command": "sleep 1000"})
+        assert "no timeout was given" in output
+        assert TIMEOUT_KILL_NOTE in output
+
+    async def test_the_warning_names_the_two_things_the_model_must_do(self):
+        # Pinned in prose because this is a message to a model, not an API:
+        # it must say the output is incomplete AND that work may continue.
+        assert "killed" in TIMEOUT_KILL_NOTE
+        assert "incomplete" in TIMEOUT_KILL_NOTE
+        assert "still be in progress" in TIMEOUT_KILL_NOTE
+        assert "Re-check any file it produced" in TIMEOUT_KILL_NOTE
+
+    async def test_a_capped_command_that_finished_is_not_warned(self):
+        # The cap note is not a kill: a command that returned its output
+        # must not be told its output is incomplete.
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="done", stderr=""))
+        tool = bash_tool(sandbox, deadline=_fixed_deadline(900.0, 200.0))
+        output = await tool.handler({"command": "echo hi", "timeout": 120})
+        assert "note: timeout was capped" in output
+        assert TIMEOUT_KILL_NOTE not in output
+
+    async def test_a_plain_success_is_not_warned(self):
+        sandbox = FakeExecSandbox(ExecResult(exit_code=0, stdout="done", stderr=""))
+        tool = bash_tool(sandbox)
+        output = await tool.handler({"command": "echo hi"})
+        assert TIMEOUT_KILL_NOTE not in output
 
 
 class TestBashToolNeverDispatchesAZeroWindow:
@@ -887,8 +1002,9 @@ class TestBashToolExecCappedEvent:
         self, run_store: RunStore, run_id: str
     ):
         """Regression: the payload reported only the *base* landing reserve,
-        so the softener's real contribution — the number round 3 retunes
-        LANDING_RESERVE_FRACTION from — was absent. It is not always
+        so the remaining-share reserve's real contribution — the number
+        REMAINING_RESERVE_FRACTION is retuned from — was absent. It is not
+        always
         recoverable either: for reason "band"/"reserve" it equals
         remaining - effective, but for "share" nothing in the payload
         determines it."""
@@ -1091,6 +1207,67 @@ class TestReadWriteEditFileTools:
         tool = write_file_tool(sandbox)
         with pytest.raises(MissingArgumentError):
             await tool.handler({"path": "f.txt"})
+
+    async def test_default_mode_overwrites_and_says_wrote(self, sandbox: LocalSandbox):
+        # Backward-compat pin: omitting `mode` must still overwrite and
+        # report "wrote", exactly as before `mode` existed.
+        write = write_file_tool(sandbox)
+        read = read_file_tool(sandbox)
+        await write.handler({"path": "f.txt", "content": "old"})
+        result = await write.handler({"path": "f.txt", "content": "new"})
+        assert result == "wrote 3 bytes to f.txt"
+        assert await read.handler({"path": "f.txt"}) == "new"
+
+    async def test_append_mode_concatenates_and_says_appended(
+        self, sandbox: LocalSandbox
+    ):
+        write = write_file_tool(sandbox)
+        read = read_file_tool(sandbox)
+        await write.handler({"path": "f.txt", "content": "piece1-"})
+        result = await write.handler(
+            {"path": "f.txt", "content": "piece2", "mode": "append"}
+        )
+        assert result == "appended 6 bytes to f.txt"
+        assert await read.handler({"path": "f.txt"}) == "piece1-piece2"
+
+    async def test_append_to_missing_file_creates_it(self, sandbox: LocalSandbox):
+        write = write_file_tool(sandbox)
+        read = read_file_tool(sandbox)
+        await write.handler({"path": "new.txt", "content": "first", "mode": "append"})
+        assert await read.handler({"path": "new.txt"}) == "first"
+
+    async def test_explicit_overwrite_mode_matches_default(
+        self, sandbox: LocalSandbox
+    ):
+        write = write_file_tool(sandbox)
+        read = read_file_tool(sandbox)
+        await write.handler({"path": "f.txt", "content": "old"})
+        result = await write.handler(
+            {"path": "f.txt", "content": "new", "mode": "overwrite"}
+        )
+        assert result == "wrote 3 bytes to f.txt"
+        assert await read.handler({"path": "f.txt"}) == "new"
+
+    async def test_invalid_mode_raises_argument_error_not_silent_overwrite(
+        self, sandbox: LocalSandbox
+    ):
+        write = write_file_tool(sandbox)
+        read = read_file_tool(sandbox)
+        await write.handler({"path": "f.txt", "content": "untouched"})
+        with pytest.raises(ValueError, match="mode"):
+            await write.handler(
+                {"path": "f.txt", "content": "bogus", "mode": "truncate"}
+            )
+        # The rejected call must not have mutated the file either way.
+        assert await read.handler({"path": "f.txt"}) == "untouched"
+
+    def test_schema_declares_mode_as_optional_enum(self, sandbox: LocalSandbox):
+        tool = write_file_tool(sandbox)
+        props = tool.spec.input_schema["properties"]
+        assert props["mode"]["enum"] == ["overwrite", "append"]
+        # Only path/content are required -- `mode` stays optional so every
+        # existing caller that never mentions it keeps working.
+        assert set(tool.spec.input_schema["required"]) == {"path", "content"}
 
     async def test_dispatch_error_on_path_traversal(self, sandbox: LocalSandbox):
         registry = ToolRegistry()
