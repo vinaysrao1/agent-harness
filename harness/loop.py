@@ -202,10 +202,12 @@ TRUNCATION_REMINDERS: dict[str, str] = {
 #: The wind-down band (:data:`WIND_DOWN_FRACTION`,
 #: :data:`WIND_DOWN_MIN_REMAINING`, :data:`WIND_DOWN_MAX_REMAINING`,
 #: :func:`wind_down_threshold`) is defined in :mod:`harness.deadline` and
-#: re-exported here: :meth:`Deadline.exec_cap` needs the threshold to make
-#: its band guarantee, and the tools layer must reach it without importing
-#: the loop. Every pre-existing ``from harness.loop import ...`` of these
-#: four names keeps working.
+#: re-exported here: :meth:`Deadline.exec_cap` uses the threshold as the
+#: ceiling on its remaining-share reserve (it is a ceiling, not a
+#: guarantee that an exec returns above the band — see
+#: :data:`~harness.deadline.REMAINING_RESERVE_FRACTION`), and the tools
+#: layer must reach it without importing the loop. Every pre-existing
+#: ``from harness.loop import ...`` of these four names keeps working.
 
 #: Injected once as a user message when the wall-clock budget is nearly spent.
 #: Unlike the diligence nudge (which pushes the agent to keep working), this
@@ -691,8 +693,8 @@ class AgentLoop:
         wall-clock is actually left, via
         :meth:`~harness.deadline.Deadline.exec_cap` with
         ``purpose="verification"`` — the exec cap's plain landing-reserve
-        shape, deliberately exempt from the share cap and the band softener
-        that bound the ``bash`` tool
+        shape, deliberately exempt from the share cap and the
+        remaining-share reserve that bound the ``bash`` tool
         (:func:`~harness.tools.builtin.bash_tool`). Verification runs at
         completion by definition, and shortening it would turn a legitimate
         check into ``timed_out`` + ``timeout_capped``, which this loop reads

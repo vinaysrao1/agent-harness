@@ -37,7 +37,7 @@ from harness.types import (
     ToolCall,
     Usage,
 )
-from tests.test_harbor_sandbox import StubEnvironment
+from tests.test_harbor_sandbox import StubEnvironment, unwrap
 
 _MODULE = "harness.integrations.harbor_agent"
 
@@ -388,7 +388,9 @@ async def test_orchestrator_runs_on_harbor_sandbox(tmp_path: Path):
         assert result.final_text == CLEAN_FINISH
 
         # The bash tool call reached the Harbor environment.
-        commands = [command for command, _ in env.calls]
+        # Commands are dispatched wrapped in the pid sentinel that lets a
+        # timeout kill the container-side process tree; unwrap to compare.
+        commands = [unwrap(command)[1] for command, _ in env.calls]
         assert "echo hello" in commands
 
         # The system prompt renders the container root, not a host path.
@@ -468,7 +470,7 @@ async def test_isolated_spawn_forced_onto_override_sandbox(
 
         # The child's bash call ran inside the Harbor environment (the
         # shared override), not a fresh host sandbox.
-        assert "echo child" in [command for command, _ in env.calls]
+        assert "echo child" in [unwrap(command)[1] for command, _ in env.calls]
 
         lead, child = store.list_agents(run_id)
         assert child.status == "completed"
@@ -568,7 +570,7 @@ class TestHarnessAgentRun:
         await agent.run("Echo hello in the container.", env, context)
 
         # The bash call went through the Harbor environment.
-        assert "echo hello" in [command for command, _ in env.calls]
+        assert "echo hello" in [unwrap(command)[1] for command, _ in env.calls]
 
         # Per-trial isolation: state landed under logs_dir, not ~/.harness.
         harness_home = logs_dir / "harness-home"

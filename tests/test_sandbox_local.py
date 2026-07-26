@@ -182,6 +182,49 @@ class TestFileRoundTrip:
         assert result.stdout == "content-here"
 
 
+class TestWriteFileMode:
+    """`mode` is a capability addition (write a large file in pieces), not
+    a defect repair -- see harness/sandbox/base.py's `WriteMode` docstring."""
+
+    async def test_default_mode_is_overwrite(self, sandbox: LocalSandbox):
+        # Backward-compat pin: omitting `mode` entirely must behave exactly
+        # like before this change -- every existing call site stays valid.
+        await sandbox.write_file("f.txt", "old")
+        await sandbox.write_file("f.txt", "new")
+        assert await sandbox.read_file("f.txt") == "new"
+
+    async def test_explicit_overwrite_mode_replaces_contents(
+        self, sandbox: LocalSandbox
+    ):
+        await sandbox.write_file("f.txt", "old")
+        await sandbox.write_file("f.txt", "new", mode="overwrite")
+        assert await sandbox.read_file("f.txt") == "new"
+
+    async def test_append_mode_concatenates(self, sandbox: LocalSandbox):
+        await sandbox.write_file("f.txt", "piece1-")
+        await sandbox.write_file("f.txt", "piece2-", mode="append")
+        await sandbox.write_file("f.txt", "piece3", mode="append")
+        assert await sandbox.read_file("f.txt") == "piece1-piece2-piece3"
+
+    async def test_append_to_missing_file_creates_it(self, sandbox: LocalSandbox):
+        await sandbox.write_file("new.txt", "first chunk", mode="append")
+        assert await sandbox.read_file("new.txt") == "first chunk"
+
+    async def test_append_creates_parent_dirs(self, sandbox: LocalSandbox):
+        await sandbox.write_file("a/b/c.txt", "nested", mode="append")
+        assert await sandbox.read_file("a/b/c.txt") == "nested"
+
+    async def test_edit_file_after_append_reads_and_overwrites_normally(
+        self, sandbox: LocalSandbox
+    ):
+        # edit_file's default implementation must always write back with
+        # mode="overwrite" regardless of how the file got its content.
+        await sandbox.write_file("f.py", "x = 1\n")
+        await sandbox.write_file("f.py", "y = 2\n", mode="append")
+        await sandbox.edit_file("f.py", "x = 1", "x = 100")
+        assert await sandbox.read_file("f.py") == "x = 100\ny = 2\n"
+
+
 class TestEditFile:
     async def test_edit_replaces_unique_match(self, sandbox: LocalSandbox):
         await sandbox.write_file("f.py", "x = 1\ny = 2\n")

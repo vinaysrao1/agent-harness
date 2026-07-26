@@ -25,6 +25,7 @@ from harness.sandbox.base import (
     MAX_OUTPUT_BYTES,
     ExecResult,
     Sandbox,
+    WriteMode,
     read_workspace_file,
     truncate_output,
     write_workspace_file,
@@ -201,6 +202,12 @@ class LocalSandbox(Sandbox):
         """Read a text file at ``path`` relative to the workspace root."""
         return await read_workspace_file(self._workspace, path)
 
-    async def write_file(self, path: str, content: str) -> None:
-        """Write a text file at ``path`` relative to the workspace root."""
-        await write_workspace_file(self._workspace, path, content)
+    async def write_file(
+        self, path: str, content: str, *, mode: WriteMode = "overwrite"
+    ) -> None:
+        """Write a text file at ``path`` relative to the workspace root.
+
+        ``mode="append"`` adds to an existing file (creating it if absent)
+        instead of replacing its contents; see :data:`WriteMode`.
+        """
+        await write_workspace_file(self._workspace, path, content, mode=mode)

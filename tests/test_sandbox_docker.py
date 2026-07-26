@@ -424,3 +424,17 @@ class TestDockerSandboxFiles:
     async def test_absolute_path_rejected(self, sandbox: DockerSandbox):
         with pytest.raises(SandboxPathError):
             await sandbox.write_file("/etc/passwd", "pwned")
+
+    async def test_default_mode_is_overwrite(self, sandbox: DockerSandbox):
+        await sandbox.write_file("f.txt", "old")
+        await sandbox.write_file("f.txt", "new")
+        assert await sandbox.read_file("f.txt") == "new"
+
+    async def test_append_mode_concatenates(self, sandbox: DockerSandbox):
+        await sandbox.write_file("f.txt", "piece1-")
+        await sandbox.write_file("f.txt", "piece2", mode="append")
+        assert await sandbox.read_file("f.txt") == "piece1-piece2"
+
+    async def test_append_to_missing_file_creates_it(self, sandbox: DockerSandbox):
+        await sandbox.write_file("new.txt", "first chunk", mode="append")
+        assert await sandbox.read_file("new.txt") == "first chunk"
