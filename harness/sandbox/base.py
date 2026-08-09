@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import uuid
 from pathlib import Path
 from typing import Final, Literal
 
@@ -27,6 +28,7 @@ from pydantic import BaseModel, ConfigDict
 
 __all__ = [
     "MAX_OUTPUT_BYTES",
+    "SPILL_DIR",
     "SandboxError",
     "SandboxPathError",
     "ExecResult",
@@ -34,6 +36,7 @@ __all__ = [
     "WriteMode",
     "apply_edit",
     "resolve_workspace_path",
+    "spill_tool_output",
     "truncate_output",
     "read_workspace_file",
     "write_workspace_file",
@@ -41,6 +44,20 @@ __all__ = [
 
 #: Per-stream truncation limit for `exec` output (DESIGN.md §4.7).
 MAX_OUTPUT_BYTES: Final[int] = 100_000
+
+#: Directory *inside the sandbox* that oversized tool results spill to (see
+#: :func:`spill_tool_output`). Deliberately under ``/tmp`` and never under
+#: the workspace: graders and deliverable checks inspect the workspace
+#: filesystem, and a task has already been lost to one stray file sitting
+#: next to the deliverable. A spill is scratch space for the model to grep,
+#: not part of what it produced.
+SPILL_DIR: Final[str] = "/tmp/.harness-tool-output"
+
+#: Byte budget for one spill write. The write travels as part of a shell
+#: command line through :meth:`Sandbox.exec`, so a chunk has to stay well
+#: clear of the platform's ``ARG_MAX`` (as low as 256KB on macOS, where the
+#: local sandbox runs); larger content is appended across several execs.
+_SPILL_CHUNK_BYTES: Final[int] = 32_000
 
 #: `write_file`'s two modes: `"overwrite"` (default, replaces the file's
 #: contents) or `"append"` (adds to them, creating the file if it doesn't
@@ -112,6 +129,78 @@ def truncate_output(
         f"{total_len} bytes total]...\n"
     )
     return head.decode("utf-8", errors="replace") + marker
+
+
+def _spill_chunks(content: str, limit: int) -> list[str]:
+    """Split ``content`` into heredoc-sized pieces at line boundaries.
+
+    Splitting on lines rather than raw bytes is what makes the heredoc
+    round-trip exact: every piece except possibly the last ends with a
+    newline, so appending the pieces back-to-back reproduces ``content``
+    byte for byte (the last one gains a trailing newline if the original
+    lacked it). A single line longer than ``limit`` is emitted whole rather
+    than cut — the caller treats an over-long exec as a failed spill, which
+    is the fail-open path, and a silently mangled file would be worse.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in content.splitlines(keepends=True):
+        line_size = len(line.encode("utf-8"))
+        if current and size + line_size > limit:
+            chunks.append("".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += line_size
+    if current:
+        chunks.append("".join(current))
+    return chunks or [""]
+
+
+async def spill_tool_output(
+    sandbox: "Sandbox", content: str, *, timeout: float = 30.0
+) -> str:
+    """Write ``content`` to a fresh file under :data:`SPILL_DIR` and return it.
+
+    The path returned is absolute *inside the sandbox* — that is the point:
+    a truncation notice the model cannot act on is not an instruction, so
+    the registry names this path and a concrete ``grep``/``sed`` call for
+    retrieving the part it wants (see
+    :func:`harness.tools.registry._truncate_result`).
+
+    The write goes through :meth:`Sandbox.exec` rather than
+    :meth:`Sandbox.write_file` for two reasons: ``write_file`` is confined
+    to the workspace root by :func:`resolve_workspace_path`, and the
+    workspace is exactly where a spill must never land (see
+    :data:`SPILL_DIR`); and ``exec`` puts the file where the model's own
+    ``bash`` will look for it, which for a container backend is inside the
+    container. Content is appended in :data:`_SPILL_CHUNK_BYTES` pieces via
+    a quoted heredoc whose delimiter carries the file's uuid, so no content
+    can accidentally terminate it and no shell expansion touches the text.
+
+    Raises :class:`SandboxError` if any write fails or times out. Callers
+    are expected to treat that as "no spill" and carry on — a truncation
+    notice must never be the thing that breaks a tool call.
+    """
+    token = uuid.uuid4().hex
+    path = f"{SPILL_DIR}/{token}.txt"
+    delimiter = f"HARNESS_SPILL_{token}"
+    for index, chunk in enumerate(_spill_chunks(content, _SPILL_CHUNK_BYTES)):
+        body = chunk if not chunk or chunk.endswith("\n") else chunk + "\n"
+        redirect = ">" if index == 0 else ">>"
+        command = (
+            f"mkdir -p {SPILL_DIR} && cat {redirect} {path} "
+            f"<<'{delimiter}'\n{body}{delimiter}\n"
+        )
+        result = await sandbox.exec(command, timeout=timeout)
+        if result.timed_out:
+            raise SandboxError(f"spill to {path} timed out")
+        if result.exit_code != 0:
+            raise SandboxError(
+                f"spill to {path} failed with exit code {result.exit_code}: "
+                f"{result.stderr.strip()}"
+            )
+    return path
 
 
 def resolve_workspace_path(workspace: Path, path: str) -> Path:
