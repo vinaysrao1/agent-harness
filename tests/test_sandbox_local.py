@@ -13,9 +13,12 @@ import pytest
 
 from harness.sandbox.base import (
     MAX_OUTPUT_BYTES,
+    SPILL_DIR,
+    ExecResult,
     SandboxError,
     SandboxPathError,
     apply_edit,
+    spill_tool_output,
 )
 from harness.sandbox.local import LocalSandbox
 
@@ -23,6 +26,20 @@ from harness.sandbox.local import LocalSandbox
 @pytest.fixture
 def sandbox(tmp_path: Path) -> LocalSandbox:
     return LocalSandbox(tmp_path / "workspace")
+
+
+@pytest.fixture
+def spills():
+    """Collects spill paths written during a test and removes them after.
+
+    Spills deliberately land in the real ``/tmp`` (that is the mechanism
+    under test — see :data:`harness.sandbox.base.SPILL_DIR`), so the test
+    owns the cleanup rather than ``tmp_path``.
+    """
+    created: list[str] = []
+    yield created
+    for path in created:
+        Path(path).unlink(missing_ok=True)
 
 
 class TestExec:
@@ -319,3 +336,107 @@ class TestPathTraversal:
     async def test_edit_file_path_traversal_rejected(self, sandbox: LocalSandbox):
         with pytest.raises(SandboxPathError):
             await sandbox.edit_file("../outside.txt", "a", "b")
+
+
+class _StubSandbox:
+    """A Sandbox stand-in whose ``exec`` returns a scripted result.
+
+    Used for the spill failure paths, which must be exercised without
+    depending on a real filesystem error being reproducible.
+    """
+
+    def __init__(self, result: ExecResult) -> None:
+        self.result = result
+        self.commands: list[str] = []
+
+    async def exec(self, command: str, timeout: float = 120) -> ExecResult:
+        self.commands.append(command)
+        return self.result
+
+
+class TestSpillToolOutput:
+    """`spill_tool_output` — the retrieval affordance behind the truncation
+    marker. Two things are load-bearing: the file must be readable back
+    verbatim, and it must never land in the workspace."""
+
+    async def test_writes_content_and_returns_tmp_path(
+        self, sandbox: LocalSandbox, spills: list[str]
+    ):
+        await sandbox.start()
+        content = "alpha\nbeta\ngamma\n"
+        path = await spill_tool_output(sandbox, content)
+        spills.append(path)
+        assert path.startswith(SPILL_DIR + "/")
+        assert path.startswith("/tmp/")
+        assert Path(path).read_text(encoding="utf-8") == content
+
+    async def test_never_writes_into_the_workspace(
+        self, sandbox: LocalSandbox, spills: list[str]
+    ):
+        # The non-negotiable one: a stray file next to the deliverable has
+        # already cost a graded task, and graders inspect the workspace.
+        await sandbox.start()
+        path = await spill_tool_output(sandbox, "some output\n")
+        spills.append(path)
+        workspace_root = str(sandbox.workspace.resolve())
+        assert not path.startswith(workspace_root)
+        assert not Path(path).resolve().is_relative_to(sandbox.workspace.resolve())
+        assert list(sandbox.workspace.iterdir()) == []
+
+    async def test_large_content_round_trips_across_chunks(
+        self, sandbox: LocalSandbox, spills: list[str]
+    ):
+        # Bigger than one heredoc chunk, so the append path is exercised.
+        await sandbox.start()
+        content = "".join(f"line {i} " + "z" * 60 + "\n" for i in range(4000))
+        assert len(content.encode("utf-8")) > 200_000
+        path = await spill_tool_output(sandbox, content)
+        spills.append(path)
+        assert Path(path).read_text(encoding="utf-8") == content
+
+    async def test_shell_metacharacters_are_written_verbatim(
+        self, sandbox: LocalSandbox, spills: list[str]
+    ):
+        # The heredoc is quoted, so nothing in the content is expanded or
+        # executed, and no plausible line can close the uuid delimiter.
+        await sandbox.start()
+        content = "EOF\n$(touch /tmp/pwned-by-spill)\n`id`\n${HOME}\n'\"\\\n"
+        path = await spill_tool_output(sandbox, content)
+        spills.append(path)
+        assert Path(path).read_text(encoding="utf-8") == content
+        assert not Path("/tmp/pwned-by-spill").exists()
+
+    async def test_content_without_trailing_newline_gains_exactly_one(
+        self, sandbox: LocalSandbox, spills: list[str]
+    ):
+        await sandbox.start()
+        path = await spill_tool_output(sandbox, "no newline at end")
+        spills.append(path)
+        assert Path(path).read_text(encoding="utf-8") == "no newline at end\n"
+
+    async def test_each_spill_gets_a_fresh_path(
+        self, sandbox: LocalSandbox, spills: list[str]
+    ):
+        await sandbox.start()
+        first = await spill_tool_output(sandbox, "one\n")
+        second = await spill_tool_output(sandbox, "two\n")
+        spills.extend([first, second])
+        assert first != second
+        assert Path(first).read_text(encoding="utf-8") == "one\n"
+        assert Path(second).read_text(encoding="utf-8") == "two\n"
+
+    async def test_nonzero_exit_raises_sandbox_error(self):
+        stub = _StubSandbox(
+            ExecResult(exit_code=1, stdout="", stderr="No space left on device")
+        )
+        with pytest.raises(SandboxError) as excinfo:
+            await spill_tool_output(stub, "content\n")
+        assert "No space left on device" in str(excinfo.value)
+
+    async def test_timeout_raises_sandbox_error(self):
+        stub = _StubSandbox(
+            ExecResult(exit_code=-1, stdout="", stderr="", timed_out=True)
+        )
+        with pytest.raises(SandboxError) as excinfo:
+            await spill_tool_output(stub, "content\n")
+        assert "timed out" in str(excinfo.value)

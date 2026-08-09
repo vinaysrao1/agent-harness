@@ -56,7 +56,7 @@ from harness.loop import AgentLoop, AgentResult, AskCallable, Budgets
 from harness.memory.store import MemoryStore
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
-from harness.sandbox.base import Sandbox
+from harness.sandbox.base import Sandbox, spill_tool_output
 from harness.sandbox.docker import DockerSandbox
 from harness.sandbox.local import LocalSandbox
 from harness.skills import SkillLibrary
@@ -226,8 +226,18 @@ CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
         agent_id=deps.agent_id,
     ),
     lambda deps: read_file_tool(deps.sandbox),
-    lambda deps: write_file_tool(deps.sandbox),
-    lambda deps: edit_file_tool(deps.sandbox),
+    lambda deps: write_file_tool(
+        deps.sandbox,
+        deadline=deps.deadline,
+        store=deps.store,
+        agent_id=deps.agent_id,
+    ),
+    lambda deps: edit_file_tool(
+        deps.sandbox,
+        deadline=deps.deadline,
+        store=deps.store,
+        agent_id=deps.agent_id,
+    ),
     lambda deps: memory_read_fact_tool(deps.memory),
     lambda deps: memory_write_fact_tool(deps.memory),
     lambda deps: memory_search_tool(deps.memory),
@@ -734,6 +744,12 @@ class Orchestrator:
         accessor for that agent's live written-data map (the loop is built
         after this registry, so it cannot be the map itself).
 
+        The registry is also given a spill writer over the same
+        ``sandbox``, so a tool result too large for the context window is
+        written to ``/tmp`` *inside the sandbox* (never the workspace — see
+        :data:`~harness.sandbox.base.SPILL_DIR`) and the truncation marker
+        can name a path the model can actually grep.
+
         This is the **subagent-shaped** registry: it deliberately excludes
         ``spawn_agent``/``await_agents`` (depth cap 1); :meth:`_execute`
         adds those two to the lead agent's registry only.
@@ -752,7 +768,12 @@ class Orchestrator:
         factories = (
             CODING_TOOL_FACTORIES if tool_factories is None else tool_factories
         )
-        registry = ToolRegistry()
+
+        async def spill(content: str) -> str:
+            """Write an oversized tool result into the sandbox's /tmp."""
+            return await spill_tool_output(sandbox, content)
+
+        registry = ToolRegistry(spill=spill, store=self.store, agent_id=agent_id)
         for factory in factories:
             registry.register(factory(deps))
         return registry

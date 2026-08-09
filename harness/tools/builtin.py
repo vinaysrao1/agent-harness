@@ -43,6 +43,7 @@ import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from harness.checks import run_syntax_check
 from harness.deadline import Deadline
 from harness.diligence import (
     VERIFICATION_LINT_EVENT,
@@ -579,7 +580,12 @@ def read_file_tool(sandbox: Sandbox) -> Tool:
 _WRITE_FILE_MODES = ("overwrite", "append")
 
 
-def write_file_tool(sandbox: Sandbox) -> Tool:
+def write_file_tool(
+    sandbox: Sandbox,
+    deadline: Deadline | None = None,
+    store: RunStore | None = None,
+    agent_id: str | None = None,
+) -> Tool:
     """Build the ``write_file`` tool: writes/overwrites/appends a file in ``sandbox``.
 
     ``mode`` is a **capability addition, not a defect repair**: the loop
@@ -590,6 +596,27 @@ def write_file_tool(sandbox: Sandbox) -> Tool:
     window (~30KB) was unproducible by the tool the advice names.
     ``mode="overwrite"`` stays the default so every existing call (every
     call that omits `mode`) keeps behaving exactly as before.
+
+    **Post-write syntax check** (§10.3 Change A). After a *successful*
+    write, the harness runs its own syntax check on the file
+    (:func:`~harness.checks.run_syntax_check`) and appends the diagnostics
+    to this tool's result if it fails. Nothing is appended when it passes,
+    when no checker covers the file's suffix, or when anything at all goes
+    wrong with the check itself — silence means "the harness has nothing to
+    add", never "the harness could not look". The check is the counterpart
+    to ``declare_verification``: that one is the model's own command (and so
+    can converge on a tautology), this one is the harness's, chosen by file
+    extension alone.
+
+    ``mode="append"`` is deliberately **not** checked: an append is a
+    partial file by construction — piece 1 of a Python module legitimately
+    does not parse — and reporting that would be a false positive on
+    correct work.
+
+    ``deadline``, when given, gates the check: a landing turn or scarce
+    remaining wall-clock skips it, since an unrequested check must never
+    spend the landing reserve. ``store``/``agent_id``, when both given,
+    record a :data:`~harness.checks.SYNTAX_CHECK_EVENT` per checked write.
     """
 
     spec = ToolSpec(
@@ -639,16 +666,42 @@ def write_file_tool(sandbox: Sandbox) -> Tool:
         await sandbox.write_file(path, content, mode=mode)
         size = len(content.encode("utf-8"))
         verb = "appended" if mode == "append" else "wrote"
-        return f"{verb} {size} bytes to {path}"
+        result = f"{verb} {size} bytes to {path}"
+        check = await run_syntax_check(
+            sandbox,
+            path,
+            deadline=deadline,
+            store=store,
+            agent_id=agent_id,
+            tool="write_file",
+            skip_reason="append_mode" if mode == "append" else None,
+        )
+        if check is None:
+            return result
+        return f"{result}\n\n{check}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 
 
-def edit_file_tool(sandbox: Sandbox) -> Tool:
+def edit_file_tool(
+    sandbox: Sandbox,
+    deadline: Deadline | None = None,
+    store: RunStore | None = None,
+    agent_id: str | None = None,
+) -> Tool:
     """Build the ``edit_file`` tool: an old/new-string replacement in ``sandbox``.
 
     Mirrors Claude Code's tool conventions (DESIGN.md §8): ``old_string``
     must match uniquely unless ``replace_all`` is set.
+
+    Like `write_file`, a *successful* edit is followed by the harness's own
+    syntax check (:func:`~harness.checks.run_syntax_check`), whose
+    diagnostics are appended to this result only when the check genuinely
+    fails; see :func:`write_file_tool` for the fail-open rules, the
+    deadline gate, and the ``deadline``/``store``/``agent_id`` arguments.
+    Unlike `write_file` there is no partial-write mode here, so every
+    successful edit of a covered suffix is checked: an edit that breaks a
+    file's syntax is exactly the defect this catches earliest.
     """
 
     spec = ToolSpec(
@@ -690,7 +743,18 @@ def edit_file_tool(sandbox: Sandbox) -> Tool:
         await sandbox.edit_file(
             path, old_string, new_string, replace_all=replace_all
         )
-        return f"edited {path}"
+        result = f"edited {path}"
+        check = await run_syntax_check(
+            sandbox,
+            path,
+            deadline=deadline,
+            store=store,
+            agent_id=agent_id,
+            tool="edit_file",
+        )
+        if check is None:
+            return result
+        return f"{result}\n\n{check}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 

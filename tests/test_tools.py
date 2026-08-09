@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from harness.checks import CHECK_TIMEOUT_SECONDS, SYNTAX_CHECK_EVENT
 from harness.deadline import (
     EXEC_CAP_FLOOR_SECONDS,
     LANDING_ALLOWANCE_DEFAULT,
@@ -16,7 +17,7 @@ from harness.diligence import WrittenData, record_written_data
 from harness.memory.store import FactNotFoundError, MemoryStore
 from harness.permissions import ToolMeta
 from harness.persistence import RunStore
-from harness.sandbox.base import ExecResult, SandboxError
+from harness.sandbox.base import SPILL_DIR, ExecResult, SandboxError, spill_tool_output
 from harness.sandbox.local import LocalSandbox
 from harness.skills import SkillLibrary
 from harness.context import ContextManager
@@ -285,6 +286,214 @@ class TestDispatch:
         result = await registry.dispatch(_call("exact"))
         assert "truncated" not in result.content
         assert len(result.content) == MAX_RESULT_BYTES
+
+
+# ---------------------------------------------------------------------------
+# ToolRegistry: oversized results spill to a retrievable path
+# ---------------------------------------------------------------------------
+
+
+def _huge_tool(name: str = "huge", extra: int = 5000) -> tuple[Tool, str]:
+    """A tool whose result overflows MAX_RESULT_BYTES, plus that result."""
+    content = "x" * (MAX_RESULT_BYTES + extra)
+
+    async def handler(arguments: dict) -> str:
+        return content
+
+    return _fake_tool(name, handler=handler), content
+
+
+def _legacy_marker(total_bytes: int) -> str:
+    """The pre-spill truncation marker, spelled out as the fail-open pin.
+
+    Every path that does not produce a spill must reproduce this exactly:
+    if it drifts, the "advisory vs unactionable" comparison the spill
+    exists to settle is no longer measuring one changed variable.
+    """
+    return (
+        f"\n...[tool result truncated at {MAX_RESULT_BYTES} bytes; "
+        f"{total_bytes} bytes total]...\n"
+    )
+
+
+class _SpyStore:
+    """A RunStore stand-in that records append_event calls."""
+
+    def __init__(self, boom: bool = False) -> None:
+        self.events: list[tuple[str, str, dict]] = []
+        self._boom = boom
+
+    def append_event(self, agent_id: str, kind: str, payload: dict) -> int:
+        if self._boom:
+            raise RuntimeError("transcript write failed")
+        self.events.append((agent_id, kind, payload))
+        return len(self.events)
+
+
+class TestResultSpill:
+    async def test_under_cap_never_spills(self):
+        calls: list[str] = []
+
+        async def spill(content: str) -> str:
+            calls.append(content)
+            return "/tmp/.harness-tool-output/never.txt"
+
+        store = _SpyStore()
+        registry = ToolRegistry(spill=spill, store=store, agent_id="agent-1")
+        registry.register(_fake_tool("noop"))
+        result = await registry.dispatch(_call("noop"))
+        assert result.content == "ok"
+        assert calls == []
+        assert store.events == []
+
+    async def test_over_cap_marker_names_path_and_next_call(self):
+        path = f"{SPILL_DIR}/deadbeef.txt"
+        seen: list[str] = []
+
+        async def spill(content: str) -> str:
+            seen.append(content)
+            return path
+
+        tool, content = _huge_tool()
+        registry = ToolRegistry(spill=spill)
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))
+        # The writer gets the FULL result, not the truncated head.
+        assert seen == [content]
+        assert result.is_error is False
+        assert "truncated" in result.content
+        assert path in result.content
+        # An instruction with an object: a concrete retrieval command.
+        assert "grep -n PATTERN" in result.content
+        assert "bash" in result.content
+        assert str(len(content)) in result.content
+
+    async def test_over_cap_emits_transcript_event(self):
+        path = f"{SPILL_DIR}/cafe1234.txt"
+
+        async def spill(content: str) -> str:
+            return path
+
+        tool, content = _huge_tool()
+        store = _SpyStore()
+        registry = ToolRegistry(spill=spill, store=store, agent_id="agent-7")
+        registry.register(tool)
+        await registry.dispatch(_call("huge"))
+        assert len(store.events) == 1
+        agent_id, kind, payload = store.events[0]
+        assert agent_id == "agent-7"
+        assert kind == "tool_output_spilled"
+        assert payload == {
+            "tool": "huge",
+            "full_bytes": len(content),
+            "shown_bytes": MAX_RESULT_BYTES,
+            "path": path,
+        }
+
+    async def test_over_cap_without_spill_is_todays_behaviour(self):
+        tool, content = _huge_tool()
+        registry = ToolRegistry()
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))
+        assert result.content == "x" * MAX_RESULT_BYTES + _legacy_marker(len(content))
+
+    async def test_spill_failure_falls_back_silently(self):
+        async def spill(content: str) -> str:
+            raise OSError("no space left on device")
+
+        tool, content = _huge_tool()
+        store = _SpyStore()
+        registry = ToolRegistry(spill=spill, store=store, agent_id="agent-1")
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))  # must not raise
+        assert result.is_error is False
+        assert result.content == "x" * MAX_RESULT_BYTES + _legacy_marker(len(content))
+        assert store.events == []
+
+    async def test_spill_returning_empty_path_falls_back(self):
+        async def spill(content: str) -> str:
+            return ""
+
+        tool, content = _huge_tool()
+        store = _SpyStore()
+        registry = ToolRegistry(spill=spill, store=store, agent_id="agent-1")
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))
+        assert result.content == "x" * MAX_RESULT_BYTES + _legacy_marker(len(content))
+        assert store.events == []
+
+    async def test_transcript_failure_still_names_the_path(self):
+        # Telemetry is never allowed to cost the model the affordance it
+        # is measuring.
+        path = f"{SPILL_DIR}/feed0000.txt"
+
+        async def spill(content: str) -> str:
+            return path
+
+        tool, _ = _huge_tool()
+        registry = ToolRegistry(
+            spill=spill, store=_SpyStore(boom=True), agent_id="agent-1"
+        )
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))  # must not raise
+        assert path in result.content
+
+    async def test_spill_without_store_still_names_the_path(self):
+        path = f"{SPILL_DIR}/0badc0de.txt"
+
+        async def spill(content: str) -> str:
+            return path
+
+        tool, _ = _huge_tool()
+        registry = ToolRegistry(spill=spill)
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))
+        assert path in result.content
+
+    async def test_error_results_are_never_spilled(self):
+        calls: list[str] = []
+
+        async def spill(content: str) -> str:
+            calls.append(content)
+            return f"{SPILL_DIR}/x.txt"
+
+        async def boom(arguments: dict) -> str:
+            raise RuntimeError("kaboom")
+
+        registry = ToolRegistry(spill=spill)
+        registry.register(_fake_tool("boom", handler=boom))
+        result = await registry.dispatch(_call("boom"))
+        assert result.is_error is True
+        assert calls == []
+
+    async def test_end_to_end_spill_lands_in_tmp_not_the_workspace(
+        self, sandbox: LocalSandbox
+    ):
+        # The full wiring the orchestrator installs: a real sandbox-backed
+        # spill writer. The spill must be retrievable by the model AND must
+        # never put a stray file in the workspace -- graders inspect the
+        # workspace filesystem, and a task has been lost to exactly that.
+        await sandbox.start()
+        workspace_root = str(sandbox.workspace.resolve())
+
+        async def spill(content: str) -> str:
+            return await spill_tool_output(sandbox, content)
+
+        tool, content = _huge_tool()
+        store = _SpyStore()
+        registry = ToolRegistry(spill=spill, store=store, agent_id="agent-1")
+        registry.register(tool)
+        result = await registry.dispatch(_call("huge"))
+        path = store.events[0][2]["path"]
+        try:
+            assert path.startswith("/tmp/")
+            assert not path.startswith(workspace_root)
+            assert path in result.content
+            assert Path(path).read_text(encoding="utf-8").rstrip("\n") == content
+            # Nothing was left behind in the workspace.
+            assert list(sandbox.workspace.iterdir()) == []
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2159,3 +2368,282 @@ class TestDeclareVerificationLint:
         assert result.is_error is False
         assert "Advisory" in result.content
         assert self._lint_events(run_store, agent_id)
+
+
+# ---------------------------------------------------------------------------
+# Post-write syntax checks (§10.3 Change A): the harness runs a check the
+# model did not choose, and appends it to that tool call's result.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedExecSandbox(LocalSandbox):
+    """A `LocalSandbox` whose ``exec`` is scripted; file ops stay real.
+
+    Lets a tool-level test drive the *check's* outcome (a missing
+    interpreter, an exec that raises) while `write_file`/`edit_file`
+    genuinely write to a tmp_path workspace.
+    """
+
+    def __init__(
+        self,
+        workspace: Path,
+        result: ExecResult | None = None,
+        boom: bool = False,
+    ) -> None:
+        super().__init__(workspace)
+        self.exec_calls: list[tuple[str, float]] = []
+        self._result = result or ExecResult(exit_code=0, stdout="", stderr="")
+        self._boom = boom
+
+    async def exec(self, command: str, timeout: float = 120) -> ExecResult:
+        self.exec_calls.append((command, timeout))
+        if self._boom:
+            raise SandboxError("no shell here")
+        return self._result
+
+
+_BROKEN_PY = "def f(:\n"
+_CLEAN_PY = "def f():\n    return 1\n"
+
+
+def _syntax_events(store: _SpyStore) -> list[dict]:
+    return [
+        payload
+        for _agent, kind, payload in store.events
+        if kind == SYNTAX_CHECK_EVENT
+    ]
+
+
+class TestPostWriteSyntaxCheck:
+    """The harness's own check, appended to `write_file`/`edit_file`.
+
+    Counterpart to `declare_verification`: that command is the model's own
+    (and so converges on a tautology it cannot fail), this one is the
+    harness's, selected by file extension alone -- no model, provider, or
+    adapter is ever consulted.
+    """
+
+    async def test_write_file_appends_the_check_when_the_file_is_broken(
+        self, sandbox: LocalSandbox
+    ):
+        result = await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _BROKEN_PY}
+        )
+        # The write itself still reports exactly what it did, first.
+        assert result.startswith("wrote 8 bytes to solve.py")
+        assert "Syntax check failed (harness-run):" in result
+        assert "SyntaxError" in result
+
+    async def test_clean_write_result_is_byte_for_byte_unchanged(
+        self, sandbox: LocalSandbox
+    ):
+        # Silence is the success signal: a passing check must not add a
+        # single character to what the model reads.
+        result = await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        assert result == f"wrote {len(_CLEAN_PY)} bytes to solve.py"
+
+    async def test_unchecked_suffix_result_is_unchanged(
+        self, sandbox: LocalSandbox
+    ):
+        store = _SpyStore()
+        result = await write_file_tool(
+            sandbox, store=store, agent_id="agent-1"
+        ).handler({"path": "notes.txt", "content": "def f(:\n"})
+        assert result == "wrote 8 bytes to notes.txt"
+        # No checker applies, so nothing is recorded either.
+        assert _syntax_events(store) == []
+
+    async def test_append_mode_is_never_checked(self, sandbox: LocalSandbox):
+        # An append is a partial file by construction (`write_file` is
+        # documented for writing a large file across several calls), so
+        # "piece 1 does not parse" is not a defect.
+        store = _SpyStore()
+        write = write_file_tool(sandbox, store=store, agent_id="agent-1")
+        result = await write.handler(
+            {"path": "solve.py", "content": "def f():\n", "mode": "append"}
+        )
+        assert result == "appended 9 bytes to solve.py"
+        assert [e["skipped_reason"] for e in _syntax_events(store)] == [
+            "append_mode"
+        ]
+
+    async def test_write_file_records_the_event_with_its_tool_name(
+        self, sandbox: LocalSandbox
+    ):
+        store = _SpyStore()
+        await write_file_tool(sandbox, store=store, agent_id="agent-1").handler(
+            {"path": "solve.py", "content": _BROKEN_PY}
+        )
+        assert _syntax_events(store) == [
+            {
+                "path": "solve.py",
+                "language": "python",
+                "ok": False,
+                "exit_code": 1,
+                "skipped_reason": None,
+                "tool": "write_file",
+            }
+        ]
+
+    async def test_clean_write_records_a_passing_event(
+        self, sandbox: LocalSandbox
+    ):
+        # The mechanism has to be measurable even when it stays silent --
+        # this project has shipped mechanisms that never fired.
+        store = _SpyStore()
+        await write_file_tool(sandbox, store=store, agent_id="agent-1").handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        assert [(e["ok"], e["exit_code"]) for e in _syntax_events(store)] == [
+            (True, 0)
+        ]
+
+    async def test_edit_file_appends_the_check_when_the_edit_breaks_the_file(
+        self, sandbox: LocalSandbox
+    ):
+        await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        result = await edit_file_tool(sandbox).handler(
+            {"path": "solve.py", "old_string": "def f():", "new_string": "def f(:"}
+        )
+        assert result.startswith("edited solve.py")
+        assert "Syntax check failed (harness-run):" in result
+
+    async def test_clean_edit_result_is_unchanged(self, sandbox: LocalSandbox):
+        await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        result = await edit_file_tool(sandbox).handler(
+            {"path": "solve.py", "old_string": "return 1", "new_string": "return 2"}
+        )
+        assert result == "edited solve.py"
+
+    async def test_edit_file_records_the_event_with_its_tool_name(
+        self, sandbox: LocalSandbox
+    ):
+        store = _SpyStore()
+        await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        await edit_file_tool(sandbox, store=store, agent_id="agent-1").handler(
+            {"path": "solve.py", "old_string": "def f():", "new_string": "def f(:"}
+        )
+        assert [(e["tool"], e["ok"]) for e in _syntax_events(store)] == [
+            ("edit_file", False)
+        ]
+
+    async def test_scarce_wall_clock_skips_the_check(self, tmp_path: Path):
+        # The landing reserve is not this mechanism's to spend: with too
+        # little time left the check does not run at all, and the broken
+        # file's write result is the unchanged one.
+        box = _ScriptedExecSandbox(tmp_path / "workspace")
+        store = _SpyStore()
+        deadline = _fixed_deadline(3600.0, remaining=65.0)
+        result = await write_file_tool(
+            box, deadline=deadline, store=store, agent_id="agent-1"
+        ).handler({"path": "solve.py", "content": _BROKEN_PY})
+        assert result == "wrote 8 bytes to solve.py"
+        assert box.exec_calls == []
+        assert [e["skipped_reason"] for e in _syntax_events(store)] == ["deadline"]
+
+    async def test_landing_turn_skips_the_check(self, tmp_path: Path):
+        box = _ScriptedExecSandbox(tmp_path / "workspace")
+        store = _SpyStore()
+        deadline = _fixed_deadline(3600.0)
+        deadline.begin_landing()
+        result = await write_file_tool(
+            box, deadline=deadline, store=store, agent_id="agent-1"
+        ).handler({"path": "solve.py", "content": _BROKEN_PY})
+        assert result == "wrote 8 bytes to solve.py"
+        assert box.exec_calls == []
+        assert [e["skipped_reason"] for e in _syntax_events(store)] == ["landing"]
+
+    async def test_missing_interpreter_never_reaches_the_model(
+        self, tmp_path: Path
+    ):
+        # The fail-open pin. A sandbox image without `node` must produce
+        # silence, never a scary message about a file that is fine.
+        box = _ScriptedExecSandbox(
+            tmp_path / "workspace",
+            ExecResult(exit_code=127, stdout="", stderr="node: command not found"),
+        )
+        result = await write_file_tool(box).handler(
+            {"path": "app.js", "content": "const x = ;\n"}
+        )
+        assert result == "wrote 12 bytes to app.js"
+
+    async def test_check_that_raises_does_not_fail_the_write(
+        self, tmp_path: Path
+    ):
+        box = _ScriptedExecSandbox(tmp_path / "workspace", boom=True)
+        store = _SpyStore()
+        result = await write_file_tool(
+            box, store=store, agent_id="agent-1"
+        ).handler({"path": "solve.py", "content": _BROKEN_PY})
+        assert result == "wrote 8 bytes to solve.py"
+        assert [e["skipped_reason"] for e in _syntax_events(store)] == [
+            "exec_error"
+        ]
+
+    async def test_check_is_bounded_by_the_check_timeout(self, tmp_path: Path):
+        box = _ScriptedExecSandbox(tmp_path / "workspace")
+        await write_file_tool(box).handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        assert [timeout for _cmd, timeout in box.exec_calls] == [
+            CHECK_TIMEOUT_SECONDS
+        ]
+
+    async def test_a_store_that_raises_does_not_fail_the_write(
+        self, sandbox: LocalSandbox
+    ):
+        result = await write_file_tool(
+            sandbox, store=_SpyStore(boom=True), agent_id="agent-1"
+        ).handler({"path": "solve.py", "content": _CLEAN_PY})
+        assert result == f"wrote {len(_CLEAN_PY)} bytes to solve.py"
+
+    async def test_checked_write_leaves_no_artifacts_in_the_workspace(
+        self, sandbox: LocalSandbox
+    ):
+        # A prior task was lost because an extra file existed in the
+        # deliverable directory; the check must never add one.
+        await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _CLEAN_PY}
+        )
+        await write_file_tool(sandbox).handler(
+            {"path": "broken.py", "content": _BROKEN_PY}
+        )
+        await write_file_tool(sandbox).handler(
+            {"path": "data.json", "content": '{"a": 1}'}
+        )
+        assert sorted(p.name for p in sandbox.workspace.rglob("*")) == [
+            "broken.py",
+            "data.json",
+            "solve.py",
+        ]
+
+    async def test_appended_text_does_not_look_unfinished(
+        self, sandbox: LocalSandbox
+    ):
+        # The model may echo the harness's text back in its final answer;
+        # it must not read as a promise or a question.
+        from harness.diligence import looks_unfinished
+
+        result = await write_file_tool(sandbox).handler(
+            {"path": "solve.py", "content": _BROKEN_PY}
+        )
+        assert looks_unfinished(result, 0)[0] is False
+
+    async def test_registry_dispatch_carries_the_check_through(
+        self, sandbox: LocalSandbox
+    ):
+        registry = ToolRegistry()
+        registry.register(write_file_tool(sandbox))
+        result = await registry.dispatch(
+            _call("write_file", {"path": "solve.py", "content": _BROKEN_PY})
+        )
+        assert result.is_error is False
+        assert "Syntax check failed (harness-run):" in result.content
