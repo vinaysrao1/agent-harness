@@ -156,6 +156,20 @@ _DEFAULT_STREAM_IDLE_TIMEOUT = 60.0
 #: provider hangs on every attempt. Overridable via the ``retry`` kwarg.
 _DEFAULT_RETRY_MAX_ELAPSED = 300.0
 
+#: Default attempt cap for one ``complete()`` call's retry sequence.
+#:
+#: Deliberately high so that :data:`_DEFAULT_RETRY_MAX_ELAPSED` is the
+#: *binding* constraint rather than decoration. With
+#: :func:`retry_with_backoff`'s default ladder (base 1s, cap 30s, up to 2x
+#: jitter) the delays run 1, 2, 4, 8, 16, then 30s each, so the stock
+#: ``max_attempts=5`` exhausts a retry sequence in only ~15-35s — a provider
+#: blip lasting longer than that killed the trial outright while the
+#: documented 300s ceiling never once had a chance to apply. Twelve attempts
+#: span roughly 180-360s, letting the wall-clock ceiling do the bounding it
+#: was written to do. Still bounded: ``max_elapsed`` re-raises before any
+#: sleep that would cross it, so this cannot overrun an upstream deadline.
+_DEFAULT_RETRY_MAX_ATTEMPTS = 12
+
 #: Provider finish reasons -> harness :class:`StopReason`.
 _FINISH_REASONS: dict[str, StopReason] = {
     "stop": StopReason.END_TURN,
@@ -845,7 +859,11 @@ class OpenAICompatAdapter(ModelAdapter):
         self._request_timeout = request_timeout
         # Default the retry sequence's wall-clock ceiling; an explicit
         # ``retry`` mapping may override it (or any other retry knob).
-        self._retry = {"max_elapsed": _DEFAULT_RETRY_MAX_ELAPSED, **(retry or {})}
+        self._retry = {
+            "max_attempts": _DEFAULT_RETRY_MAX_ATTEMPTS,
+            "max_elapsed": _DEFAULT_RETRY_MAX_ELAPSED,
+            **(retry or {}),
+        }
         # Explicit prompt caching is endpoint-dependent, so it is configured
         # rather than assumed: off by default (a no-op or an error on
         # endpoints without Anthropic-style cache_control), on for a gateway

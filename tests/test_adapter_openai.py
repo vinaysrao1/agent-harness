@@ -1815,3 +1815,56 @@ class TestCacheControl:
         )
         (kwargs,) = client.chat.completions.calls
         assert kwargs["messages"][0]["content"] == "sys"
+
+
+class TestRetryLadderSpansWallClockCeiling:
+    """The attempt cap must not pre-empt ``max_elapsed``.
+
+    Regression test for a real Terminal-Bench failure: four trials died to
+    ``APIConnectionError`` during a ~30s provider blip, one of them only 17s
+    after starting. The stock ``max_attempts=5`` ladder (1+2+4+8s) exhausted
+    in well under the documented 300s ceiling, so the ceiling was decoration
+    and a brief blip forfeited whole trials.
+    """
+
+    def test_adapter_defaults_let_max_elapsed_bind(self) -> None:
+        adapter = OpenAICompatAdapter("m", api_key="k")
+        assert adapter._retry["max_elapsed"] == 300.0
+        # Ladder is 1,2,4,8,16 then 30s-capped; five attempts cannot reach
+        # anywhere near 300s, so the cap must be well above five.
+        assert adapter._retry["max_attempts"] >= 10
+
+    def test_explicit_retry_override_still_wins(self) -> None:
+        adapter = OpenAICompatAdapter("m", api_key="k", retry={"max_attempts": 3})
+        assert adapter._retry["max_attempts"] == 3
+
+    async def test_survives_a_blip_longer_than_the_old_ladder(self) -> None:
+        # Fails for the first 8 attempts (the old cap of 5 would have given
+        # up), then succeeds.
+        import openai as _openai
+
+        calls = {"n": 0}
+
+        class FlakyCompletions:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def create(self, **kwargs: Any) -> Any:
+                calls["n"] += 1
+                if calls["n"] <= 8:
+                    raise _openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+                return FakeStream(
+                    [stream_chunk(content="ok"), stream_chunk(finish_reason="stop")]
+                )
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=FlakyCompletions()))
+        adapter = OpenAICompatAdapter(
+            "m",
+            client=client,
+            # Zero out sleeping so the test is instant; the attempt cap is
+            # what is under test.
+            retry={"backoff_base": 0.0, "backoff_cap": 0.0, "jitter": lambda: 0.0},
+        )
+        response = await adapter.complete([Message(role=Role.USER, content="hi")], [])
+        assert calls["n"] == 9
+        assert response.message.content == "ok"
