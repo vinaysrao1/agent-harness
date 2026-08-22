@@ -173,6 +173,14 @@ class ModelConfig(BaseModel):
     #: turn's token budget thinking. An unsupported field is ignored by the
     #: gateway, not an error.
     extra_body: dict[str, Any] | None = None
+    #: Whether to set ``cache_control: ephemeral`` breakpoints on requests via
+    #: the OpenAI-compatible adapter. Off by default: the field is a no-op on
+    #: endpoints that do not implement Anthropic-style explicit prompt caching
+    #: (and some providers cache automatically, needing nothing here). Turn it
+    #: on for a gateway that fronts Anthropic models — it is a property of the
+    #: *endpoint*, which is why it lives in config rather than being inferred
+    #: from the model name inside the harness.
+    cache_control: bool = False
 
     def resolve_api_key(self) -> str | None:
         """Resolve the stored reference to the actual API key, if any."""

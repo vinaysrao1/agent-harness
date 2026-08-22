@@ -1705,3 +1705,113 @@ class TestStreamingComplete:
             await adapter.complete([Message(role=Role.USER, content="hi")], [])
         assert "no choices" in str(excinfo.value)
         assert excinfo.value.retryable is True
+
+
+class TestCacheControl:
+    """``cache_control`` breakpoints on the OpenAI-compatible path.
+
+    The gateway maps a content part's ``cache_control`` onto the underlying
+    Anthropic block, which is how an Anthropic model reached through an
+    OpenAI-shaped endpoint gets explicit prompt caching. Verified against the
+    live gateway before this was wired up: a repeated prefix came back with
+    ``cached_tokens`` equal to the prefix and ~7x lower cost.
+    """
+
+    def test_off_by_default_leaves_content_as_plain_strings(self) -> None:
+        out = to_openai_messages([Message(role=Role.USER, content="hi")], "sys")
+        assert out[0] == {"role": "system", "content": "sys"}
+        assert out[1]["content"] == "hi"
+
+    def test_marks_system_prompt_and_final_message(self) -> None:
+        out = to_openai_messages(
+            [Message(role=Role.USER, content="hi")], "sys", cache=True
+        )
+        assert out[0]["content"] == [
+            {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+        ]
+        assert out[-1]["content"] == [
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+        ]
+
+    def test_marks_a_trailing_tool_result(self) -> None:
+        # The prefix of an agent-loop request usually ends on a tool result;
+        # if this case were skipped almost all of the benefit would be lost.
+        messages = [
+            Message(role=Role.USER, content="go"),
+            Message(
+                role=Role.ASSISTANT,
+                tool_calls=[ToolCall(id="c1", name="bash", arguments={"cmd": "ls"})],
+            ),
+            Message(
+                role=Role.TOOL,
+                tool_result=ToolResult(tool_call_id="c1", content="out.txt"),
+            ),
+        ]
+        out = to_openai_messages(messages, "sys", cache=True)
+        assert out[-1]["role"] == "tool"
+        assert out[-1]["content"] == [
+            {"type": "text", "text": "out.txt", "cache_control": {"type": "ephemeral"}}
+        ]
+        # tool_call_id must survive the rewrite or the turn is unmatchable.
+        assert out[-1]["tool_call_id"] == "c1"
+
+    def test_at_most_two_breakpoints(self) -> None:
+        # Anthropic allows four; staying well under leaves headroom and keeps
+        # the count independent of transcript length.
+        messages = [
+            Message(role=Role.USER, content="a"),
+            Message(role=Role.ASSISTANT, content="b"),
+            Message(role=Role.USER, content="c"),
+        ]
+        out = to_openai_messages(messages, "sys", cache=True)
+        marked = sum(
+            1
+            for m in out
+            if isinstance(m["content"], list)
+            for part in m["content"]
+            if "cache_control" in part
+        )
+        assert marked == 2
+
+    def test_tool_call_only_assistant_turn_is_left_alone(self) -> None:
+        # No text block to mark; fabricating an empty part risks a 400.
+        messages = [
+            Message(role=Role.USER, content="go"),
+            Message(
+                role=Role.ASSISTANT,
+                tool_calls=[ToolCall(id="c1", name="bash", arguments={"cmd": "ls"})],
+            ),
+        ]
+        out = to_openai_messages(messages, "sys", cache=True)
+        assert out[-1]["content"] in (None, "")
+        assert out[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_capability_reflects_construction_flag(self) -> None:
+        off = OpenAICompatAdapter("m", api_key="k")
+        assert off.capabilities.supports_cache_control is False
+        on = OpenAICompatAdapter("m", api_key="k", cache_control=True)
+        assert on.capabilities.supports_cache_control is True
+
+    async def test_enabled_adapter_sends_breakpoints(self) -> None:
+        client = fake_streaming_client(
+            [FakeStream([stream_chunk(content="ok"), stream_chunk(finish_reason="stop")])]
+        )
+        adapter = OpenAICompatAdapter("m", client=client, cache_control=True)
+        await adapter.complete(
+            [Message(role=Role.USER, content="hi")], [], system="sys"
+        )
+        (kwargs,) = client.chat.completions.calls
+        assert kwargs["messages"][0]["content"][0]["cache_control"] == {
+            "type": "ephemeral"
+        }
+
+    async def test_disabled_adapter_sends_none(self) -> None:
+        client = fake_streaming_client(
+            [FakeStream([stream_chunk(content="ok"), stream_chunk(finish_reason="stop")])]
+        )
+        adapter = OpenAICompatAdapter("m", client=client)
+        await adapter.complete(
+            [Message(role=Role.USER, content="hi")], [], system="sys"
+        )
+        (kwargs,) = client.chat.completions.calls
+        assert kwargs["messages"][0]["content"] == "sys"
