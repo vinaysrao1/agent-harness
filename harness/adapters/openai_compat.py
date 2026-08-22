@@ -177,8 +177,25 @@ def map_finish_reason(finish_reason: str | None) -> StopReason:
     return _FINISH_REASONS.get(finish_reason, StopReason.ERROR)
 
 
+#: ``cache_control`` value for ephemeral prompt-cache breakpoints, mirroring
+#: the Anthropic adapter. Only emitted when the adapter is constructed with
+#: ``cache_control=True``.
+_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
+
+
+def _cached_parts(text: str) -> list[dict[str, Any]]:
+    """Render ``text`` as a single content part carrying a cache breakpoint.
+
+    chat.completions accepts a content *parts* list wherever it accepts a
+    plain string, and a gateway fronting Anthropic maps a part's
+    ``cache_control`` onto the underlying block. Anthropic permits at most
+    four breakpoints per request; :func:`to_openai_messages` sets two.
+    """
+    return [{"type": "text", "text": text, "cache_control": dict(_EPHEMERAL)}]
+
+
 def to_openai_messages(
-    messages: list[Message], system: str | None = None
+    messages: list[Message], system: str | None = None, *, cache: bool = False
 ) -> list[dict[str, Any]]:
     """Translate harness messages to chat.completions message dicts.
 
@@ -187,6 +204,13 @@ def to_openai_messages(
     Assistant tool calls are serialized with JSON-string ``arguments``; tool
     results become ``role="tool"`` messages with ``tool_call_id``, with
     ``is_error`` results prefixed ``Error:`` since the format has no flag.
+
+    When ``cache`` is true, ``cache_control: ephemeral`` breakpoints are set
+    on the system prompt and on the final message, marking the whole
+    transcript so far as a cacheable stable prefix for the next turn. The
+    final message is used whatever its role — in an agent loop the prefix
+    usually ends on a ``tool`` result, and skipping that case would forfeit
+    nearly all of the benefit.
 
     An *assistant* message with neither ``content`` nor ``tool_calls`` is
     translated with the :data:`EMPTY_ASSISTANT_PLACEHOLDER` body and a
@@ -202,7 +226,12 @@ def to_openai_messages(
     """
     out: list[dict[str, Any]] = []
     if system is not None:
-        out.append({"role": "system", "content": system})
+        out.append(
+            {
+                "role": "system",
+                "content": _cached_parts(system) if cache else system,
+            }
+        )
     for message in messages:
         if message.role is Role.TOOL:
             if message.tool_result is None:
@@ -260,7 +289,22 @@ def to_openai_messages(
                 for call in message.tool_calls
             ]
         out.append(entry)
+    if cache and out:
+        _set_trailing_breakpoint(out[-1])
     return out
+
+
+def _set_trailing_breakpoint(entry: dict[str, Any]) -> None:
+    """Put a cache breakpoint on ``entry``'s content, in place.
+
+    An assistant turn that is pure tool calls has ``content`` of ``None`` or
+    ``""``; there is no block to mark, and fabricating an empty text part
+    risks a provider rejecting it, so such an entry is left alone. The
+    system-prompt breakpoint still covers the stable prefix in that case.
+    """
+    content = entry.get("content")
+    if isinstance(content, str) and content:
+        entry["content"] = _cached_parts(content)
 
 
 def to_openai_tools(tools: list[ToolSpec]) -> list[dict[str, Any]]:
@@ -745,6 +789,9 @@ class OpenAICompatAdapter(ModelAdapter):
     hung upstream surfaces as a retryable timeout rather than blocking
     indefinitely; it is ignored when an explicit ``client`` is injected.
     ``retry`` overrides keyword arguments to :func:`retry_with_backoff`.
+    ``cache_control`` enables ``cache_control: ephemeral`` breakpoints (see
+    :func:`to_openai_messages`); leave it off unless the endpoint implements
+    Anthropic-style explicit prompt caching.
     """
 
     def __init__(
@@ -759,6 +806,7 @@ class OpenAICompatAdapter(ModelAdapter):
         stream: bool = True,
         stream_idle_timeout: float = _DEFAULT_STREAM_IDLE_TIMEOUT,
         extra_body: dict[str, Any] | None = None,
+        cache_control: bool = False,
         retry: dict[str, Any] | None = None,
     ) -> None:
         if client is None:
@@ -798,9 +846,13 @@ class OpenAICompatAdapter(ModelAdapter):
         # Default the retry sequence's wall-clock ceiling; an explicit
         # ``retry`` mapping may override it (or any other retry knob).
         self._retry = {"max_elapsed": _DEFAULT_RETRY_MAX_ELAPSED, **(retry or {})}
+        # Explicit prompt caching is endpoint-dependent, so it is configured
+        # rather than assumed: off by default (a no-op or an error on
+        # endpoints without Anthropic-style cache_control), on for a gateway
+        # that fronts Anthropic models.
         self._capabilities = Capabilities(
             max_context=max_context,
-            supports_cache_control=False,
+            supports_cache_control=cache_control,
         )
 
     @property
@@ -831,7 +883,9 @@ class OpenAICompatAdapter(ModelAdapter):
         """
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "messages": to_openai_messages(messages, system),
+            "messages": to_openai_messages(
+                messages, system, cache=self._capabilities.supports_cache_control
+            ),
             **params,
         }
         if tools:
