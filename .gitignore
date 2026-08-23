@@ -22,3 +22,10 @@ jobs/
 .idea/
 .vscode/
 terminal-bench/
+
+# Judge-evaluation data: derived from jobs/ run data and containing agent
+# solutions to benchmark tasks. Publishing those would risk contaminating the
+# benchmark, and the same rule as jobs/ applies. Regenerate with
+# tools_eval/judge_eval/build_corpus.py -- see that directory's README.
+tools_eval/**/corpus.jsonl
+tools_eval/**/verdicts.json
