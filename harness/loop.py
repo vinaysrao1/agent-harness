@@ -90,7 +90,7 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -131,6 +131,8 @@ from harness.types import (
 )
 
 __all__ = [
+    "COMPLETION_GATES",
+    "NUDGE_SOURCES",
     "Budgets",
     "AgentResult",
     "AskCallable",
@@ -260,6 +262,24 @@ LANDING_TURN_NOTICE: str = (
 #: the wall clock will always reach first — which is the point. It exists to
 #: stop a zero-cost infinite loop, not to ration turns.
 MIN_SECONDS_PER_TURN: float = 5.0
+
+
+#: Completion gates on the ``CODING`` path (N5): the checks that can stop a
+#: turn with no tool calls from finishing the run. Frozen as a golden by the
+#: conformance suite -- adding a gate is a deliberate change to the benchmark
+#: path, so it must be declared here and the golden re-frozen with a
+#: Terminal-Bench run attached (Lane B, see the M10 re-freeze protocol).
+COMPLETION_GATES: Final[tuple[str, ...]] = ("diligence", "self_verification")
+
+#: Sources that may consume the shared nudge budget (:data:`MAX_NUDGES`), in
+#: the order the loop evaluates them. Frozen as a golden by N5.
+#:
+#: N5 also pins the *structural* count of ``nudges += 1`` sites and of
+#: ``_finish("completed")`` returns in this module against these tuples, so a
+#: gate cannot be added without either declaring itself here or failing the
+#: invariant. That is an approximation, not a proof: a gate that neither nudges
+#: nor adds a completion return would slip past it. Stated rather than implied.
+NUDGE_SOURCES: Final[tuple[str, ...]] = ("diligence", "self_verification")
 
 
 class Budgets(BaseModel):
