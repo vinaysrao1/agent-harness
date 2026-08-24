@@ -56,6 +56,49 @@ def compute() -> dict[str, str]:
         }
 
 
+TRACE_NAME = "replay_trace.json"
+
+
+def freeze_replay_trace() -> tuple[bool, list[str]]:
+    """Rewrite the replay trace golden if it moved. Returns ``(changed, keys)``.
+
+    Stored as readable JSON rather than a digest: when N7 fails, the useful
+    output is *which trial at which window moved which turn index*, and a hash
+    cannot say. The file is shape data -- no task content -- so it is safe to
+    commit and small enough to diff.
+
+    This golden guards N7 **and** N8 and is, per S-003, the only instrument for
+    S-105, S-109 and S-102. An earlier version rewrote it unconditionally, with
+    no diff, no changed-count and therefore no CHANGELOG reminder -- so a bare
+    ``python -m tests.conformance.freeze`` silently reset a failing invariant
+    and exited 0. An invariant any freeze invocation quietly resets is not an
+    invariant. It now gets exactly the discipline every digest gets.
+    """
+    import json
+
+    from tests.conformance.replay import replay_corpus
+
+    path = GOLDEN_DIR / TRACE_NAME
+    new_trace = replay_corpus()
+    previous: dict = {}
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            previous = {}
+    moved = sorted(
+        key
+        for key in set(new_trace) | set(previous)
+        if previous.get(key) != new_trace.get(key)
+    )
+    if not moved:
+        return False, []
+    path.write_text(
+        json.dumps(new_trace, indent=1, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return True, moved
+
+
 def main(argv: list[str] | None = None) -> None:
     """Regenerate goldens, printing every change.
 
@@ -73,11 +116,11 @@ def main(argv: list[str] | None = None) -> None:
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     digests = compute()
     if names:
-        unknown = sorted(set(names) - set(digests))
+        unknown = sorted(set(names) - set(digests) - {TRACE_NAME})
         if unknown:
             raise SystemExit(
                 f"unknown golden(s): {', '.join(unknown)}\n"
-                f"known: {', '.join(sorted(digests))}"
+                f"known: {', '.join(sorted([*digests, TRACE_NAME]))}"
             )
         digests = {k: v for k, v in digests.items() if k in names}
 
@@ -91,6 +134,17 @@ def main(argv: list[str] | None = None) -> None:
         path.write_text(digest + "\n", encoding="utf-8")
         changed += 1
         print(f"  RE-FROZEN  {name}\n    {previous} -> {digest}")
+    if not names or TRACE_NAME in names:
+        trace_changed, moved = freeze_replay_trace()
+        if trace_changed:
+            changed += 1
+            print(f"  RE-FROZEN  {TRACE_NAME}")
+            print(f"    {len(moved)} trace key(s) moved, e.g.:")
+            for key in moved[:5]:
+                print(f"      {key}")
+        else:
+            print(f"  unchanged  {TRACE_NAME}")
+
     if changed:
         print(
             f"\n{changed} golden(s) moved. Add a row to tests/golden/CHANGELOG.md "
