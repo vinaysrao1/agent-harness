@@ -6,3 +6,4 @@
 | --- | --- | --- | --- | --- | --- |
 | [S-001](S-001-spec-process.md) | Spec process and traceability | Implemented | A | - | XS |
 | [S-002](S-002-neutrality-invariants.md) | Neutrality invariants and the TB2 conformance suite | Implemented | A | S-001 | S |
+| [S-003](S-003-replay-corpora.md) | Replay corpora and the context-timing invariants | Implemented | A | S-002 | S |
