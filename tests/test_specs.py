@@ -395,3 +395,15 @@ class TestRulesRejectViolations:
             encoding="utf-8",
         )
         assert event_kinds_in_source(pkg) == {"after_kwargs"}
+
+    def test_S001_registered_event_kinds_are_actually_emitted(self) -> None:
+        # The mirror of the unowned check. A spec that registers telemetry it
+        # never produces would otherwise stay green forever.
+        from harness.specs import unemitted_spec_kinds
+
+        emitted = event_kinds_in_source(PACKAGE_DIR)
+        unemitted = unemitted_spec_kinds(emitted)
+        assert not unemitted, (
+            f"registered against a spec but never emitted: {unemitted}. "
+            "Either emit it or remove the registration."
+        )

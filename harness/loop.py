@@ -118,6 +118,11 @@ from harness.diligence import (
 )
 from harness.permissions import Decision, Policy, ToolMeta, evaluate
 from harness.persistence import RunStore
+from harness.repo import (
+    CHECKPOINT_EVENT,
+    CHECKPOINT_SKIPPED_EVENT,
+    GitSubstrate,
+)
 from harness.sandbox.base import Sandbox
 from harness.tools.registry import ToolRegistry
 from harness.types import (
@@ -419,6 +424,7 @@ class AgentLoop:
         declared_command: str | None = None,
         deadline: Deadline | None = None,
         written_data: WrittenData | None = None,
+        repo: "GitSubstrate | None" = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -442,6 +448,11 @@ class AgentLoop:
         #: falls back to a self-built one from ``budgets.wall_clock_seconds``
         #: when this is None.
         self.deadline = deadline
+        #: Shadow-git substrate (S-201), or None. Inactive unless both the
+        #: profile enables ``git_substrate`` and the environment affirms it,
+        #: so on the benchmark path this is either None or a no-op object
+        #: that issues no commands.
+        self.repo = repo
         #: What this agent has written where (Change 4): fed from the
         #: tool-call stream, read by the verification-quality lint. Loop
         #: state, not context state, so compaction cannot erase it; not
@@ -1074,6 +1085,32 @@ class AgentLoop:
                         "tool_result",
                         result.model_dump(mode="json"),
                     )
+                # Shadow checkpoint (S-201) after the turn's writes have
+                # landed. A no-op unless the profile enables git_substrate
+                # AND the environment affirms it, so on the CODING path this
+                # returns before issuing any command -- N3 and N4 hold.
+                if self.repo is not None:
+                    ref, skip_reason = await self.repo.checkpoint_detailed(
+                        f"turn-{turns}"
+                    )
+                    if ref is not None:
+                        self.store.append_event(
+                            self.agent_id,
+                            CHECKPOINT_EVENT,
+                            {"spec": "S-201", "turn": turns, "ref": ref},
+                        )
+                    elif skip_reason not in (None, "inactive"):
+                        # A skip is recorded, not merely counted: a checkpoint
+                        # absent from the log is indistinguishable from one
+                        # that was never attempted. "inactive" is excluded
+                        # because a capability that was never on has nothing
+                        # to report.
+                        self.store.append_event(
+                            self.agent_id,
+                            CHECKPOINT_SKIPPED_EVENT,
+                            {"spec": "S-201", "turn": turns, "reason": skip_reason},
+                        )
+
                 # Self-verification declarations (§10.3 B1): a successful
                 # declare_verification call sets (or replaces) the command
                 # the loop will hold the model to at completion time.
