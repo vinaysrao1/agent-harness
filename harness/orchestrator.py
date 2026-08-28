@@ -449,8 +449,9 @@ class Orchestrator:
         :data:`harness.profiles.CODING`, so omitting all three preserves
         pre-M9a behavior exactly. Explicit ``domain_rules`` /
         ``tool_factories`` arguments override the profile's fields.
-        Subagents inherit the lead's factories and rules (v1, §11.4:
-        heterogeneous subagents are deferred to M9b).
+        Subagents inherit the lead's profile in full (§11.4); a per-spawn
+        profile is S-304's, because applying only part of one would desync a
+        child's tools from its prompt.
 
         ``deadline``, when provided, is the run's shared wall-clock
         :class:`~harness.deadline.Deadline`, anchored by the caller where
@@ -489,6 +490,7 @@ class Orchestrator:
             sandbox_override=sandbox,
             domain_rules=domain_rules,
             tool_factories=tool_factories,
+            profile=profile,
             deadline=deadline,
         )
         return run_id, result
@@ -899,6 +901,7 @@ class Orchestrator:
         sandbox_override: Sandbox | None = None,
         domain_rules: str | None = None,
         tool_factories: Sequence[ToolFactory] | None = None,
+        profile: "Profile | None" = None,
         deadline: Deadline | None = None,
     ) -> AgentResult:
         """Shared engine behind :meth:`run_task` and :meth:`resume_task`.
@@ -978,9 +981,18 @@ class Orchestrator:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_SUBAGENTS)
 
         def build_policy() -> Policy:
+            # A profile may *add* allow globs; it can never change the mode or
+            # the deny list. `mode` here is the operator's resolved choice, so
+            # a profile cannot turn `--mode gated` into auto, and
+            # `evaluate()` consults HARD_DENY_CATEGORIES before allow patterns,
+            # so a profile cannot auto-allow a hard-denied tool either. Both
+            # properties are asserted in tests/test_profiles_promotion.py.
             policy = Policy(
                 mode=mode,
-                allow=tuple(self.config.permission_allow),
+                allow=(
+                    *self.config.permission_allow,
+                    *(profile.permission_allow if profile is not None else ()),
+                ),
                 deny=tuple(self.config.permission_deny),
             )
             for pattern in self._grants:
@@ -1056,6 +1068,12 @@ class Orchestrator:
             return loop
 
         async def spawn_handler(arguments: dict) -> str:
+            # Subagents inherit the lead's profile in full. A per-spawn profile
+            # is S-304's: applying only `tool_factories` would hand a child
+            # read-only tools while its system prompt -- built once, above --
+            # still described the lead's, and half a profile is worse than
+            # none. Exposing it to the model would additionally change
+            # spawn_agent's JSON schema, which N2 freezes.
             prompt = _require_str("spawn_agent", arguments, "prompt")
             share_sandbox = bool(arguments.get("share_sandbox", True))
             isolation_note = ""
