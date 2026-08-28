@@ -118,7 +118,10 @@ LEGACY_EVENT_KINDS = frozenset(
 #: emitted kind is accounted for by a spec -- so a new event cannot appear
 #: without a spec owning it. The payload-level assertion belongs to whichever
 #: spec first emits a new kind, where a real payload exists to assert against.
-EVENT_KIND_SPECS: dict[str, str] = {}
+EVENT_KIND_SPECS: dict[str, str] = {
+    "repo_checkpoint": "S-201",
+    "repo_checkpoint_skipped": "S-201",
+}
 
 
 class SpecError(ValueError):
@@ -287,6 +290,16 @@ def unowned_event_kinds(kinds: set[str]) -> list[str]:
 def stale_legacy_kinds(kinds: set[str]) -> list[str]:
     """Kinds frozen as legacy that the package no longer emits."""
     return sorted(LEGACY_EVENT_KINDS - kinds)
+
+
+def unemitted_spec_kinds(kinds: set[str]) -> list[str]:
+    """Kinds registered against a spec that nothing actually emits.
+
+    The mirror of :func:`unowned_event_kinds`. Without it a spec could declare
+    telemetry it never produces and T3 would stay green forever -- the same
+    asymmetry that let a registered kind sit unemitted indefinitely.
+    """
+    return sorted(set(EVENT_KIND_SPECS) - kinds)
 
 
 def render_index(specs: list[Spec]) -> str:
