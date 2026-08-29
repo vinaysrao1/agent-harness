@@ -344,6 +344,13 @@ class AgentResult(BaseModel):
     usage: Usage
     turns: int
     error_kind: str | None = None
+    #: One-line summary of what this run changed (S-202), e.g.
+    #: ``"3 files changed, +40/-12"``. ``None`` whenever no repo-mode
+    #: substrate was active -- which includes the entire benchmark path.
+    #: ``None`` rather than an empty string, because "no diff was computed"
+    #: and "computed a diff that was empty" are different facts and a caller
+    #: reporting them identically would be wrong.
+    diff_stat: str | None = None
 
 
 class AgentLoop:
@@ -453,6 +460,9 @@ class AgentLoop:
         #: so on the benchmark path this is either None or a no-op object
         #: that issues no commands.
         self.repo = repo
+        #: Filled at the end of a run when a substrate was active; read by
+        #: :meth:`_finish`. Stays None on every other path.
+        self._diff_stat: str | None = None
         #: What this agent has written where (Change 4): fed from the
         #: tool-call stream, read by the verification-quality lint. Loop
         #: state, not context state, so compaction cannot erase it; not
@@ -561,6 +571,26 @@ class AgentLoop:
                 },
             )
 
+    async def _record_diff_stat(self) -> None:
+        """Summarise what this run changed, for :attr:`AgentResult.diff_stat`.
+
+        Read-only, and skipped entirely without an active substrate -- which
+        is every run on the benchmark path. A failure here must never affect
+        the run's outcome: the diff is a report about work already done, so it
+        degrades to ``None`` rather than turning a completed run into an
+        errored one.
+        """
+        if self.repo is None or not self.repo.active:
+            return
+        try:
+            from harness.diffs import ShadowReader
+
+            reader = ShadowReader(self.sandbox, self.run_id, self.agent_id)
+            stat = await reader.stat()
+            self._diff_stat = stat.summary()
+        except Exception:
+            self._diff_stat = None
+
     def _finish(
         self,
         status: Literal["completed", "paused_budget", "error"],
@@ -587,6 +617,7 @@ class AgentLoop:
             usage=usage,
             turns=turns,
             error_kind=error_kind if status == "error" else None,
+            diff_stat=self._diff_stat,
         )
         if status == "error":
             self.store.append_event(
@@ -1407,4 +1438,5 @@ class AgentLoop:
                         self.agent_id, "verification_failed", payload
                     )
 
+            await self._record_diff_stat()
             return self._finish("completed", final_text, total_usage, turns)
