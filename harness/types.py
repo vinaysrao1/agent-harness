@@ -41,7 +41,12 @@ __all__ = [
 #:   tool call or a complete answer.
 #: - ``"no_finish_reason"`` — the provider ended the response without a stop
 #:   reason we recognise *and* left nothing usable in the message.
-IncompleteReason = Literal["max_tokens", "dropped_calls", "no_finish_reason"]
+IncompleteReason = Literal[
+    "max_tokens",
+    "dropped_calls",
+    "no_finish_reason",
+    "refusal",
+]
 
 
 class Role(str, Enum):

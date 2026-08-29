@@ -9,5 +9,6 @@
 | [S-003](S-003-replay-corpora.md) | Replay corpora and the context-timing invariants | Implemented | A | S-002 | S |
 | [S-004](S-004-agent-profile.md) | AgentProfile promotion | Implemented | A | S-002 | S |
 | [S-005](S-005-environment-probe.md) | EnvironmentProfile probe and SetupBudget | Implemented | A | S-004 | S |
+| [S-110](S-110-refusal-handling.md) | Report a model refusal as a refusal | Implemented | A | S-001 | XS |
 | [S-201](S-201-git-substrate.md) | Git substrate | Implemented | A | S-005 | M |
 | [S-202](S-202-diff-as-artifact.md) | Diff as the artifact | Implemented | A | S-201 | S |

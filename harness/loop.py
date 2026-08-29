@@ -136,6 +136,7 @@ from harness.types import (
 )
 
 __all__ = [
+    "REFUSAL_EVENT",
     "COMPLETION_GATES",
     "NUDGE_SOURCES",
     "Budgets",
@@ -168,6 +169,9 @@ _CLOSED_TASK_STATUSES = frozenset(
 #: Once spent, an incomplete turn is either accepted like any other final
 #: answer or — when *every* continue was spent on unparseable tool calls —
 #: failed loudly (see :meth:`AgentLoop.run` step 5a).
+#: Transcript event kind for a model refusal (S-110, T3).
+REFUSAL_EVENT: Final[str] = "model_refusal"
+
 MAX_TRUNCATION_CONTINUES: int = 3
 
 #: Re-prompts for an incomplete turn, keyed by
@@ -344,6 +348,11 @@ class AgentResult(BaseModel):
     usage: Usage
     turns: int
     error_kind: str | None = None
+    #: True when the model declined the task rather than attempting it
+    #: (S-110). Distinct from ``error``: nothing failed, the model chose not
+    #: to act. Callers that treat a completed run as "the agent produced this
+    #: answer" must check this, because the answer is a notice, not work.
+    refused: bool = False
     #: One-line summary of what this run changed (S-202), e.g.
     #: ``"3 files changed, +40/-12"``. ``None`` whenever no repo-mode
     #: substrate was active -- which includes the entire benchmark path.
@@ -463,6 +472,8 @@ class AgentLoop:
         #: Filled at the end of a run when a substrate was active; read by
         #: :meth:`_finish`. Stays None on every other path.
         self._diff_stat: str | None = None
+        #: Set when any turn came back as a refusal (S-110).
+        self._refused: bool = False
         #: What this agent has written where (Change 4): fed from the
         #: tool-call stream, read by the verification-quality lint. Loop
         #: state, not context state, so compaction cannot erase it; not
@@ -551,6 +562,22 @@ class AgentLoop:
                 "content_chars": len(response.message.content or ""),
             },
         )
+        if getattr(response, "incomplete_reason", None) == "refusal":
+            # A refusal is a fact about the run that must reach the caller.
+            # The harness does not re-prompt to get around it: the defect
+            # being fixed is that a decline was *disguised* as an answer, not
+            # that the model declined.
+            self._refused = True
+            self.store.append_event(
+                self.agent_id,
+                REFUSAL_EVENT,
+                {
+                    "spec": "S-110",
+                    "turn": turn,
+                    "provider_stop_reason": response.provider_stop_reason,
+                },
+            )
+
         for dropped in getattr(response, "dropped_tool_calls", None) or []:
             prefix = getattr(dropped, "raw_arguments_prefix", "") or ""
             self.store.append_event(
@@ -617,6 +644,7 @@ class AgentLoop:
             usage=usage,
             turns=turns,
             error_kind=error_kind if status == "error" else None,
+            refused=self._refused,
             diff_stat=self._diff_stat,
         )
         if status == "error":

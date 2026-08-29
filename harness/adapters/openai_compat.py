@@ -109,6 +109,13 @@ EMPTY_MESSAGE_PLACEHOLDERS: dict[IncompleteReason | None, str] = {
         "any output)"
     ),
     "no_finish_reason": "(provider response ended without completing)",
+    # A refusal is not an answer, and must never read like one. The generic
+    # placeholder below was previously used here, and `looks_unfinished`
+    # accepted it as a completed run -- so a model declining the task was
+    # recorded as the agent finishing and producing that sentence.
+    "refusal": (
+        "(the model declined to act on this task; no work was attempted)"
+    ),
     None: "(provider returned an empty assistant message)",
 }
 
@@ -571,6 +578,12 @@ def from_openai_response(response: Any) -> ModelResponse:
     incomplete_reason: IncompleteReason | None = None
     if dropped:
         incomplete_reason = "dropped_calls"
+    elif stop_reason is StopReason.REFUSAL and not content and not tool_calls:
+        # Distinguish "the model declined" from "the provider returned
+        # nothing". Both arrive as an empty assistant turn, but they are
+        # different facts and a caller that reports them identically is
+        # reporting one of them wrongly.
+        incomplete_reason = "refusal"
     elif stop_reason is StopReason.MAX_TOKENS:
         incomplete_reason = "max_tokens"
     elif stop_reason is StopReason.ERROR and not content and not tool_calls:

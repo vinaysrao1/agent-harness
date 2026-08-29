@@ -121,6 +121,7 @@ LEGACY_EVENT_KINDS = frozenset(
 EVENT_KIND_SPECS: dict[str, str] = {
     "repo_checkpoint": "S-201",
     "repo_checkpoint_skipped": "S-201",
+    "model_refusal": "S-110",
 }
 
 
