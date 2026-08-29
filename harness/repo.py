@@ -31,15 +31,18 @@ from harness.deadline import Deadline
 
 __all__ = [
     "SHADOW_GIT_DIR",
+    "shadow_root",
     "CHECKPOINT_TIMEOUT_SECONDS",
     "CHECKPOINT_COMMAND_TIMEOUT",
     "CHECKPOINT_EVENT",
     "CHECKPOINT_SKIPPED_EVENT",
+    "BASELINE_EVENT",
     "BASELINE_REF_SUFFIX",
     "GIT_IDENTITY_NAME",
     "GIT_IDENTITY_EMAIL",
     "work_tree_argument",
     "RepoState",
+    "Checkpoint",
     "GitSubstrate",
     "DirtyWorktreeError",
 ]
@@ -48,6 +51,19 @@ __all__ = [
 #: spill directory, so N4's "nothing outside the workspace and /tmp/.harness-*"
 #: rule covers it by construction rather than by exception.
 SHADOW_GIT_DIR = "/tmp/.harness-git"
+
+
+def shadow_root() -> str:
+    """Where the shadow object stores live, read at call time.
+
+    :data:`SHADOW_GIT_DIR` is a module constant, so anything that imported it
+    by name holds its own binding and a test that redirects it away from the
+    real ``/tmp`` would move the writer without moving the reader -- which
+    fails as "no checkpoints found" rather than as a wrong path. Readers in
+    other modules go through this instead, so there is exactly one name to
+    redirect.
+    """
+    return SHADOW_GIT_DIR
 
 #: Total wall-clock a checkpoint may consume, across all its commands. A
 #: checkpoint that needs longer than this on a workspace-sized tree indicates
@@ -62,6 +78,13 @@ CHECKPOINT_EVENT = "repo_checkpoint"
 
 #: Transcript event kind for a skipped checkpoint (S-201, T3).
 CHECKPOINT_SKIPPED_EVENT = "repo_checkpoint_skipped"
+
+#: Emitted once, when the substrate activates, carrying the pre-agent tree.
+#: It exists to make activation *visible*: without it, "no checkpoints because
+#: the agent made no tool calls" and "no checkpoints because the capability
+#: never switched on" are the same empty log, and a consumer cannot tell an
+#: observation from a gap.
+BASELINE_EVENT = "repo_baseline"
 
 #: Identity used for shadow commits. Never the user's: these are harness
 #: bookkeeping objects in a private store, not authored work.
@@ -128,6 +151,31 @@ class RepoState:
         return self.base_sha is not None or self.unborn
 
 
+@dataclass(frozen=True)
+class Checkpoint:
+    """The outcome of one checkpoint attempt.
+
+    Carries the **tree hash** as well as the ref, and that is the point. A ref
+    is only readable while the shadow store exists, and the shadow store lives
+    at :data:`SHADOW_GIT_DIR` *inside the sandbox* -- under Docker it is
+    destroyed with the container, so anything that has to be known after the
+    run cannot be recovered from refs. The tree hash is a value: recorded in
+    the event log at the moment it is computed, it survives teardown on every
+    backend, and "did this turn change the tree?" becomes a comparison of two
+    strings rather than a git command against a store that may be gone.
+    """
+
+    ref: str | None = None
+    skip_reason: str | None = None
+    #: The `write-tree` hash of the workspace at this checkpoint, or ``None``
+    #: when the checkpoint was skipped and no tree was written.
+    tree: str | None = None
+
+    @property
+    def written(self) -> bool:
+        return self.ref is not None
+
+
 class GitSubstrate:
     """Per-run shadow git, or an inert object when the capability is off.
 
@@ -158,6 +206,7 @@ class GitSubstrate:
         self._checkpoints = 0
         self._skipped = 0
         self._baseline_ref: str | None = None
+        self._baseline_tree: str | None = None
 
     @property
     def active(self) -> bool:
@@ -171,6 +220,15 @@ class GitSubstrate:
     def baseline_ref(self) -> str | None:
         """Ref holding the pre-agent tree, or ``None`` if it was not written."""
         return self._baseline_ref
+
+    @property
+    def baseline_tree(self) -> str | None:
+        """Tree hash of the pre-agent workspace, or ``None`` if unrecorded.
+
+        The value a later turn's tree is compared against to answer "has the
+        agent changed anything yet?" without touching the shadow store.
+        """
+        return self._baseline_tree
 
     @property
     def checkpoint_count(self) -> int:
@@ -299,36 +357,52 @@ class GitSubstrate:
             self._active = False
             return self._state
 
+        # Make the shadow see the tree the way the workspace repository sees
+        # it. `git add -A` reads per-directory .gitignore files out of the work
+        # tree, so those already apply -- but `.git/info/exclude` lives in the
+        # *git directory*, and ours is the shadow, so the workspace's excludes
+        # were invisible. The consequence is not cosmetic: byte-code caches
+        # written by a test run land in the snapshot, so the tree hash changes
+        # on a turn that only *ran* the tests, and any consumer asking "which
+        # turn first changed the code?" gets the wrong turn. Best-effort: an
+        # unreadable exclude file is a slightly noisier diff, not a failure.
+        await self._run(
+            f"mkdir -p {SHADOW_GIT_DIR}/{self._run_id}/info && "
+            f"cp \"$(git rev-parse --absolute-git-dir 2>/dev/null)/info/exclude\" "
+            f"{SHADOW_GIT_DIR}/{self._run_id}/info/exclude 2>/dev/null || true",
+            CHECKPOINT_TIMEOUT_SECONDS,
+        )
+
         # BLOCKER-3: capture the pre-agent tree. The workspace repo's own
         # base_sha cannot serve as a diff base -- the shadow store shares no
         # objects with it, so that sha is unresolvable there. Without this the
         # earliest snapshot already contains the agent's first edits and there
         # is nothing to diff against.
-        baseline, _reason = await self.checkpoint_detailed(BASELINE_REF_SUFFIX)
-        self._baseline_ref = baseline
+        baseline = await self.checkpoint_detailed(BASELINE_REF_SUFFIX)
+        self._baseline_ref = baseline.ref
+        self._baseline_tree = baseline.tree
         return self._state
 
     async def checkpoint(self, turn: int) -> str | None:
         """Write a shadow ref for ``turn``, or ``None`` if skipped."""
-        ref, _reason = await self.checkpoint_detailed(f"turn-{turn}")
-        return ref
+        return (await self.checkpoint_detailed(f"turn-{turn}")).ref
 
-    async def checkpoint_detailed(self, name: str) -> tuple[str | None, str | None]:
-        """Write a shadow ref named ``name``; return ``(ref, skip_reason)``.
+    async def checkpoint_detailed(self, name: str) -> "Checkpoint":
+        """Write a shadow ref named ``name``; return what happened.
 
-        The reason is returned rather than swallowed so the caller can record
-        it. An earlier version claimed skips were "recorded" when they were an
-        in-memory counter and nothing else -- the same shape as a mechanism
-        that never fires behind healthy telemetry.
+        The skip reason is returned rather than swallowed so the caller can
+        record it. An earlier version claimed skips were "recorded" when they
+        were an in-memory counter and nothing else -- the same shape as a
+        mechanism that never fires behind healthy telemetry.
         """
         if not self._active:
-            return None, "inactive"
+            return Checkpoint(skip_reason="inactive")
         if not self._state.usable:
-            return None, "no_base_sha"
+            return Checkpoint(skip_reason="no_base_sha")
         reason = self._skip_reason()
         if reason is not None:
             self._skipped += 1
-            return None, reason
+            return Checkpoint(skip_reason=reason)
 
         ref = f"{self._ref_prefix}/{name}"
         code, _ = await self._run(
@@ -336,13 +410,13 @@ class GitSubstrate:
         )
         if code != 0:
             self._skipped += 1
-            return None, "git_add_failed"
+            return Checkpoint(skip_reason="git_add_failed")
         code, tree = await self._run(
             self._git("write-tree") + " 2>/dev/null", CHECKPOINT_COMMAND_TIMEOUT
         )
         if code != 0 or not tree:
             self._skipped += 1
-            return None, "write_tree_failed"
+            return Checkpoint(skip_reason="write_tree_failed")
         code, commit = await self._run(
             self._git(f'commit-tree {tree} -m "harness {name}"')
             + " 2>/dev/null",
@@ -350,16 +424,16 @@ class GitSubstrate:
         )
         if code != 0 or not commit:
             self._skipped += 1
-            return None, "commit_tree_failed"
+            return Checkpoint(skip_reason="commit_tree_failed")
         code, _ = await self._run(
             self._git(f"update-ref {ref} {commit}") + " 2>/dev/null",
             CHECKPOINT_COMMAND_TIMEOUT,
         )
         if code != 0:
             self._skipped += 1
-            return None, "update_ref_failed"
+            return Checkpoint(skip_reason="update_ref_failed")
         self._checkpoints += 1
-        return ref, None
+        return Checkpoint(ref=ref, tree=tree)
 
     def _skip_reason(self) -> str | None:
         """Why the deadline forbids a checkpoint now, or ``None``.

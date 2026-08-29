@@ -289,3 +289,119 @@ class TestAgentResultCarriesTheStat:
             diff_stat="2 files changed, +10/-7",
         )
         assert result.diff_stat == "2 files changed, +10/-7"
+
+
+class TestAgainstARealShell:
+    """Every other test here execs against a fake sandbox that stores the
+    command string and never runs it. That is the right shape for asserting
+    *which* commands are issued -- and it is blind to whether they work.
+
+    It stayed blind to a real one: ``for-each-ref --format=%(refname)`` is a
+    syntax error in ``sh``, because the parentheses are shell metacharacters.
+    :meth:`ShadowReader._run` turns any failure into ``(1, "")`` and
+    :meth:`turns` turns that into ``[]``, so in every real shell the reader
+    reported "no checkpoints" for a store that was full of them -- while the
+    suite stayed green. These tests run the commands the reader actually
+    builds, through a real shell, against a real shadow store.
+    """
+
+    @pytest.fixture
+    def shadow(self, tmp_path, monkeypatch):
+        """A real bare shadow store holding a baseline and two turns."""
+        import subprocess
+
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "kept.txt").write_text("unchanged\n")
+
+        root = tmp_path / "shadow"
+        root.mkdir()
+        monkeypatch.setattr("harness.repo.SHADOW_GIT_DIR", str(root))
+        git_dir = root / "run1"
+        subprocess.run(["git", "init", "--bare", "-q", str(git_dir)], check=True)
+
+        index = git_dir / "index-agent1"
+
+        def snapshot(ref: str) -> None:
+            env = {"GIT_INDEX_FILE": str(index)}
+            base = [
+                "git", "-c", "user.name=t", "-c", "user.email=t@localhost",
+                f"--git-dir={git_dir}", f"--work-tree={work}",
+            ]
+            subprocess.run(base + ["add", "-A"], check=True, env={**_environ(), **env})
+            tree = subprocess.run(
+                base + ["write-tree"], check=True, capture_output=True,
+                text=True, env={**_environ(), **env},
+            ).stdout.strip()
+            commit = subprocess.run(
+                base + ["commit-tree", tree, "-m", ref], check=True,
+                capture_output=True, text=True, env={**_environ(), **env},
+            ).stdout.strip()
+            subprocess.run(
+                base + ["update-ref", f"refs/harness/agent1/{ref}", commit],
+                check=True, env={**_environ(), **env},
+            )
+
+        snapshot("baseline")
+        snapshot("turn-1")                      # no edits yet
+        (work / "added.py").write_text("x = 1\ny = 2\n")
+        snapshot("turn-2")                      # the first real edit
+        return work
+
+    class _RealShell:
+        """The one method ShadowReader calls, backed by an actual shell.
+
+        Deliberately ``shell=True``: the sandbox contract runs these commands
+        through a shell, and it is the shell that made
+        ``--format=%(refname)`` a syntax error. A shim that used ``exec``
+        directly would tokenize the command itself and reproduce the very
+        blindness these tests exist to remove.
+        """
+
+        def __init__(self, cwd) -> None:
+            self._cwd = cwd
+
+        async def exec(self, command: str, timeout: float = 30.0):
+            import subprocess
+
+            proc = subprocess.run(
+                command, shell=True, cwd=str(self._cwd),
+                capture_output=True, text=True, timeout=timeout,
+            )
+
+            class _Out:
+                exit_code = proc.returncode
+                stdout = proc.stdout or ""
+
+            return _Out()
+
+    def _reader(self, work):
+        return ShadowReader(self._RealShell(work), "run1", "agent1")
+
+    async def test_S202_turns_are_found_through_a_real_shell(self, shadow) -> None:
+        assert await self._reader(shadow).turns() == [1, 2]
+
+    async def test_S202_stat_defaults_to_the_latest_turn(self, shadow) -> None:
+        # stat() with no ref goes through turns(); when that silently returned
+        # [] this reported "no files changed" for a real change.
+        stat = await self._reader(shadow).stat()
+        assert not stat.empty, "the default-ref path found nothing to diff"
+        assert [f.path for f in stat.files] == ["added.py"]
+        assert stat.summary() == "1 file changed, +2/-0"
+
+    async def test_S202_a_turn_that_changed_nothing_diffs_empty(self, shadow) -> None:
+        assert (await self._reader(shadow).stat("refs/harness/agent1/turn-1")).empty
+
+    async def test_S202_resolve_finds_a_real_checkpoint(self, shadow) -> None:
+        resolution = await self._reader(shadow).resolve(2)
+        assert resolution.found and resolution.exact
+
+    async def test_S202_patch_returns_a_real_diff(self, shadow) -> None:
+        patch = await self._reader(shadow).patch()
+        assert "added.py" in patch and "+x = 1" in patch
+
+
+def _environ() -> dict:
+    import os
+
+    return dict(os.environ)

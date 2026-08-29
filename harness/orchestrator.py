@@ -52,10 +52,12 @@ from harness.config import HarnessConfig, PermissionMode
 from harness.context import ContextManager
 from harness.deadline import Deadline
 from harness.diligence import WrittenData
+from harness.environment import probe_environment, setup_budget_for
 from harness.loop import AgentLoop, AgentResult, AskCallable, Budgets
 from harness.memory.store import MemoryStore
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
+from harness.repo import BASELINE_EVENT, GitSubstrate
 from harness.sandbox.base import Sandbox, spill_tool_output
 from harness.sandbox.docker import DockerSandbox
 from harness.sandbox.local import LocalSandbox
@@ -884,6 +886,84 @@ class Orchestrator:
 
     # -- the run engine ------------------------------------------------------
 
+    async def _activate_repo_substrate(
+        self,
+        *,
+        sandbox: Sandbox,
+        run_id: str,
+        agent_id: str,
+        profile: "Profile | None",
+        deadline: Deadline | None,
+        budgets: Budgets,
+        sandbox_owned: bool,
+    ) -> GitSubstrate | None:
+        """Turn on S-201's shadow checkpoints, or return ``None``.
+
+        The two-dimensional capability rule, applied once per run:
+        ``active(c) = profile.enables(c) and environment.affirms(c)``. The
+        profile half is checked **first and cheaply**, before any exec, so a
+        run whose profile never asked for the capability issues zero commands
+        — that is what makes neutrality on the benchmark path (N3/N4)
+        structural rather than merely observed, and it is why this returns
+        early instead of relying on ``probe_environment`` to notice the empty
+        budget.
+
+        The environment half is the one that can say no for real reasons: a
+        workspace that is not a git work tree has nothing to checkpoint, and a
+        container the harness does not own must not be written to at all.
+        ``affirms`` treats *unknown* as no, so a probe that ran out of budget
+        degrades to today's behavior rather than to a guess.
+
+        Failures here disable the substrate; they never fail the run. A lost
+        checkpoint history is a lost convenience, and a run that dies because
+        its optional telemetry could not start would be a worse trade.
+
+        ``allow_dirty=True`` is part of the same trade.
+        :meth:`~harness.repo.GitSubstrate.start` otherwise refuses a work tree
+        with uncommitted changes, on the grounds that the diff would mix the
+        agent's work with changes that were already there — a good default for
+        a caller who can go and commit first, and the wrong one for a run that
+        has already started. The tree's state is available afterwards on
+        ``substrate.state.dirty``; nothing persists it yet, which is S-202's
+        open gap, so today a dirty baseline is knowable and not reported.
+        """
+        if profile is None or not profile.enables("git_substrate"):
+            return None
+        budget = setup_budget_for(profile, budgets.wall_clock_seconds)
+        try:
+            environment = await probe_environment(
+                sandbox, budget, sandbox_owned=sandbox_owned
+            )
+        except Exception:  # noqa: BLE001 - optional telemetry, never fatal
+            return None
+        if not environment.affirms("git_substrate"):
+            return None
+        substrate = GitSubstrate(
+            sandbox,
+            run_id,
+            agent_id,
+            active=True,
+            deadline=deadline,
+            # The run proceeds on a dirty tree; `RepoState.dirty` records it
+            # so a consumer of the diff knows the baseline was not clean.
+            allow_dirty=True,
+        )
+        try:
+            await substrate.start()
+        except Exception:  # noqa: BLE001 - see docstring
+            return None
+        # Activation is recorded, not merely performed. A run whose agent makes
+        # no tool calls writes no checkpoints at all, which is indistinguishable
+        # in the log from a run where the capability never switched on -- and a
+        # consumer that cannot tell those apart will report one as the other.
+        self.store.append_event(
+            agent_id,
+            BASELINE_EVENT,
+            {"spec": "S-201", "tree": substrate.baseline_tree,
+             "ref": substrate.baseline_ref},
+        )
+        return substrate
+
     async def _execute(
         self,
         *,
@@ -1039,6 +1119,7 @@ class Orchestrator:
             agent_sandbox: Sandbox,
             declared_command: str | None = None,
             written_data: WrittenData | None = None,
+            repo: GitSubstrate | None = None,
         ) -> AgentLoop:
             loop = AgentLoop(
                 adapter=adapter,
@@ -1063,6 +1144,9 @@ class Orchestrator:
                 # The same map this agent's declare_verification accessor
                 # returns, so the lint sees what the loop observed.
                 written_data=written_data,
+                # S-201's shadow checkpoints. None for every subagent and for
+                # every run whose profile did not ask for the capability.
+                repo=repo,
             )
             self._live_loops.append(loop)
             return loop
@@ -1221,18 +1305,38 @@ class Orchestrator:
             lead_prompt, replayed_declaration = self._replay_lead_transcript(
                 lead_agent_id, lead_context, skills, lead_prompt
             )
-        lead_loop = build_loop(
-            lead_adapter,
-            lead_registry,
-            lead_agent_id,
-            lead_context,
-            sandbox,
-            declared_command=replayed_declaration,
-            written_data=lead_written,
-        )
-
         try:
             await sandbox.start()
+            # S-201/S-005 activation, the run's first and only one. It sits
+            # here, rather than beside the other lead-agent construction
+            # above, because both of its neighbours are load-bearing: the
+            # probe needs a *started* sandbox, and the baseline snapshot must
+            # predate the agent's first edit. The lead loop is therefore built
+            # after it, so the substrate arrives as a constructor argument
+            # instead of being attached to a live loop afterwards.
+            #
+            # Returns None without issuing a single command unless the profile
+            # named the capability, which is what keeps the benchmark path
+            # free of git -- see `_activate_repo_substrate`.
+            lead_repo = await self._activate_repo_substrate(
+                sandbox=sandbox,
+                run_id=run_id,
+                agent_id=lead_agent_id,
+                profile=profile,
+                deadline=deadline,
+                budgets=budgets,
+                sandbox_owned=sandbox_override is None,
+            )
+            lead_loop = build_loop(
+                lead_adapter,
+                lead_registry,
+                lead_agent_id,
+                lead_context,
+                sandbox,
+                declared_command=replayed_declaration,
+                written_data=lead_written,
+                repo=lead_repo,
+            )
             result = await lead_loop.run(lead_prompt)
         except BaseException:
             self.store.set_run_status(run_id, "error")

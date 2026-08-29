@@ -345,7 +345,12 @@ class TestLoopWiring:
         real_init = AgentLoop.__init__
 
         def patched(self, *args, **kwargs):
-            kwargs.setdefault("repo", substrate)
+            # Assignment, not setdefault: the orchestrator now passes `repo`
+            # explicitly (None unless the profile asked for the capability),
+            # so a default would never win. These two tests deliberately
+            # bypass activation to exercise the loop-to-event wiring alone;
+            # activation itself is covered by TestProductionActivation.
+            kwargs["repo"] = substrate
             real_init(self, *args, **kwargs)
 
         monkeypatch.setattr(AgentLoop, "__init__", patched)
@@ -394,7 +399,12 @@ class TestLoopWiring:
         real_init = AgentLoop.__init__
 
         def patched(self, *args, **kwargs):
-            kwargs.setdefault("repo", substrate)
+            # Assignment, not setdefault: the orchestrator now passes `repo`
+            # explicitly (None unless the profile asked for the capability),
+            # so a default would never win. These two tests deliberately
+            # bypass activation to exercise the loop-to-event wiring alone;
+            # activation itself is covered by TestProductionActivation.
+            kwargs["repo"] = substrate
             real_init(self, *args, **kwargs)
 
         monkeypatch.setattr(AgentLoop, "__init__", patched)
@@ -598,4 +608,301 @@ class TestConcurrentAgentsDoNotCollide:
         child = GitSubstrate(_Sandbox(_clean_repo()), "run1", "child", active=True)
         assert lead._git("x").split("--git-dir=")[1].split()[0] == (
             child._git("x").split("--git-dir=")[1].split()[0]
+        )
+
+
+class TestProductionActivation:
+    """S-201 amendment: the orchestrator is the substrate's first real caller.
+
+    Until this existed, ``GitSubstrate`` was constructed nowhere but in tests.
+    A feature with no production caller is the shape this project keeps
+    getting wrong -- a mechanism that never fires, behind telemetry that looks
+    healthy because the tests exercising it pass. These tests assert the
+    mechanism fires on the repo path and, just as importantly, that it stays
+    completely silent on the benchmark path.
+    """
+
+    @pytest.fixture
+    def shadow(self, tmp_path, monkeypatch):
+        """Redirect the shadow store out of the real /tmp/.harness-git."""
+        root = tmp_path / "shadow"
+        monkeypatch.setattr("harness.repo.SHADOW_GIT_DIR", str(root))
+        return root
+
+    @staticmethod
+    def _git_repo(path):
+        import subprocess
+
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "seed.txt").write_text("seed\n")
+        for args in (
+            ["init", "-q"],
+            ["config", "user.name", "t"],
+            ["config", "user.email", "t@localhost"],
+            ["add", "-A"],
+            ["commit", "-q", "-m", "seed"],
+        ):
+            subprocess.run(["git", "-C", str(path), *args], check=True,
+                           capture_output=True)
+        return path
+
+    async def test_S201_repo_profile_in_a_git_workspace_checkpoints(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # The whole chain, end to end and unmocked: CODING_REPO enables the
+        # capability, probe_environment affirms it (real git work tree, our
+        # own sandbox), the substrate starts, and the loop writes refs.
+        workspace = self._git_repo(tmp_path / "ws")
+        run_id, result = await orchestrator.run_task(
+            GOAL,
+            "fake-model",
+            adapter_override=FakeAdapter(_write_then_finish()),
+            workspace=workspace,
+            profile=CODING_REPO,
+        )
+        assert result.status == "completed"
+        kinds = [
+            event.kind
+            for event in orchestrator.store.load_events(
+                orchestrator.store.list_agents(run_id)[0].id
+            )
+        ]
+        assert CHECKPOINT_EVENT in kinds, (
+            "the repo profile ran in a real git work tree and wrote no "
+            f"checkpoint; got {sorted(set(kinds))}"
+        )
+        assert (shadow / run_id).is_dir(), "no shadow store was created"
+
+    async def test_S201_checkpoint_refs_are_readable_afterwards(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # A checkpoint that cannot be read back is not a checkpoint. This is
+        # the property S-401's first-edit metric depends on.
+        import subprocess
+
+        workspace = self._git_repo(tmp_path / "ws")
+        run_id, _ = await orchestrator.run_task(
+            GOAL,
+            "fake-model",
+            adapter_override=FakeAdapter(_write_then_finish()),
+            workspace=workspace,
+            profile=CODING_REPO,
+        )
+        agent_id = orchestrator.store.list_agents(run_id)[0].id
+        refs = subprocess.run(
+            ["git", f"--git-dir={shadow / run_id}", "for-each-ref",
+             "--format=%(refname)", f"refs/harness/{agent_id}"],
+            capture_output=True, text=True,
+        ).stdout.split()
+        assert f"refs/harness/{agent_id}/{BASELINE_REF_SUFFIX}" in refs
+        assert any(r.endswith("/turn-1") for r in refs), refs
+
+        # And the baseline really is pre-agent: hello.txt appears only after.
+        diff = subprocess.run(
+            ["git", f"--git-dir={shadow / run_id}", "diff", "--name-only",
+             f"refs/harness/{agent_id}/{BASELINE_REF_SUFFIX}",
+             f"refs/harness/{agent_id}/turn-1"],
+            capture_output=True, text=True,
+        ).stdout.split()
+        assert diff == ["hello.txt"], diff
+
+    async def test_S201_coding_profile_runs_no_git_at_all(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # N3/N4 at the integration level: even in a git work tree, where the
+        # environment *would* affirm, the default profile names no capability
+        # and so not one git command is issued. The assertion is on the
+        # commands actually executed, not on the absence of events -- a
+        # substrate that probed and then declined would produce the same
+        # events and is exactly what this must catch.
+        workspace = self._git_repo(tmp_path / "ws")
+        seen: list[str] = []
+        from harness.sandbox.local import LocalSandbox
+
+        real_exec = LocalSandbox.exec
+
+        async def spy(self, command, **kwargs):
+            seen.append(command)
+            return await real_exec(self, command, **kwargs)
+
+        import pytest as _pytest  # noqa: F401  (monkeypatch via fixture below)
+        LocalSandbox.exec = spy
+        try:
+            _, result = await orchestrator.run_task(
+                GOAL,
+                "fake-model",
+                adapter_override=FakeAdapter(_write_then_finish()),
+                workspace=workspace,
+                profile=CODING,
+            )
+        finally:
+            LocalSandbox.exec = real_exec
+        assert result.status == "completed"
+        git_commands = [c for c in seen if "git" in c]
+        assert git_commands == [], git_commands
+        assert not shadow.exists(), "a shadow store was created on the CODING path"
+
+    async def test_S201_non_git_workspace_declines_without_failing_the_run(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # The environment half saying no. The run must still succeed: the
+        # substrate is telemetry, and telemetry that can fail a task would be
+        # a worse trade than no telemetry.
+        workspace = tmp_path / "plain"
+        workspace.mkdir()
+        run_id, result = await orchestrator.run_task(
+            GOAL,
+            "fake-model",
+            adapter_override=FakeAdapter(_write_then_finish()),
+            workspace=workspace,
+            profile=CODING_REPO,
+        )
+        assert result.status == "completed"
+        kinds = {
+            event.kind
+            for event in orchestrator.store.load_events(
+                orchestrator.store.list_agents(run_id)[0].id
+            )
+        }
+        assert CHECKPOINT_EVENT not in kinds
+        assert CHECKPOINT_SKIPPED_EVENT not in kinds
+
+    async def test_S201_a_substrate_that_fails_to_start_does_not_fail_the_run(
+        self, orchestrator, tmp_path, shadow, monkeypatch
+    ) -> None:
+        async def boom(self):
+            raise RuntimeError("shadow store unavailable")
+
+        monkeypatch.setattr(GitSubstrate, "start", boom)
+        workspace = self._git_repo(tmp_path / "ws")
+        _, result = await orchestrator.run_task(
+            GOAL,
+            "fake-model",
+            adapter_override=FakeAdapter(_write_then_finish()),
+            workspace=workspace,
+            profile=CODING_REPO,
+        )
+        assert result.status == "completed"
+
+    async def test_S201_a_dirty_tree_does_not_abort_a_repo_run(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # GitSubstrate.start raises DirtyWorktreeError by default. The
+        # orchestrator passes allow_dirty=True deliberately: a real repository
+        # is often dirty, and refusing to run would be a worse answer than
+        # running and recording that the baseline was not clean.
+        workspace = self._git_repo(tmp_path / "ws")
+        (workspace / "already-here.txt").write_text("uncommitted\n")
+        run_id, result = await orchestrator.run_task(
+            GOAL,
+            "fake-model",
+            adapter_override=FakeAdapter(_write_then_finish()),
+            workspace=workspace,
+            profile=CODING_REPO,
+        )
+        assert result.status == "completed"
+        kinds = {
+            event.kind
+            for event in orchestrator.store.load_events(
+                orchestrator.store.list_agents(run_id)[0].id
+            )
+        }
+        assert CHECKPOINT_EVENT in kinds
+
+    async def test_S201_subagents_get_no_substrate(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # Activation is lead-only for now (a known gap, recorded in the S-401
+        # spec). Pinned behaviourally so that turning it on later is a
+        # deliberate change with a failing test attached: subagent checkpoints
+        # would share the run's object store, and while S-201 namespaces the
+        # index and refs per agent, nothing has yet exercised two agents
+        # checkpointing concurrently.
+        lead = FakeAdapter(
+            [
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[
+                            ToolCall(id="s1", name="spawn_agent",
+                                     arguments={"prompt": "Write child.txt."})
+                        ],
+                    ),
+                    usage=Usage(),
+                    stop_reason=StopReason.TOOL_USE,
+                ),
+                ModelResponse(
+                    message=Message(
+                        role=Role.ASSISTANT,
+                        tool_calls=[ToolCall(id="a1", name="await_agents",
+                                             arguments={})],
+                    ),
+                    usage=Usage(),
+                    stop_reason=StopReason.TOOL_USE,
+                ),
+                ModelResponse(
+                    message=Message(role=Role.ASSISTANT, content=CLEAN_FINISH),
+                    usage=Usage(),
+                    stop_reason=StopReason.END_TURN,
+                ),
+            ]
+        )
+        child = FakeAdapter(_write_then_finish())
+        adapters = iter([lead, child])
+        workspace = self._git_repo(tmp_path / "ws")
+        _, result = await orchestrator.run_task(
+            "Fan out the work.",
+            "fake-model",
+            adapter_override=lambda: next(adapters),
+            workspace=workspace,
+            profile=CODING_REPO,
+        )
+        assert result.status == "completed"
+        loops = orchestrator._live_loops
+        assert len(loops) == 2, [l.agent_id for l in loops]
+        with_repo = [l for l in loops if l.repo is not None]
+        assert len(with_repo) == 1, (
+            "exactly one loop -- the lead -- should hold a substrate; "
+            f"{len(with_repo)} do"
+        )
+
+    async def test_S201_a_profile_without_the_capability_never_probes(
+        self, orchestrator, tmp_path, shadow
+    ) -> None:
+        # The profile gate is load-bearing, not decorative. A profile that
+        # asks for *other* capabilities gets a non-zero setup budget, so the
+        # probe would run and spend it -- issuing git commands on a path that
+        # never had any use for the answer. Deleting the gate passes every
+        # other test in this file, because CODING's empty capability set makes
+        # the budget zero on its own; this is the case that notices.
+        from dataclasses import replace
+        from harness.sandbox.local import LocalSandbox
+
+        other = replace(CODING_REPO, capabilities=frozenset({"structured_search"}))
+        assert not other.enables("git_substrate")
+
+        workspace = self._git_repo(tmp_path / "ws")
+        seen: list[str] = []
+        real_exec = LocalSandbox.exec
+
+        async def spy(self, command, **kwargs):
+            seen.append(command)
+            return await real_exec(self, command, **kwargs)
+
+        LocalSandbox.exec = spy
+        try:
+            _, result = await orchestrator.run_task(
+                GOAL,
+                "fake-model",
+                adapter_override=FakeAdapter(_write_then_finish()),
+                workspace=workspace,
+                profile=other,
+            )
+        finally:
+            LocalSandbox.exec = real_exec
+        assert result.status == "completed"
+        git_commands = [c for c in seen if "git" in c]
+        assert git_commands == [], (
+            "a profile that did not ask for git_substrate issued git "
+            f"commands: {git_commands}"
         )

@@ -1162,14 +1162,27 @@ class AgentLoop:
                 # AND the environment affirms it, so on the CODING path this
                 # returns before issuing any command -- N3 and N4 hold.
                 if self.repo is not None:
-                    ref, skip_reason = await self.repo.checkpoint_detailed(
+                    checkpoint = await self.repo.checkpoint_detailed(
                         f"turn-{turns}"
                     )
-                    if ref is not None:
+                    skip_reason = checkpoint.skip_reason
+                    if checkpoint.written:
+                        # The tree hash goes in the event, not just the ref.
+                        # A ref is only readable while the shadow store
+                        # exists, and that store lives inside the sandbox --
+                        # under Docker it dies with the container, so a
+                        # consumer asking "which turn first changed the tree?"
+                        # after the run has nothing left to read. The hash is
+                        # a value and survives teardown on every backend.
                         self.store.append_event(
                             self.agent_id,
                             CHECKPOINT_EVENT,
-                            {"spec": "S-201", "turn": turns, "ref": ref},
+                            {
+                                "spec": "S-201",
+                                "turn": turns,
+                                "ref": checkpoint.ref,
+                                "tree": checkpoint.tree,
+                            },
                         )
                     elif skip_reason not in (None, "inactive"):
                         # A skip is recorded, not merely counted: a checkpoint

@@ -136,6 +136,21 @@ refused to start on all of them. That is not the condition the check guards:
 there is no committed state for the agent's work to be confused with, and the
 baseline captures the starting tree regardless.
 
+## Production activation (added by S-401)
+Until S-401, `GitSubstrate` was constructed nowhere but in tests: the feature
+had no caller. `Orchestrator._activate_repo_substrate` is now the one, applying
+`active(c) = profile.enables(c) ∧ environment.affirms(c)` once per run, after
+`sandbox.start()` (the probe needs a live sandbox) and before the lead loop is
+built (the baseline snapshot must predate the agent's first edit). Neutrality
+is asserted on the commands actually executed, in
+`tests/test_repo.py::TestProductionActivation`.
+
+Two decisions worth naming: `allow_dirty=True`, because aborting is the right
+default for a caller who can go and commit first and the wrong one for a run
+already under way — the tree's state lands on `state.dirty`, which nothing yet
+persists; and failures are swallowed, because a run that died because its
+optional telemetry could not start would be a bad trade.
+
 ## Known gaps
 Exhaustive as far as is known; anything missing is a defect in this list.
 
@@ -143,13 +158,20 @@ Exhaustive as far as is known; anything missing is a defect in this list.
   branch, so a turn with no tool calls writes no ref. S-202's `rewind <turn>`
   will meet missing refs.
 
-- **Nothing constructs a `GitSubstrate` yet.** `AgentLoop` accepts and calls
-  one, but the orchestrator never builds it, so no run has a substrate. Wiring
-  that requires calling the S-005 probe during a run, which is a behavior
-  change for non-`CODING` profiles and belongs with S-202 (`harness diff`),
-  the first spec that needs the checkpoints to exist. The consequence is real:
-  the substrate has never run against a live git repository, only against a
-  scripted sandbox.
+- ~~**Nothing constructs a `GitSubstrate` yet.**~~ **Closed by S-401** — see
+  *Production activation* above. The consequence this gap predicted was real:
+  the substrate had never run against a live git repository, and the first time
+  it did, S-202's reader turned out not to work in a shell at all.
+- **The objects do not survive a Docker run.** `/tmp/.harness-git` is inside
+  the sandbox, so under `DockerSandbox` the store is destroyed at teardown.
+  S-401's amendment moved the *facts a consumer needs* out of the store and
+  into the event log — `Checkpoint` carries its `write-tree` hash, the
+  `repo_checkpoint` event records it, and `repo_baseline` records activation
+  and the pre-agent tree — so "which turn changed the tree" is now answerable
+  on any backend. The **objects** are still gone, which means S-202's patch and
+  `rewind` remain LocalSandbox-only. A host-side mount would fix that at the
+  cost of giving the agent a writable host directory outside its workspace;
+  exporting a bundle before teardown would not.
 - `RepoState` is returned but not persisted to the run row, so the contract's
   "record on the run" is half-met — the state is available to the caller and
   written nowhere. S-202 owns the run-row column, since it is the spec that

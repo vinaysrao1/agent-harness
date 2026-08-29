@@ -1,15 +1,14 @@
 """Suite definition and the held-out split (S-401).
 
-A suite is a repository plus an ordered list of revisions. Everything else is
-derived, so the same inputs always produce the same suite -- no sampling, no
-clock, no network.
+A suite is a repository, an ordered list of revisions, and the commands used to
+grade them. Everything else is derived, so the same inputs always produce the
+same suite -- no sampling, no clock, no network.
 
-The held-out split exists because the plan's eval-gated promotion (§10.3 B6)
-is meaningless without one: a change tuned against the tasks it is then scored
-on will look like an improvement whether or not it is. The split is by a hash
-of the task id, so it is stable as the suite grows -- a task never migrates
-between halves when new tasks are added, which a modulo-of-index split would
-allow.
+The held-out split exists because eval-gated promotion is meaningless without
+one: a change tuned against the tasks it is then scored on will look like an
+improvement whether or not it is. The split is by a hash of the task id, so it
+is stable as the suite grows -- a task never migrates between halves when new
+tasks are added, which a modulo-of-index split would allow.
 """
 
 from __future__ import annotations
@@ -19,11 +18,41 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["Suite", "HELDOUT_FRACTION", "is_heldout"]
+__all__ = [
+    "Suite",
+    "HELDOUT_FRACTION",
+    "is_heldout",
+    "heldout_score",
+    "SuiteError",
+]
+
+
+class SuiteError(ValueError):
+    """A suite file is missing something the runner needs."""
+
 
 #: Fraction of tasks reserved. A third is small enough to leave a usable
 #: development set and large enough that a held-out result is not one task.
 HELDOUT_FRACTION = 1 / 3
+
+#: Size of the hash space the first four digest bytes are drawn from, so the
+#: score lands in ``[0, 1)``. ``0xFFFFFFFF`` (one less) would put the maximum
+#: at exactly 1.0 and leave that one id outside a ``fraction=1.0`` set that
+#: should contain everything. That is a 2^-32 event and will never be seen; it
+#: is written correctly anyway, and `heldout_score` exists so the choice is
+#: pinned by a test rather than asserted in a comment.
+_HASH_SPACE = 1 << 32
+
+
+def heldout_score(task_id: str) -> float:
+    """Where ``task_id`` sits in ``[0, 1)``. Stable across processes and runs.
+
+    Exposed rather than inlined because it is the whole split: a change to it
+    silently reassigns tasks between the half you tune on and the half you
+    score on, which is the one thing the split exists to prevent.
+    """
+    digest = hashlib.sha256(task_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") / _HASH_SPACE
 
 
 def is_heldout(task_id: str, fraction: float = HELDOUT_FRACTION) -> bool:
@@ -33,8 +62,7 @@ def is_heldout(task_id: str, fraction: float = HELDOUT_FRACTION) -> bool:
     suite grows, which would silently move tasks you had already tuned against
     into the held-out half and destroy the guarantee it exists to provide.
     """
-    digest = hashlib.sha256(task_id.encode("utf-8")).digest()
-    return (int.from_bytes(digest[:4], "big") / 0xFFFFFFFF) < fraction
+    return heldout_score(task_id) < fraction
 
 
 @dataclass(frozen=True)
@@ -44,31 +72,45 @@ class Suite:
     name: str
     repo: str
     revs: tuple[str, ...]
+    #: Command that grades the task's own tests. Must fail at the base state
+    #: and pass at the head state, or :func:`~harness.eval.pr_replay.validate`
+    #: rejects the task.
     test_command: str
+    #: Optional command running the *rest* of the suite, for regression
+    #: counting. Absent means regressions are reported as **not measured**
+    #: rather than as zero.
+    regression_command: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "Suite":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SuiteError(f"could not read suite {path}: {exc}") from exc
+        missing = [k for k in ("name", "repo", "revs", "test_command") if k not in data]
+        if missing:
+            raise SuiteError(f"suite {path} is missing: {', '.join(missing)}")
+        if not isinstance(data["revs"], list) or not data["revs"]:
+            raise SuiteError(f"suite {path} lists no revisions")
         return cls(
             name=data["name"],
             repo=data["repo"],
             revs=tuple(data["revs"]),
             test_command=data["test_command"],
+            regression_command=data.get("regression_command"),
         )
 
     def save(self, path: Path) -> None:
+        payload = {
+            "name": self.name,
+            "repo": self.repo,
+            "revs": list(self.revs),
+            "test_command": self.test_command,
+        }
+        if self.regression_command is not None:
+            payload["regression_command"] = self.regression_command
         Path(path).write_text(
-            json.dumps(
-                {
-                    "name": self.name,
-                    "repo": self.repo,
-                    "revs": list(self.revs),
-                    "test_command": self.test_command,
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
         )
 
     def split(self, task_ids: list[str]) -> tuple[list[str], list[str]]:

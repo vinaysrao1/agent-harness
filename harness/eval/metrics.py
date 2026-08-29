@@ -1,39 +1,50 @@
 """Metrics for a PR-replay run (S-401).
 
-The contract names five: pass rate, tokens per task, turns to first edit, diff
-precision, and regression count. Two of them are the ones that make this eval
-worth having over a pass/fail number.
+Five numbers, chosen because pass rate alone cannot see the two ways an agent
+"succeeds" badly.
 
 **Diff precision** asks whether the agent changed *the files the change
 touched*, not merely enough files to go green. An agent that rewrites twelve
-files to fix one has not done the task well even if the tests pass, and a
-pass-rate-only metric cannot say so.
+files to fix one has not done the task well even if the tests pass.
 
-**Regression count** asks what else it broke. A change that makes its own
-tests pass by breaking three others is a net loss that pass rate scores as a
-win.
+**Regression count** asks what else it broke. A change that makes its own tests
+pass by breaking three others is a net loss that pass rate scores as a win.
+
+Two distinctions this module refuses to blur, both because collapsing them
+would let a broken measurement read as a healthy one:
+
+*Not measured* is not zero. ``regressions=None`` means no regression command
+was configured; reporting that as ``0`` would claim a clean bill of health
+nobody checked for. Same for ``turns_to_first_edit``: "never edited" and "we
+had no telemetry to tell" are different facts.
+
+*A tampered pass is not a pass.* The tests live in the agent's own writable
+tree and deleting them is a winning move under most runners. An outcome that
+is both ``passed`` and ``tampered`` is rejected at construction rather than
+filtered downstream, so no code path can produce one and forget to check.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-__all__ = ["TaskOutcome", "SuiteReport", "diff_precision"]
+__all__ = ["TaskOutcome", "SuiteReport", "diff_precision", "TamperedPassError"]
 
 
-def diff_precision(
-    touched: set[str], reference: set[str]
-) -> tuple[float, float]:
+class TamperedPassError(ValueError):
+    """A trial claimed a pass while having modified the grader."""
+
+
+def diff_precision(touched: set[str], reference: set[str]) -> tuple[float, float]:
     """``(precision, recall)`` of the agent's file set against the change's.
 
     Precision falls when the agent touched files the change did not; recall
     falls when it missed files the change did. Both are reported because they
     fail in opposite directions and a single blended number would hide which.
-    Empty reference yields ``(0.0, 0.0)`` rather than a misleading 1.0.
+    An empty reference or an empty touched set yields ``(0.0, 0.0)`` rather
+    than a vacuous 1.0.
     """
-    if not reference:
-        return 0.0, 0.0
-    if not touched:
+    if not reference or not touched:
         return 0.0, 0.0
     hit = len(touched & reference)
     return hit / len(touched), hit / len(reference)
@@ -47,12 +58,33 @@ class TaskOutcome:
     passed: bool
     tokens: int = 0
     turns: int = 0
+    #: Turn number of the first change to the work tree, ``None`` if none
+    #: happened. Meaningful only when :attr:`first_edit_measured` is True.
     turns_to_first_edit: int | None = None
+    #: Whether the substrate telemetry needed for the above was available.
+    #: False means "unknown", which :class:`SuiteReport` keeps out of both
+    #: the mean and the never-edited count.
+    first_edit_measured: bool = False
     files_touched: frozenset[str] = frozenset()
     reference_files: frozenset[str] = frozenset()
-    regressions: int = 0
+    #: Tests broken outside the task's own, or ``None`` when no regression
+    #: command was configured. ``None`` is not zero.
+    regressions: int | None = None
+    #: The agent modified, deleted or disabled the grader.
+    tampered: bool = False
     refused: bool = False
     errored: bool = False
+
+    def __post_init__(self) -> None:
+        if self.passed and self.tampered:
+            raise TamperedPassError(
+                f"{self.task_id}: a trial that modified the grader cannot be "
+                "scored as a pass; the runner must set passed=False"
+            )
+
+    @property
+    def edited(self) -> bool:
+        return bool(self.files_touched)
 
     @property
     def precision(self) -> float:
@@ -65,11 +97,17 @@ class TaskOutcome:
 
 @dataclass
 class SuiteReport:
-    """Aggregate over N tasks × K trials."""
+    """Aggregate over N tasks x K trials.
+
+    Every rate here carries its denominator as a sibling property, because a
+    mean over a silently-filtered subset is how a metric stops measuring what
+    its name says without anything looking wrong.
+    """
 
     outcomes: list[TaskOutcome] = field(default_factory=list)
 
-    def _mean(self, values: list[float]) -> float:
+    @staticmethod
+    def _mean(values: list[float]) -> float:
         return sum(values) / len(values) if values else 0.0
 
     @property
@@ -81,32 +119,89 @@ class SuiteReport:
         return self._mean([1.0 if o.passed else 0.0 for o in self.outcomes])
 
     @property
+    def token_trials(self) -> int:
+        """Trials the token mean is taken over: those that actually ran.
+
+        An errored trial is constructed with ``tokens=0`` because the run
+        never returned a usage figure -- not because it was free. A trial that
+        burned 400k tokens and then hit a transport error would otherwise pull
+        the mean toward zero, making a flaky provider look like an efficiency
+        gain.
+        """
+        return sum(1 for o in self.outcomes if not o.errored)
+
+    @property
     def tokens_per_task(self) -> float:
-        return self._mean([float(o.tokens) for o in self.outcomes])
+        return self._mean([float(o.tokens) for o in self.outcomes if not o.errored])
+
+    @property
+    def mean_turns(self) -> float:
+        return self._mean([float(o.turns) for o in self.outcomes if not o.errored])
+
+    # -- first edit ------------------------------------------------------
+
+    @property
+    def first_edit_trials(self) -> int:
+        """Trials where first-edit timing was actually observed."""
+        return sum(1 for o in self.outcomes if o.first_edit_measured)
 
     @property
     def mean_turns_to_first_edit(self) -> float:
-        # Only over trials that edited at all: averaging in "never edited" as
-        # zero would make a paralysed agent look decisive.
-        seen = [float(o.turns_to_first_edit) for o in self.outcomes
-                if o.turns_to_first_edit is not None]
+        # Only over measured trials that edited at all: averaging in "never
+        # edited" as zero would make a paralysed agent look decisive, and
+        # averaging in "not measured" would invent data.
+        seen = [
+            float(o.turns_to_first_edit)
+            for o in self.outcomes
+            if o.first_edit_measured and o.turns_to_first_edit is not None
+        ]
         return self._mean(seen)
 
     @property
     def never_edited(self) -> int:
-        return sum(1 for o in self.outcomes if o.turns_to_first_edit is None)
+        """Measured trials in which the work tree never changed."""
+        return sum(
+            1
+            for o in self.outcomes
+            if o.first_edit_measured and o.turns_to_first_edit is None
+        )
+
+    # -- diff shape ------------------------------------------------------
+
+    @property
+    def precision_trials(self) -> int:
+        """Trials the precision/recall means are taken over.
+
+        Precision is undefined for a trial that touched nothing (0/0), so
+        those are excluded -- and the count is published so the mean can
+        never be read as "the agent was precise" when it mostly did nothing.
+        :attr:`never_edited` is the other half of that picture.
+        """
+        return sum(1 for o in self.outcomes if o.edited)
 
     @property
     def mean_precision(self) -> float:
-        return self._mean([o.precision for o in self.outcomes if o.files_touched])
+        return self._mean([o.precision for o in self.outcomes if o.edited])
 
     @property
     def mean_recall(self) -> float:
-        return self._mean([o.recall for o in self.outcomes if o.files_touched])
+        return self._mean([o.recall for o in self.outcomes if o.edited])
+
+    # -- damage ----------------------------------------------------------
 
     @property
-    def regressions(self) -> int:
-        return sum(o.regressions for o in self.outcomes)
+    def regression_trials(self) -> int:
+        return sum(1 for o in self.outcomes if o.regressions is not None)
+
+    @property
+    def regressions(self) -> int | None:
+        """Total regressions, or ``None`` if no trial measured them."""
+        measured = [o.regressions for o in self.outcomes if o.regressions is not None]
+        return sum(measured) if measured else None
+
+    @property
+    def tampered(self) -> int:
+        return sum(1 for o in self.outcomes if o.tampered)
 
     @property
     def refusals(self) -> int:
@@ -119,16 +214,32 @@ class SuiteReport:
     def render(self) -> str:
         if not self.outcomes:
             return "no trials"
+        regressions = (
+            "not measured"
+            if self.regressions is None
+            else f"{self.regressions} (over {self.regression_trials}/{self.trials} trials)"
+        )
+        first_edit = (
+            "not measured"
+            if self.first_edit_trials == 0
+            else (
+                f"{self.mean_turns_to_first_edit:.1f}"
+                f"  ({self.never_edited} never edited, "
+                f"{self.first_edit_trials}/{self.trials} measured)"
+            )
+        )
         return "\n".join(
             [
                 f"trials              : {self.trials}",
                 f"pass rate           : {self.pass_rate:.1%}",
-                f"tokens / task       : {self.tokens_per_task:,.0f}",
-                f"turns to first edit : {self.mean_turns_to_first_edit:.1f}"
-                f"  ({self.never_edited} never edited)",
-                f"diff precision      : {self.mean_precision:.1%}",
+                f"tokens / task       : {self.tokens_per_task:,.0f}"
+                f"  (over {self.token_trials}/{self.trials} trials that ran)",
+                f"turns to first edit : {first_edit}",
+                f"diff precision      : {self.mean_precision:.1%}"
+                f"  (over {self.precision_trials}/{self.trials} trials that edited)",
                 f"diff recall         : {self.mean_recall:.1%}",
-                f"regressions         : {self.regressions}",
+                f"regressions         : {regressions}",
+                f"tampered            : {self.tampered}",
                 f"refusals            : {self.refusals}",
                 f"errors              : {self.errors}",
             ]

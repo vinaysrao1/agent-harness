@@ -18,6 +18,7 @@ import pytest
 
 from harness.adapters.fake import FakeAdapter
 from harness.cli import main, make_ask
+from tests.test_eval_pr_replay import host_run
 from harness.config import HarnessConfig, load_config
 from harness.loop import Budgets
 from harness.orchestrator import Orchestrator
@@ -375,3 +376,245 @@ def test_resume_continues_paused_run(
 
     with RunStore(home / "state.db") as store:
         assert store.get_run(run_id).status == "completed"
+
+
+# -- harness eval (S-401) -----------------------------------------------------
+
+
+class TestEvalCommand:
+    """The command exists to make the eval runnable; what it must not do is
+    print a pass rate over a suite that quietly shrank."""
+
+    def _suite_file(self, tmp_path, **overrides):
+        import json
+
+        payload = {
+            "name": "toy",
+            "repo": str(tmp_path / "repo"),
+            "revs": ["HEAD"],
+            "test_command": "true",
+        }
+        payload.update(overrides)
+        path = tmp_path / "suite.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_S401_a_malformed_suite_exits_cleanly(self, tmp_path, capsys) -> None:
+        from harness.cli import main
+
+        bad = tmp_path / "suite.json"
+        bad.write_text('{"name": "toy"}')
+        code = main(["eval", str(bad), "--model", "fake-model"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert err.startswith("error: ") and "Traceback" not in err
+
+    def test_S401_a_missing_suite_exits_cleanly(self, tmp_path, capsys) -> None:
+        from harness.cli import main
+
+        code = main(["eval", str(tmp_path / "nope.json"), "--model", "fake-model"])
+        assert code == 2
+        assert capsys.readouterr().err.startswith("error: ")
+
+    def test_S401_revisions_that_produced_no_task_are_reported(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        # generate() skips a rev it cannot resolve. Silently, the suite shrinks
+        # and still prints a pass rate.
+        import subprocess
+
+        from harness.cli import main
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (["init", "-q"], ["config", "user.name", "t"],
+                     ["config", "user.email", "t@l"]):
+            subprocess.run(["git", "-C", str(repo), *args], check=True,
+                           capture_output=True)
+        (repo / "a.txt").write_text("a\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "root"],
+                       check=True, capture_output=True)
+
+        suite = self._suite_file(tmp_path, revs=["HEAD", "does-not-exist"])
+        monkeypatch.setenv("HARNESS_HOME", str(tmp_path / "home"))
+        code = main(["eval", str(suite), "--model", "fake-model", "--split", "all"])
+        out = capsys.readouterr().out
+        assert "2 revision(s) produced no task" in out, out
+        assert code == 2  # nothing left to run, and it says so
+
+    def test_S401_eval_runs_a_suite_end_to_end(
+        self, home: Path, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        """Acceptance (6): generate, validate, run, grade, report -- through
+        the command a person would actually type."""
+        import json
+        import subprocess
+        import sys as _sys
+
+        from harness.repo import SHADOW_GIT_DIR  # noqa: F401  (patched below)
+
+        monkeypatch.setattr("harness.repo.SHADOW_GIT_DIR", str(tmp_path / "shadow"))
+
+        repo = tmp_path / "repo"
+        (repo / "tests").mkdir(parents=True)
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(repo), *args], check=True,
+                           capture_output=True)
+
+        (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        git("init", "-q")
+        git("config", "user.name", "t")
+        git("config", "user.email", "t@localhost")
+        git("add", "-A")
+        git("commit", "-q", "-m", "initial")
+        solved = "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
+        (repo / "calc.py").write_text(solved)
+        (repo / "tests" / "test_mul.py").write_text(
+            "from calc import mul\n\n\ndef test_mul():\n    assert mul(3, 4) == 12\n"
+        )
+        git("add", "-A")
+        git("commit", "-q", "-m", "Add a multiply helper")
+
+        write_fake_config(
+            home,
+            [
+                json.dumps({"tool_calls": [{"name": "write_file", "arguments": {
+                    "path": "calc.py", "content": solved}}]}),
+                json.dumps({"content": "Task complete. Added mul() and the tests pass."}),
+            ],
+        )
+        suite = tmp_path / "suite.json"
+        suite.write_text(json.dumps({
+            "name": "toy",
+            "repo": str(repo),
+            "revs": ["HEAD"],
+            "test_command": f"{_sys.executable} -m pytest tests -q",
+        }))
+
+        code = main([
+            "eval", str(suite), "--model", "fake", "--split", "all",
+            "--workdir", str(tmp_path / "work"), "--wall-clock", "120",
+        ])
+        out = capsys.readouterr().out
+        assert code == 0, out
+        assert "suite toy: 1 task(s)" in out
+        assert "validated: 1 usable, 0 dropped" in out
+        assert "PASS" in out
+        assert "pass rate           : 100.0%" in out
+        assert "diff precision      : 100.0%" in out
+        assert "regressions         : not measured" in out, out
+
+    def test_S401_validation_uses_the_runner_it_will_grade_with(
+        self, home: Path, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """Structural, and it has to be.
+
+        Validation on the host while grading happens in a container is not a
+        difference any fixture here can observe -- these tests patch Docker
+        away, so both paths collapse to `LocalSandbox`. On a real machine it
+        was the default, and it scored correct solutions as model failures: a
+        suite whose test_command names a host interpreter validates perfectly
+        and then fails every trial inside the image. So the assertion is on
+        *which runner is passed*, not on what it returns.
+        """
+        import json
+        import subprocess
+
+        from harness.cli import main
+
+        monkeypatch.setattr("harness.repo.SHADOW_GIT_DIR", str(tmp_path / "shadow"))
+        repo = tmp_path / "repo"
+        (repo / "tests").mkdir(parents=True)
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(repo), *args], check=True,
+                           capture_output=True)
+
+        (repo / "a.py").write_text("X = 1\n")
+        git("init", "-q")
+        git("config", "user.name", "t")
+        git("config", "user.email", "t@localhost")
+        git("add", "-A")
+        git("commit", "-q", "-m", "initial")
+        (repo / "a.py").write_text("X = 2\n")
+        (repo / "tests" / "test_a.py").write_text(
+            "from a import X\n\n\ndef test_x():\n    assert X == 2\n"
+        )
+        git("add", "-A")
+        git("commit", "-q", "-m", "Bump X")
+
+        sentinel = object()
+        seen = {}
+
+        import harness.eval.grading as grading_module
+        import harness.eval.pr_replay as replay_module
+
+        monkeypatch.setattr(
+            grading_module, "sandboxed_runner", lambda config: sentinel
+        )
+        real_validate = replay_module.validate
+
+        async def spy(task, command, workdir, run_command, timeout=300):
+            seen["runner"] = run_command
+            # Fall back to a real host run so the command still completes.
+            return await real_validate(task, command, workdir, host_run, timeout)
+
+        monkeypatch.setattr(replay_module, "validate", spy)
+
+        write_fake_config(home, ['{"content": "Task complete. Nothing to do."}'])
+        suite = tmp_path / "suite.json"
+        suite.write_text(json.dumps({
+            "name": "toy", "repo": str(repo), "revs": ["HEAD"],
+            "test_command": "true",
+        }))
+        main([
+            "eval", str(suite), "--model", "fake", "--split", "all",
+            "--workdir", str(tmp_path / "work"), "--wall-clock", "60",
+        ])
+        assert seen.get("runner") is sentinel, (
+            "validation did not use the sandboxed runner the trials grade with"
+        )
+
+    def test_S401_an_unvalidated_run_says_it_is_not_a_benchmark_result(
+        self, home: Path, tmp_path: Path, capsys, monkeypatch
+    ) -> None:
+        import json
+        import subprocess
+
+        monkeypatch.setattr("harness.repo.SHADOW_GIT_DIR", str(tmp_path / "shadow"))
+        repo = tmp_path / "repo"
+        (repo / "tests").mkdir(parents=True)
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(repo), *args], check=True,
+                           capture_output=True)
+
+        (repo / "a.py").write_text("X = 1\n")
+        git("init", "-q")
+        git("config", "user.name", "t")
+        git("config", "user.email", "t@localhost")
+        git("add", "-A")
+        git("commit", "-q", "-m", "initial")
+        (repo / "a.py").write_text("X = 2\n")
+        (repo / "tests" / "test_a.py").write_text("from a import X\n\n\ndef test_x():\n    assert X == 2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "Bump X")
+
+        write_fake_config(home, ['{"content": "Task complete. Nothing to do."}'])
+        suite = tmp_path / "suite.json"
+        suite.write_text(json.dumps({
+            "name": "toy", "repo": str(repo), "revs": ["HEAD"],
+            "test_command": "true",
+        }))
+        code = main([
+            "eval", str(suite), "--model", "fake", "--split", "all",
+            "--no-validate", "--workdir", str(tmp_path / "work"),
+            "--wall-clock", "60",
+        ])
+        out = capsys.readouterr().out
+        assert code == 0, out
+        assert "validation skipped" in out
+        assert "not a benchmark result" in out

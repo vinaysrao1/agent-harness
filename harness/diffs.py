@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from harness.repo import (
     BASELINE_REF_SUFFIX,
     CHECKPOINT_COMMAND_TIMEOUT,
-    SHADOW_GIT_DIR,
+    shadow_root,
     GIT_IDENTITY_EMAIL,
     GIT_IDENTITY_NAME,
     work_tree_argument,
@@ -126,7 +126,7 @@ class ShadowReader:
         # carried a work tree could touch the index, and `diff` promises not
         # to. rewind() adds them back deliberately.
         return (
-            f"git --git-dir={SHADOW_GIT_DIR}/{self._run_id} {args}"
+            f"git --git-dir={shadow_root()}/{self._run_id} {args}"
         )
 
     async def _run(self, command: str) -> tuple[int, str]:
@@ -147,8 +147,18 @@ class ShadowReader:
 
     async def turns(self) -> list[int]:
         """Turn numbers that have a checkpoint, ascending."""
+        # The format string is quoted because this command is run through a
+        # shell: `%(refname)` unquoted is a syntax error in sh, and `_run`
+        # turns any failure into `(1, "")`, which `turns()` reports as "no
+        # checkpoints". The command was therefore broken in every real shell
+        # while every test passed, because the tests exec against a fake
+        # sandbox that never invokes one. TestAgainstARealShell exists to stop
+        # that happening again.
         code, out = await self._run(
-            self._git(f"for-each-ref --format=%(refname) refs/harness/{self._agent_id}")
+            self._git(
+                "for-each-ref --format='%(refname)' "
+                f"refs/harness/{self._agent_id}"
+            )
         )
         if code != 0 or not out:
             return []
@@ -236,10 +246,10 @@ class ShadowReader:
         resolution = await self.resolve(turn)
         if not resolution.found:
             return resolution
-        index = f"{SHADOW_GIT_DIR}/{self._run_id}/index-{self._agent_id}"
+        index = f"{shadow_root()}/{self._run_id}/index-{self._agent_id}"
         shadow = (
             f"GIT_INDEX_FILE={index} "
-            f"git --git-dir={SHADOW_GIT_DIR}/{self._run_id} "
+            f"git --git-dir={shadow_root()}/{self._run_id} "
             f"{work_tree_argument()}"
         )
         # read-tree loads the snapshot into this agent's private index;

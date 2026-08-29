@@ -75,5 +75,25 @@ Exhaustive as far as is known; anything missing is a defect in this list.
 - **`rewind` restores the tree but not the agent's context.** Files go back;
   the transcript, ledger and memory do not. It is a filesystem operation
   presented as one, not a time machine.
-- The reader is exercised against a scripted sandbox only. Like S-201, it has
-  never run against a live git repository.
+- ~~The reader is exercised against a scripted sandbox only.~~ **Closed by
+  S-401, which found the defect this gap was describing.** `turns()` builds
+  `for-each-ref --format=%(refname) …` and runs it through a shell, where the
+  unquoted parentheses are a syntax error; `_run` maps the failure to
+  `(1, "")` and `turns()` maps that to `[]`, so the reader reported "no
+  checkpoints" for a store full of them — in every real shell, while every
+  test here passed. `TestAgainstARealShell` now runs the reader's own commands
+  against a real shadow store.
+- **The artifact does not survive a Docker run.** The shadow store lives at
+  `/tmp/.harness-git` *inside the sandbox*. Under `DockerSandbox` it is
+  destroyed with the container, so after the run — the only time anyone wants
+  to look at the diff — there is nothing to read. Only `LocalSandbox` runs
+  leave a readable history.
+
+  S-401 hit this and routed around it rather than through it: the facts a
+  metric needs (which turn changed the tree) are small enough to put in the
+  event log, so `Checkpoint` now carries its `write-tree` hash and the loop
+  records it. That does nothing for *this* module, whose whole output is the
+  objects. The remaining options are a host-side mount — which hands the agent
+  a writable host directory outside its workspace, a security regression traded
+  for convenience — or `git bundle` before teardown, which copies only what the
+  run produced and is the direction to prefer. Neither is built.

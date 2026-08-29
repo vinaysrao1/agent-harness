@@ -6,6 +6,7 @@ Subcommands:
 - ``harness runs``        — table of every persisted run.
 - ``harness cost RUN_ID`` — aggregated token usage for one run.
 - ``harness resume RUN_ID`` — continue an interrupted run (v1 limits below).
+- ``harness eval SUITE`` — run a PR-replay suite and print its report.
 
 The approval prompt (gated mode) renders the exact tool name and arguments
 and reads one of ``y`` (allow once), ``n`` (deny), or ``a`` (allow and grant
@@ -22,10 +23,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 
 from harness.config import ConfigError, PermissionMode, load_config
+from harness.eval.pr_replay import GitError
+from harness.eval.suite import SuiteError
 from harness.loop import AskCallable
 from harness.orchestrator import Orchestrator, UnknownModelError, UnknownRunError
 from harness.permissions import ToolMeta
@@ -195,6 +199,110 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """``harness eval``: run a PR-replay suite (S-401) and print its report.
+
+    Every task that is dropped is reported with its reason. A benchmark that
+    quietly shrinks is worse than one that fails loudly: a suite whose task
+    count fell from 40 to 6 still prints a pass rate, and it looks fine.
+    """
+    import asyncio as _asyncio
+
+    from harness.eval.grading import sandboxed_runner
+    from harness.eval.pr_replay import generate, validate
+    from harness.eval.runner import TrialSettings, run_suite
+    from harness.eval.suite import Suite, is_heldout
+
+    config = load_config(args.config)
+    suite = Suite.load(Path(args.suite).expanduser())
+    # The suite name comes out of a JSON file, so it is data, not a path
+    # component: "../.." in it would place task trees anywhere on the disk.
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", suite.name).strip("-.") or "suite"
+    workdir = Path(args.workdir).expanduser() if args.workdir else (
+        config.home / "eval" / safe_name
+    )
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    tasks = generate(Path(suite.repo).expanduser(), list(suite.revs))
+    print(f"suite {suite.name}: {len(tasks)} task(s) from {len(suite.revs)} revision(s)")
+    if len(tasks) < len(suite.revs):
+        print(
+            f"  {len(suite.revs) - len(tasks)} revision(s) produced no task "
+            "(unresolvable, or a root commit with no parent to diff against)"
+        )
+
+    if args.split != "all":
+        want_heldout = args.split == "heldout"
+        kept = [t for t in tasks if is_heldout(t.task_id) == want_heldout]
+        print(f"  {args.split} split: {len(kept)} of {len(tasks)}")
+        tasks = kept
+
+    # Before validation, not after: validating a task costs two full runs of
+    # the test command, and `--limit 3` on a 40-revision suite was paying for
+    # all 40.
+    if args.limit and len(tasks) > args.limit:
+        print(f"  limited to the first {args.limit} of {len(tasks)} tasks")
+        tasks = tasks[: args.limit]
+
+    if args.validate:
+        # Validated through the same sandbox that will grade, so "fails at
+        # base, passes with the reference answer" is established where the
+        # verdict will actually be reached. Validating on the host while
+        # grading in a container made a correct solution score as a model
+        # failure -- and that was the default on any machine with a daemon.
+        async def _validate_all():
+            run_command = sandboxed_runner(config)
+            usable, rejected = [], []
+            for task in tasks:
+                outcome = await validate(
+                    task, suite.test_command, workdir,
+                    run_command, args.grade_timeout,
+                )
+                (usable if outcome.usable else rejected).append((task, outcome))
+            return usable, rejected
+
+        usable, rejected = _asyncio.run(_validate_all())
+        for task, outcome in rejected:
+            print(f"  dropped {task.task_id}: {outcome.reason}")
+        print(f"  validated: {len(usable)} usable, {len(rejected)} dropped")
+        tasks = [task for task, _ in usable]
+    else:
+        print(
+            "  validation skipped: tasks were not checked for failing at the "
+            "base and passing at the head, so the number below is not a "
+            "benchmark result"
+        )
+
+    if not tasks:
+        print("no usable tasks; nothing to run", file=sys.stderr)
+        return 2
+
+    settings = TrialSettings(
+        model=args.model,
+        wall_clock_seconds=args.wall_clock,
+        max_turns=args.max_turns,
+        grade_timeout=args.grade_timeout,
+        keep_tree=args.keep_trees,
+    )
+    with RunStore(config.home / "state.db") as store:
+        report = _asyncio.run(
+            run_suite(
+                tasks, suite, settings,
+                config=config, store=store, workdir=workdir,
+                trials=args.trials,
+                on_outcome=lambda o: print(
+                    f"  {o.task_id}: {'PASS' if o.passed else 'fail'}"
+                    + ("  [TAMPERED]" if o.tampered else "")
+                ),
+            )
+        )
+    print()
+    print(report.render())
+    if not args.validate:
+        print("(unvalidated suite - not a benchmark result)")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the top-level argparse parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -252,6 +360,58 @@ def _build_parser() -> argparse.ArgumentParser:
     add_config(resume)
     resume.set_defaults(func=_cmd_resume)
 
+
+    ev = subparsers.add_parser(
+        "eval", help="Run a PR-replay suite (S-401) and print its report."
+    )
+    ev.add_argument("suite", help="Path to the suite JSON file.")
+    ev.add_argument(
+        "--model", required=True, help="Model name from the config registry."
+    )
+    ev.add_argument(
+        "--split",
+        choices=["dev", "heldout", "all"],
+        default="dev",
+        help=(
+            "Which half of the hash split to run (default: dev). Score a "
+            "change you tuned on 'heldout', once."
+        ),
+    )
+    ev.add_argument("--trials", type=int, default=1, help="Attempts per task.")
+    ev.add_argument(
+        "--limit", type=int, default=None, help="Run at most this many tasks."
+    )
+    ev.add_argument(
+        "--wall-clock", type=float, default=900.0,
+        help="Seconds each attempt gets (default: 900).",
+    )
+    ev.add_argument("--max-turns", type=int, default=60)
+    ev.add_argument(
+        "--grade-timeout", type=float, default=300.0,
+        help=(
+            "Seconds one grading command gets (default: 300). Raise it for a "
+            "suite whose own tests take longer than that, or every task fails "
+            "on a timeout that has nothing to do with the agent."
+        ),
+    )
+    ev.add_argument("--workdir", default=None, help="Where task trees are built.")
+    ev.add_argument(
+        "--no-validate",
+        dest="validate",
+        action="store_false",
+        help=(
+            "Skip the fails-at-base / passes-at-head check. Faster, and the "
+            "resulting number is not a benchmark result."
+        ),
+    )
+    ev.add_argument(
+        "--keep-trees",
+        action="store_true",
+        help="Leave each task tree on disk for inspection.",
+    )
+    add_config(ev)
+    ev.set_defaults(func=_cmd_eval, validate=True)
+
     return parser
 
 
@@ -266,7 +426,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (ConfigError, UnknownModelError, UnknownRunError) as exc:
+    except (
+        ConfigError,
+        UnknownModelError,
+        UnknownRunError,
+        SuiteError,
+        GitError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
