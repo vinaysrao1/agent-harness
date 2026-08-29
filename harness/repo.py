@@ -68,6 +68,10 @@ CHECKPOINT_SKIPPED_EVENT = "repo_checkpoint_skipped"
 GIT_IDENTITY_NAME = "harness"
 GIT_IDENTITY_EMAIL = "harness@localhost"
 
+#: Git's constant name for an empty tree. Used as the diff base in a
+#: repository with no commits yet, where there is no HEAD to name.
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 #: Ref holding the pre-agent state. Written at ``start()``, before the agent
 #: has done anything, so a diff has something to diff *against*. The workspace
 #: repo's own ``base_sha`` cannot serve: the shadow store shares no objects
@@ -108,11 +112,20 @@ class RepoState:
     base_sha: str | None = None
     branch: str | None = None
     dirty: bool | None = None
+    unborn: bool = False
 
     @property
     def usable(self) -> bool:
-        """Whether enough was established to checkpoint against."""
-        return self.base_sha is not None
+        """Whether enough was established to checkpoint against.
+
+        An *unborn* repository -- created but with no commits yet -- counts.
+        It has no HEAD to name, which an earlier version read as "I cannot
+        work here", so an active substrate silently took no snapshot for the
+        entire run. There is nothing wrong with such a repository: the
+        baseline checkpoint captures its tree exactly as it does for any
+        other.
+        """
+        return self.base_sha is not None or self.unborn
 
 
 class GitSubstrate:
@@ -129,6 +142,7 @@ class GitSubstrate:
         self,
         sandbox,
         run_id: str,
+        agent_id: str,
         *,
         active: bool,
         deadline: Deadline | None = None,
@@ -136,6 +150,7 @@ class GitSubstrate:
     ) -> None:
         self._sandbox = sandbox
         self._run_id = run_id
+        self._agent_id = agent_id
         self._active = active
         self._deadline = deadline
         self._allow_dirty = allow_dirty
@@ -165,6 +180,29 @@ class GitSubstrate:
     def skipped_count(self) -> int:
         return self._skipped
 
+    @property
+    def _index_file(self) -> str:
+        """This agent's private staging area.
+
+        The object store is shared per run -- that is the point, so snapshots
+        from different agents dedupe against each other -- but the *index* is
+        a single file that ``git add`` locks. A lead and its concurrently
+        running subagents sharing one index would race on ``index.lock``, and
+        a lost race surfaces as a non-zero exit, which this class counts as a
+        skip. The failure would therefore be invisible.
+        """
+        return f"{SHADOW_GIT_DIR}/{self._run_id}/index-{self._agent_id}"
+
+    @property
+    def _ref_prefix(self) -> str:
+        """This agent's ref namespace.
+
+        Namespaced by agent, not just by run: turn counters are per-loop, so
+        a lead and a subagent both reach ``turn-3`` and would overwrite each
+        other's snapshot under a run-only prefix.
+        """
+        return f"refs/harness/{self._agent_id}"
+
     def _git(self, args: str) -> str:
         """A git command against the shadow store and the live work tree.
 
@@ -183,6 +221,7 @@ class GitSubstrate:
         it.
         """
         return (
+            f"GIT_INDEX_FILE={self._index_file} "
             f"git -c user.name={GIT_IDENTITY_NAME} "
             f"-c user.email={GIT_IDENTITY_EMAIL} "
             f"--git-dir={SHADOW_GIT_DIR}/{self._run_id} "
@@ -224,14 +263,24 @@ class GitSubstrate:
         )
         dirty = bool(porcelain) if code == 0 else None
 
+        # No HEAD, but git answered about the work tree: the repository exists
+        # and simply has no commits yet.
+        unborn = not sha and code == 0
+
         self._state = RepoState(
             repo=remote or None,
             base_sha=sha or None,
             branch=branch or None,
-            dirty=dirty,
+            # In an unborn repository every file is untracked, so `dirty`
+            # would always be True. That is not the condition the check
+            # guards: there is no committed state for the agent's work to be
+            # confused with, and the baseline snapshot captures the starting
+            # tree either way.
+            dirty=False if unborn else dirty,
+            unborn=unborn,
         )
 
-        if dirty and not self._allow_dirty:
+        if self._state.dirty and not self._allow_dirty:
             raise DirtyWorktreeError(
                 "the work tree has uncommitted changes; the diff this run "
                 "reports would mix them with the agent's work. Pass "
@@ -281,7 +330,7 @@ class GitSubstrate:
             self._skipped += 1
             return None, reason
 
-        ref = f"refs/harness/{self._run_id}/{name}"
+        ref = f"{self._ref_prefix}/{name}"
         code, _ = await self._run(
             self._git("add -A") + " 2>/dev/null", CHECKPOINT_COMMAND_TIMEOUT
         )

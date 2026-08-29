@@ -98,22 +98,51 @@ someone else's edit to the agent, and that is worse than not starting.
   cwd, which is true of every implementation but stated nowhere. Extracted to
   `work_tree_argument()` so a test pins it.
 
+## Amendment (2026-08-22): concurrency and unborn repositories
+Two hazards this spec shipped with, both fixed before S-202 built on them.
+Both were silent, and both were dormant only because nothing constructs a
+substrate yet.
+
+**Agents shared a staging area and a ref namespace.** `build_loop` is used by
+the lead and every subagent, and subagents run concurrently. One substrate
+across all of them meant concurrent `git add -A` against a single
+`$GIT_DIR/index` — an `index.lock` race whose loser exits non-zero, which this
+class counts as a *skip*, so the failure would never surface. And because turn
+counters are per-loop while the ref prefix was per-run, a lead and a subagent
+both reached `turn-3` and one snapshot overwrote the other with no error at
+all.
+
+Fixed by making the *index* and the *refs* per-agent
+(`GIT_INDEX_FILE=…/index-<agent_id>`, `refs/harness/<agent_id>/…`) while
+deliberately keeping the **object store shared per run**: snapshots from
+different agents then dedupe against each other, and S-202 can resolve any of
+them from one place. It is contention and naming that must be private, not
+storage.
+
+Fixed now rather than during S-202 because it changes the *layout* S-202's
+`diff` and `rewind` read back — cheap to change today, rework once something
+depends on it.
+
+**A repository with no commits was a silent dead end.** A fresh `git init` has
+no HEAD, so `rev-parse HEAD` failed, `usable` was False, and an *active*
+substrate took no snapshot for the entire run — invisible except as a missing
+history. An unborn repository is a perfectly ordinary starting state for a repo
+task.
+
+Fixed by treating unborn as usable: the baseline checkpoint captures its tree
+exactly as it does for any other repository. This required one companion fix —
+every file in an unborn repository is untracked, so the dirty check would have
+refused to start on all of them. That is not the condition the check guards:
+there is no committed state for the agent's work to be confused with, and the
+baseline captures the starting tree regardless.
+
 ## Known gaps
 Exhaustive as far as is known; anything missing is a defect in this list.
 
-- **An unborn HEAD is a silent dead end.** A fresh `git init` with no commits
-  makes `rev-parse HEAD` fail, so `RepoState.usable` is False and an *active*
-  substrate never checkpoints for the whole run — plausible for a repo task,
-  and invisible except as a missing history.
 - **Turn numbering has holes.** The checkpoint sits inside the tool-call
   branch, so a turn with no tool calls writes no ref. S-202's `rewind <turn>`
   will meet missing refs.
-- **Subagent concurrency is a hazard at the seam S-202 will use.**
-  `build_loop` is shared by the lead and every subagent, and subagents run
-  concurrently. One substrate passed there means concurrent `git add -A`
-  against a single `$GIT_DIR/index` — `index.lock` races, silently counted as
-  skips — and ref collisions, since `run_id` is shared while turn counters are
-  per-loop.
+
 - **Nothing constructs a `GitSubstrate` yet.** `AgentLoop` accepts and calls
   one, but the orchestrator never builds it, so no run has a substrate. Wiring
   that requires calling the S-005 probe during a run, which is a behavior

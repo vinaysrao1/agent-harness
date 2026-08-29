@@ -105,7 +105,7 @@ def _clean_repo() -> dict[str, _Result]:
 class TestInertWhenTheCapabilityIsOff:
     async def test_S201_inactive_issues_no_commands(self) -> None:
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=False)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=False)
         assert await substrate.start() == RepoState()
         assert await substrate.checkpoint(1) is None
         assert sandbox.commands == [], (
@@ -138,7 +138,7 @@ class TestNoGitInsideTheWorkspace:
         # Acceptance (1). A .git in the workspace is a directory the agent can
         # see and the grader never expected.
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         await substrate.checkpoint(1)
         writing = [
@@ -159,7 +159,7 @@ class TestNoGitInsideTheWorkspace:
 
     async def test_S201_checkpoint_never_runs_git_init_in_the_worktree(self) -> None:
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         for command in sandbox.commands:
             if "init" in command:
@@ -171,21 +171,21 @@ class TestDirtyWorktree:
         # Acceptance (4). A dirty tree means the reported diff mixes the
         # agent's work with changes already there.
         responses = _clean_repo() | {"status --porcelain": _Result(" M src/a.py")}
-        substrate = GitSubstrate(_Sandbox(responses), "run1", active=True)
+        substrate = GitSubstrate(_Sandbox(responses), "run1", "agent1", active=True)
         with pytest.raises(DirtyWorktreeError):
             await substrate.start()
 
     async def test_S201_allow_dirty_proceeds(self) -> None:
         responses = _clean_repo() | {"status --porcelain": _Result(" M src/a.py")}
         substrate = GitSubstrate(
-            _Sandbox(responses), "run1", active=True, allow_dirty=True
+            _Sandbox(responses), "run1", "agent1", active=True, allow_dirty=True
         )
         state = await substrate.start()
         assert state.dirty is True
         assert state.base_sha == "deadbeef"
 
     async def test_S201_clean_tree_proceeds(self) -> None:
-        substrate = GitSubstrate(_Sandbox(_clean_repo()), "run1", active=True)
+        substrate = GitSubstrate(_Sandbox(_clean_repo()), "run1", "agent1", active=True)
         state = await substrate.start()
         assert state.dirty is False
         assert state.branch == "main"
@@ -206,7 +206,7 @@ class TestDeadlinePressure:
         # must not eat the landing reserve.
         sandbox = _Sandbox(_clean_repo())
         substrate = GitSubstrate(
-            sandbox, "run1", active=True, deadline=self._Deadline(landing=True)
+            sandbox, "run1", "agent1", active=True, deadline=self._Deadline(landing=True)
         )
         await substrate.start()
         before_commands = len(sandbox.commands)
@@ -220,6 +220,7 @@ class TestDeadlinePressure:
         substrate = GitSubstrate(
             sandbox,
             "run1",
+            "agent1",
             active=True,
             deadline=self._Deadline(affordable=CHECKPOINT_TIMEOUT_SECONDS - 1),
         )
@@ -235,20 +236,20 @@ class TestDeadlinePressure:
         # checkpointing never works at all.
         sandbox = _Sandbox(_clean_repo())
         substrate = GitSubstrate(
-            sandbox, "run1", active=True, deadline=self._Deadline(affordable=999.0)
+            sandbox, "run1", "agent1", active=True, deadline=self._Deadline(affordable=999.0)
         )
         await substrate.start()
         before = substrate.checkpoint_count
         ref = await substrate.checkpoint(3)
-        assert ref == "refs/harness/run1/turn-3"
+        assert ref == "refs/harness/agent1/turn-3"
         assert substrate.checkpoint_count == before + 1
         assert substrate.skipped_count == 0
         # start() must have captured the pre-agent tree, or there is nothing
         # to diff the first turn against.
-        assert substrate.baseline_ref == f"refs/harness/run1/{BASELINE_REF_SUFFIX}"
+        assert substrate.baseline_ref == f"refs/harness/agent1/{BASELINE_REF_SUFFIX}"
 
     async def test_S201_no_deadline_checkpoints(self) -> None:
-        substrate = GitSubstrate(_Sandbox(_clean_repo()), "run1", active=True)
+        substrate = GitSubstrate(_Sandbox(_clean_repo()), "run1", "agent1", active=True)
         await substrate.start()
         assert await substrate.checkpoint(1) is not None
 
@@ -256,22 +257,55 @@ class TestDeadlinePressure:
 class TestFailureIsNotFatal:
     async def test_S201_failed_shadow_init_disables_rather_than_raises(self) -> None:
         responses = _clean_repo() | {"init --bare": _Result("", exit_code=1)}
-        substrate = GitSubstrate(_Sandbox(responses), "run1", active=True)
+        substrate = GitSubstrate(_Sandbox(responses), "run1", "agent1", active=True)
         await substrate.start()
         assert substrate.active is False
         assert await substrate.checkpoint(1) is None
 
     async def test_S201_failed_checkpoint_is_counted_not_raised(self) -> None:
         responses = _clean_repo() | {"write-tree": _Result("", exit_code=1)}
-        substrate = GitSubstrate(_Sandbox(responses), "run1", active=True)
+        substrate = GitSubstrate(_Sandbox(responses), "run1", "agent1", active=True)
         await substrate.start()
         before = substrate.skipped_count
         assert await substrate.checkpoint(1) is None
         assert substrate.skipped_count == before + 1
 
-    async def test_S201_unknown_head_prevents_checkpointing(self) -> None:
-        responses = _clean_repo() | {"rev-parse HEAD": _Result("", exit_code=1)}
-        substrate = GitSubstrate(_Sandbox(responses), "run1", active=True)
+    async def test_S201_unborn_repository_is_usable(self) -> None:
+        # A repository created but not yet committed to has no HEAD. Reading
+        # that as "I cannot work here" meant an active substrate silently took
+        # no snapshot for the entire run -- and a fresh `git init` is a
+        # plausible starting state for a repo task.
+        responses = _clean_repo() | {
+            "rev-parse HEAD": _Result("", exit_code=1),
+            "status --porcelain": _Result("?? a.py\n?? b.py"),
+        }
+        substrate = GitSubstrate(_Sandbox(responses), "run1", "agent1", active=True)
+        state = await substrate.start()
+        assert state.unborn is True
+        assert state.base_sha is None
+        assert state.usable, "an unborn repository must still be checkpointable"
+        assert await substrate.checkpoint(1) is not None
+
+    async def test_S201_unborn_repository_is_not_treated_as_dirty(self) -> None:
+        # Every file in an unborn repository is untracked, so the dirty check
+        # would refuse to start on every one of them. That is not the
+        # condition it guards: there is no committed state for the agent's
+        # work to be confused with, and the baseline captures the tree anyway.
+        responses = _clean_repo() | {
+            "rev-parse HEAD": _Result("", exit_code=1),
+            "status --porcelain": _Result("?? a.py"),
+        }
+        substrate = GitSubstrate(_Sandbox(responses), "run1", "agent1", active=True)
+        state = await substrate.start()
+        assert state.dirty is False
+
+    async def test_S201_a_dead_sandbox_is_not_usable(self) -> None:
+        # The genuinely unusable case: git answers nothing at all.
+        class _Dead:
+            async def exec(self, command: str, timeout: float = 120):
+                raise RuntimeError("no container")
+
+        substrate = GitSubstrate(_Dead(), "run1", "agent1", active=True)
         state = await substrate.start()
         assert not state.usable
         assert await substrate.checkpoint(1) is None
@@ -281,7 +315,7 @@ class TestFailureIsNotFatal:
             async def exec(self, command: str, timeout: float = 120):
                 raise RuntimeError("container gone")
 
-        substrate = GitSubstrate(_Exploding(), "run1", active=True)
+        substrate = GitSubstrate(_Exploding(), "run1", "agent1", active=True)
         state = await substrate.start()
         assert state == RepoState()
         assert await substrate.checkpoint(1) is None
@@ -304,7 +338,7 @@ class TestLoopWiring:
         from harness.loop import AgentLoop
 
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
 
         # Inject the substrate into whatever loop the orchestrator builds.
@@ -353,7 +387,7 @@ class TestLoopWiring:
                 return 0.0
 
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         substrate._deadline = _AlwaysLanding()
 
@@ -404,7 +438,7 @@ class TestLoopWiring:
 
     async def test_S201_inactive_substrate_costs_nothing_per_turn(self) -> None:
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=False)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=False)
         for turn in range(50):
             assert await substrate.checkpoint(turn) is None
         assert sandbox.commands == [], (
@@ -432,7 +466,7 @@ class TestGitCommandShape:
         # auto-detection refused, so without an explicit identity every
         # checkpoint fails -- silently, since a non-zero exit counts as a skip.
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         await substrate.checkpoint(1)
         commits = [c for c in sandbox.commands if "commit-tree" in c]
@@ -443,7 +477,7 @@ class TestGitCommandShape:
 
     async def test_S201_commit_tree_receives_the_tree(self) -> None:
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         await substrate.checkpoint(1)
         commits = [c for c in sandbox.commands if "commit-tree" in c]
@@ -459,7 +493,7 @@ class TestGitCommandShape:
 
     async def test_S201_every_checkpoint_command_uses_the_work_tree(self) -> None:
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         await substrate.checkpoint(1)
         for command in sandbox.commands:
@@ -484,7 +518,7 @@ class TestGitCommandShape:
                 return await super().exec(command, timeout)
 
         sandbox = _TimeoutRecording(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
         await substrate.checkpoint(1)
         assert seen, "no checkpoint command was issued"
@@ -501,12 +535,67 @@ class TestBaseline:
         # baseline ref the earliest snapshot already contains the agent's
         # first edits and there is nothing to diff against.
         sandbox = _Sandbox(_clean_repo())
-        substrate = GitSubstrate(sandbox, "run1", active=True)
+        substrate = GitSubstrate(sandbox, "run1", "agent1", active=True)
         await substrate.start()
-        assert substrate.baseline_ref == f"refs/harness/run1/{BASELINE_REF_SUFFIX}"
+        assert substrate.baseline_ref == f"refs/harness/agent1/{BASELINE_REF_SUFFIX}"
         assert any(BASELINE_REF_SUFFIX in c for c in sandbox.commands)
 
     async def test_S201_no_baseline_when_inactive(self) -> None:
-        substrate = GitSubstrate(_Sandbox(_clean_repo()), "run1", active=False)
+        substrate = GitSubstrate(_Sandbox(_clean_repo()), "run1", "agent1", active=False)
         await substrate.start()
         assert substrate.baseline_ref is None
+
+
+class TestConcurrentAgentsDoNotCollide:
+    """S-201 amendment #1: a lead and its subagents share a run but not a
+    staging area or a ref namespace.
+
+    Both hazards were silent. A lost `index.lock` race surfaces as a non-zero
+    exit, which this class counts as a skip; and turn counters are per-loop, so
+    two agents both reach `turn-3` and one snapshot overwrote the other with no
+    error at all.
+    """
+
+    async def test_S201_agents_use_separate_index_files(self) -> None:
+        lead = GitSubstrate(_Sandbox(_clean_repo()), "run1", "lead", active=True)
+        child = GitSubstrate(_Sandbox(_clean_repo()), "run1", "child", active=True)
+        assert lead._index_file != child._index_file, (
+            "two agents share one git index; concurrent `git add -A` would "
+            "race on index.lock and the loser would be counted as a skip"
+        )
+
+    async def test_S201_agents_use_separate_ref_namespaces(self) -> None:
+        lead = GitSubstrate(_Sandbox(_clean_repo()), "run1", "lead", active=True)
+        child = GitSubstrate(_Sandbox(_clean_repo()), "run1", "child", active=True)
+        await lead.start()
+        await child.start()
+        lead_ref = await lead.checkpoint(3)
+        child_ref = await child.checkpoint(3)
+        assert lead_ref != child_ref, (
+            f"both agents wrote turn 3 to {lead_ref}; one snapshot silently "
+            "overwrote the other"
+        )
+        assert lead.baseline_ref != child.baseline_ref
+
+    async def test_S201_every_command_carries_this_agents_index(self) -> None:
+        sandbox = _Sandbox(_clean_repo())
+        substrate = GitSubstrate(sandbox, "run1", "agentX", active=True)
+        await substrate.start()
+        await substrate.checkpoint(1)
+        shadow = [c for c in sandbox.commands if "--git-dir" in c]
+        assert shadow, "no shadow command was issued"
+        for command in shadow:
+            assert "GIT_INDEX_FILE=" in command, (
+                f"a shadow command uses the default index: {command!r}"
+            )
+            assert "index-agentX" in command
+
+    async def test_S201_object_store_is_shared_per_run(self) -> None:
+        # Deliberately shared: snapshots from different agents dedupe against
+        # each other, and S-202's diff can resolve any of them from one place.
+        # It is the *index* and the *refs* that must be private, not the objects.
+        lead = GitSubstrate(_Sandbox(_clean_repo()), "run1", "lead", active=True)
+        child = GitSubstrate(_Sandbox(_clean_repo()), "run1", "child", active=True)
+        assert lead._git("x").split("--git-dir=")[1].split()[0] == (
+            child._git("x").split("--git-dir=")[1].split()[0]
+        )
