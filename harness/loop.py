@@ -137,6 +137,7 @@ from harness.types import (
 
 __all__ = [
     "REFUSAL_EVENT",
+    "NON_CONTINUABLE_REASONS",
     "COMPLETION_GATES",
     "NUDGE_SOURCES",
     "Budgets",
@@ -171,6 +172,18 @@ _CLOSED_TASK_STATUSES = frozenset(
 #: failed loudly (see :meth:`AgentLoop.run` step 5a).
 #: Transcript event kind for a model refusal (S-110, T3).
 REFUSAL_EVENT: Final[str] = "model_refusal"
+
+#: Incomplete reasons that must never be re-prompted.
+#:
+#: ``incomplete`` means "this turn produced nothing actionable", which for a
+#: truncated response is a reason to ask again. A **refusal** is not truncated:
+#: the model produced a complete answer, and that answer was no. Re-prompting
+#: it does two wrong things at once -- it tells the model something false
+#: ("you were cut off at the output-token limit", the fallback reminder), and
+#: it applies pressure to a safety decision. Neither is something this harness
+#: should do, and the first version of S-110 did both by accident simply by
+#: adding "refusal" to IncompleteReason.
+NON_CONTINUABLE_REASONS: Final[frozenset[str]] = frozenset({"refusal"})
 
 MAX_TRUNCATION_CONTINUES: int = 3
 
@@ -1232,7 +1245,11 @@ class AgentLoop:
             # to re-prompt into, and spending the last of the wall-clock on
             # a call whose reply cannot be read is the exact waste the band
             # exists to prevent. Take the partial text as the answer.
-            if response.incomplete and not landing:
+            if (
+                response.incomplete
+                and response.incomplete_reason not in NON_CONTINUABLE_REASONS
+                and not landing
+            ):
                 if truncation_continues < MAX_TRUNCATION_CONTINUES:
                     # Deadline-aware skip: a re-prompt is only worth its cost if
                     # the answer it provokes can arrive *and* be acted on. Model
@@ -1315,6 +1332,11 @@ class AgentLoop:
                     if length_bound:
                         reminder = TRUNCATION_REMINDERS["max_tokens"]
                     else:
+                        # Fallback is max_tokens because that is the only
+                        # reason whose wording is safe to over-apply. Any
+                        # reason that must NOT be re-prompted belongs in
+                        # NON_CONTINUABLE_REASONS above, not here: a
+                        # factually false diagnosis is worse than none.
                         reminder = TRUNCATION_REMINDERS.get(
                             response.incomplete_reason or "",
                             TRUNCATION_REMINDERS["max_tokens"],
