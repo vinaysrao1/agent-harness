@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from harness.eval.suite import render_command
+
 if TYPE_CHECKING:  # pragma: no cover
     from harness.eval.grading import Graded
 
@@ -670,18 +672,31 @@ def grader_was_changed(tree: TaskTree, task: TaskSpec) -> list[str]:
 
 #: Output signatures meaning the command could not run at all.
 #:
-#: Applied **only to the head state**, where the tests pass by construction, so
-#: any failure there really is environmental. Applying it to the base state
-#: deleted every task whose base failure mentioned a missing file — which is
-#: precisely what a pull request that *adds* a file looks like, and the most
-#: valuable class of task in the suite.
+#: Applied **only to the head state**, and that restriction is what lets these
+#: be broad. At head the reference answer is applied, so every module the
+#: change itself introduces exists — an import that still fails there is a
+#: third-party dependency the environment lacks, never the task's own missing
+#: work. Applying the same patterns to the base state would delete every task
+#: that *adds* a module, which is the most valuable class in the suite.
+#:
+#: The list used to name ``pytest`` specifically. On the first real repository
+#: it met a task whose tests import ``typing_extensions``, did not match, and
+#: reported "task is not solvable as generated" — blaming the task for a gap
+#: in the image. A missing dependency and an unsolvable task are opposite
+#: findings: one is fixed by editing a Dockerfile, the other by dropping the
+#: task, and telling them apart is the whole point of this check.
 _ENVIRONMENT_BROKEN = (
     "no such file or directory",
     "command not found",
-    "no module named pytest",
-    "modulenotfounderror: no module named 'pytest'",
     "permission denied",
     "cannot execute",
+    # Any unimportable module at head, not just pytest.
+    "modulenotfounderror",
+    "no module named",
+    "importerror:",
+    # pytest could not even build the test session.
+    "error during collection",
+    "error collecting",
 )
 
 
@@ -735,8 +750,9 @@ async def validate(
         except GitError as exc:
             return Validation(task.task_id, reason=f"could not build task tree: {exc}")
 
-        base = await run_command(test_command, base_dir, timeout)
-        head = await run_command(test_command, head_dir, timeout)
+        command = render_command(test_command, task.test_paths)
+        base = await run_command(command, base_dir, timeout)
+        head = await run_command(command, head_dir, timeout)
     finally:
         # Guaranteed on every path, including construction failure.
         for path in (base_dir, head_dir):

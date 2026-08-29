@@ -20,6 +20,7 @@ from pathlib import Path
 
 __all__ = [
     "Suite",
+    "render_command",
     "HELDOUT_FRACTION",
     "is_heldout",
     "heldout_score",
@@ -65,6 +66,31 @@ def is_heldout(task_id: str, fraction: float = HELDOUT_FRACTION) -> bool:
     return heldout_score(task_id) < fraction
 
 
+#: Placeholder in a suite's commands, replaced with the task's own test paths.
+TESTS_PLACEHOLDER = "{tests}"
+
+
+def render_command(command: str, test_paths: tuple[str, ...]) -> str:
+    """Substitute ``{tests}`` in ``command`` with ``test_paths``.
+
+    The grader is *the change's tests*, not the repository's whole suite. A
+    fixed command has to name one or the other, and naming the whole suite
+    makes every task's verdict hostage to any unrelated failure in the
+    repository -- one flaky test and the entire benchmark reads 0%.
+
+    A command without the placeholder is returned unchanged, so a suite that
+    genuinely wants to run everything simply does not use it.
+    """
+    if TESTS_PLACEHOLDER not in command:
+        return command
+    if not test_paths:
+        raise SuiteError(
+            f"command uses {TESTS_PLACEHOLDER} but the task has no test paths: "
+            f"{command!r}"
+        )
+    return command.replace(TESTS_PLACEHOLDER, " ".join(test_paths))
+
+
 @dataclass(frozen=True)
 class Suite:
     """A named, reproducible set of replay tasks."""
@@ -72,9 +98,13 @@ class Suite:
     name: str
     repo: str
     revs: tuple[str, ...]
-    #: Command that grades the task's own tests. Must fail at the base state
-    #: and pass at the head state, or :func:`~harness.eval.pr_replay.validate`
-    #: rejects the task.
+    #: Command that grades the task's own tests. Must fail at the starting
+    #: state and pass with the reference answer applied, or
+    #: :func:`~harness.eval.pr_replay.validate` rejects the task.
+    #:
+    #: ``{tests}`` is replaced with the task's test paths -- see
+    #: :func:`render_command`. Without it the command must name what to run
+    #: itself, which in practice means the whole suite.
     test_command: str
     #: Optional command running the *rest* of the suite, for regression
     #: counting. Absent means regressions are reported as **not measured**

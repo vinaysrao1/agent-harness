@@ -38,6 +38,7 @@ from harness.eval.pr_replay import (
 )
 from harness.eval.suite import (
     HELDOUT_FRACTION,
+    render_command,
     Suite,
     SuiteError,
     heldout_score,
@@ -1103,3 +1104,127 @@ class TestSuiteFile:
         path.write_text(payload)
         with pytest.raises(SuiteError):
             Suite.load(path)
+
+
+class TestPerTaskGraderCommand:
+    """`{tests}` exists because the grader is *this change's* tests.
+
+    A fixed command must name either the change's tests or the whole suite,
+    and naming the whole suite makes every verdict hostage to any unrelated
+    failure in the repository: one flaky test and the benchmark reads 0% for
+    reasons that have nothing to do with the agent.
+    """
+
+    def test_S401_the_placeholder_is_replaced_with_the_task_paths(self) -> None:
+        assert render_command("pytest {tests} -q", ("tests/a.py", "tests/b.py")) == (
+            "pytest tests/a.py tests/b.py -q"
+        )
+
+    def test_S401_a_command_without_the_placeholder_is_untouched(self) -> None:
+        assert render_command("make test", ("tests/a.py",)) == "make test"
+
+    def test_S401_a_placeholder_with_no_tests_is_an_error_not_an_empty_run(
+        self,
+    ) -> None:
+        # Substituting nothing yields `pytest  -q`, which collects the entire
+        # repository -- a silently different command that would quietly grade
+        # the wrong thing.
+        with pytest.raises(SuiteError):
+            render_command("pytest {tests} -q", ())
+
+    async def test_S401_validation_grades_only_the_change_s_tests(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        # A pre-existing failure elsewhere in the repository must not decide
+        # this task's verdict.
+        # The failure has to predate the change under test, or it is not in
+        # the task tree at all -- which is how the first version of this test
+        # passed while proving nothing.
+        (repo / "tests" / "test_unrelated.py").write_text(
+            "def test_broken():\n    assert False, 'failing before the agent arrives'\n"
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "a test that was already red")
+
+        (repo / "calc.py").write_text(
+            (repo / "calc.py").read_text() + "\n\ndef neg(a):\n    return -a\n"
+        )
+        (repo / "tests" / "test_neg.py").write_text(
+            "from calc import neg\n\n\ndef test_neg():\n    assert neg(2) == -2\n"
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "Add a negate helper")
+        (task,) = generate(repo, ["HEAD"])
+        assert task.test_paths == ("tests/test_neg.py",)
+
+        scoped = await validate(
+            task, f"{PY} -m pytest {{tests}} -q", tmp_path / "scoped", host_run
+        )
+        assert scoped.usable, scoped.reason
+
+        whole = await validate(
+            task, f"{PY} -m pytest tests -q", tmp_path / "whole", host_run
+        )
+        assert not whole.usable, (
+            "grading the whole suite should have been sunk by the unrelated "
+            "failure -- if it was not, this test proves nothing"
+        )
+
+
+class TestEnvironmentalFailuresBlameTheEnvironment:
+    """A missing dependency and an unsolvable task are opposite findings.
+
+    One is fixed by editing a Dockerfile, the other by dropping the task.
+    Reporting the first as the second sends you looking in the wrong place —
+    and it happened on the very first real repository this ran against, where
+    a task whose tests import `typing_extensions` was recorded as "not
+    solvable as generated".
+    """
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "ModuleNotFoundError: No module named 'typing_extensions'",
+            "ImportError: cannot import name 'x' from 'y'",
+            "E   ModuleNotFoundError: No module named 'pytest'",
+            "!!!! Interrupted: 1 error during collection !!!!",
+            "sh: 1: less: command not found",
+        ],
+    )
+    async def test_S401_a_missing_dependency_at_head_is_environmental(
+        self, repo: Path, tmp_path: Path, output: str
+    ) -> None:
+        from harness.eval.grading import Graded
+
+        (task,) = generate(repo, ["HEAD"])
+
+        async def failing_head(command, cwd, timeout):
+            # Fails at base (as a real task does) and fails at head with an
+            # environment signature.
+            return Graded(1, output)
+
+        result = await validate(
+            task, TEST_COMMAND, tmp_path / "work", failing_head
+        )
+        assert result.environment_broken, (
+            f"{output!r} was reported as a task defect, not an environment one"
+        )
+        assert "not solvable" not in (result.reason or "")
+
+    async def test_S401_a_genuine_test_failure_is_still_the_task_s_fault(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        # The other side: broadening the markers must not turn every failing
+        # task into "your environment is broken".
+        from harness.eval.grading import Graded
+
+        (task,) = generate(repo, ["HEAD"])
+
+        async def ordinary_failure(command, cwd, timeout):
+            return Graded(1, "assert mul(3, 4) == 12\nE  AssertionError\n1 failed")
+
+        result = await validate(
+            task, TEST_COMMAND, tmp_path / "work", ordinary_failure
+        )
+        assert not result.environment_broken
+        assert "not solvable" in (result.reason or "")

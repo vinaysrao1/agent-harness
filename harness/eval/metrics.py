@@ -74,6 +74,11 @@ class TaskOutcome:
     tampered: bool = False
     refused: bool = False
     errored: bool = False
+    #: The agent hit its turn or wall-clock budget rather than finishing.
+    #: Still graded -- being too slow is a real failure and TB2 scores it the
+    #: same way -- but reported separately, because a pass rate is not
+    #: interpretable without knowing how many attempts ran out of time.
+    budget_paused: bool = False
 
     def __post_init__(self) -> None:
         if self.passed and self.tampered:
@@ -204,6 +209,18 @@ class SuiteReport:
         return sum(1 for o in self.outcomes if o.tampered)
 
     @property
+    def budget_paused(self) -> int:
+        """Trials that ran out of turns or wall clock.
+
+        Surfaced because it changes what the other numbers mean. On the first
+        real run, three of eleven trials paused on the budget and every one of
+        them did all of its editing in the final turn or two -- the eval was
+        measuring how fast an agent reads, not how well it codes, and nothing
+        in the report said so.
+        """
+        return sum(1 for o in self.outcomes if o.budget_paused)
+
+    @property
     def refusals(self) -> int:
         return sum(1 for o in self.outcomes if o.refused)
 
@@ -240,6 +257,7 @@ class SuiteReport:
                 f"diff recall         : {self.mean_recall:.1%}",
                 f"regressions         : {regressions}",
                 f"tampered            : {self.tampered}",
+                f"budget paused       : {self.budget_paused}",
                 f"refusals            : {self.refusals}",
                 f"errors              : {self.errors}",
             ]

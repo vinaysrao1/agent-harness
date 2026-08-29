@@ -263,6 +263,52 @@ worse than no metric. `test_S401_an_edit_made_through_the_shell_still_counts` pi
 `test_S401_first_edit_survives_the_sandbox_being_destroyed` deletes the shadow
 store outright before measuring.
 
+## What the first live run changed
+Everything above was verified against scripted agents. The first run against a
+real model on a real repository — GLM-5.3-flash over 11 merged `pallets/click`
+commits — found four things that no fixture had.
+
+**`harness-sandbox:latest` did not exist.** DESIGN.md has named it as the
+default sandbox image since the sandbox was written and no Dockerfile existed
+anywhere in the tree, so every Docker-backed run failed on an image pull that
+could not succeed. There is now a `Dockerfile`.
+
+**The grader could not be *this task's* tests.** `test_command` was a fixed
+string, so it had to name either the change's tests or the whole suite — and
+naming the whole suite makes every verdict hostage to any unrelated failure in
+the repository. One flaky test and the benchmark reads 0% for reasons that have
+nothing to do with the agent. `{tests}` now substitutes the task's own paths.
+
+**The environmental check only knew about `pytest`.** A task whose tests import
+`typing_extensions` did not match, so a missing dependency was reported as
+"tests fail with the reference answer applied (task is not solvable as
+generated)" — blaming the task for a gap in the image. Those are opposite
+findings: one is fixed by editing a Dockerfile, the other by dropping the task,
+and telling them apart is the entire purpose of the check. The markers are now
+broad, which is safe *only* because they are applied to the head state alone:
+there the reference answer is applied, so every module the change introduces
+exists and an import that still fails is necessarily a third-party dependency.
+
+**Three of eleven trials paused on the budget, invisibly.** The report showed a
+pass rate and said nothing about attempts that ran out of time. Worse, the
+first-edit denominator was the only clue anything was odd: 8/11 measured. The
+three unmeasured trials turned out to have done *all* of their editing in the
+final one or two turns —
+
+```
+writes on turns : [12, 12, 13, 13, 13]
+checkpointed    : [1..11]
+SKIPPED         : (12, insufficient_time), (13, landing)
+```
+
+— exactly the turns where S-201 stops checkpointing to protect the landing
+reserve. So `_first_edit_turn` reported *unknown*, correctly, on live data. Had
+it reported "never edited", three runs in which the agent worked hard and
+shipped a fix would have been recorded as runs where it never touched the code.
+This is the tri-state earning its place; it is also the reason `budget_paused`
+is now a field and a reported line, because a pass rate is not interpretable
+without it.
+
 ## Known gaps
 Exhaustive as far as is known; anything missing is a defect in this list. Most
 of what follows was found by hostile review after a version I had called
@@ -325,7 +371,18 @@ finished, twice.
   down. `TaskSpec.answer_bearing_tests` flags them and nothing acts on the flag.
 - **No suite is committed.** The machinery runs any suite file; this ships
   none, because a suite pinned to this repository's own history would be a
-  benchmark whose author has read every line of the answers.
+  benchmark whose author has read every line of the answers. The first real
+  suite was generated from `pallets/click` and lives outside the repo.
+- **Suite curation is manual and necessary.** Of twelve generated tasks, one
+  was correctly dropped because `tests/typing/typing_edit.py` is a *static
+  typing* fixture, not an executable test — running it under pytest launches
+  an editor. Nothing distinguishes a type-check fixture from a runnable test by
+  path, and the reason reported ("the test command could not run") is close
+  but not exact.
+- **The wall clock is a load-bearing parameter with no guidance.** At 420s,
+  three of eleven trials ran out of time and every one of them wrote its fix in
+  the final turn under a one-second command cap; the eval was measuring reading
+  speed. `budget_paused` makes that visible, and nothing recommends a value.
 - **`--no-validate` exists.** The help text and the report both say the number
   is not a benchmark result. Nothing enforces it.
 - **The environmental check is a substring list.** A head-state test whose own

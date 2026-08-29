@@ -64,6 +64,43 @@ a warning (path-jailed but not isolated).
 | Memory & skills | `harness/memory/store.py`, `harness/skills.py` |
 | Persistence | `harness/persistence.py` (SQLite event log, resume) |
 
+## PR-replay eval (S-401)
+
+A second benchmark built from history that already exists: reset a merged
+commit's tree to its parent, restore only that commit's tests, and ask the
+agent to make them pass. The commit's tests are the grader; its diff is the
+reference answer.
+
+```bash
+docker build -t harness-sandbox:latest .      # once; graded commands run in it
+harness eval suite.json --model glm-flash --split dev
+```
+
+A suite file names a repository, the revisions to replay, and how to grade:
+
+```json
+{
+  "name": "click",
+  "repo": "/path/to/click",
+  "revs": ["a6256bfb...", "1f9cd54f..."],
+  "test_command": "PYTHONPATH=src python3 -m pytest {tests} -q -p no:cacheprovider"
+}
+```
+
+`{tests}` is replaced with the task's own test paths. Without it the command
+must name what to run itself, which in practice means the whole suite — and
+then any unrelated failure in the repository sinks every task.
+
+Two things worth knowing before reading a number from it:
+
+- **Set the wall clock generously.** At 420s, three of eleven trials ran out of
+  time and wrote their fix in the final turn. Watch the `budget paused` line;
+  if it is not zero, the run is measuring reading speed as much as coding.
+- **Everything a task needs must be in the image.** Graded commands run inside
+  the sandbox with no network. A missing dependency is reported as an
+  environment failure rather than a task defect, so read those reasons — they
+  are usually a Dockerfile edit, not a bad task.
+
 ## TB2 run playbook
 
 When running against Harbor trials:

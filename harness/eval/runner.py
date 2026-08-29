@@ -40,7 +40,7 @@ from harness.eval.pr_replay import (
     grader_was_changed,
     validate,
 )
-from harness.eval.suite import Suite
+from harness.eval.suite import Suite, render_command
 from harness.loop import Budgets
 from harness.orchestrator import Orchestrator
 from harness.persistence import RunStore
@@ -242,7 +242,10 @@ async def run_trial(
         regressions: int | None = None
         grading_failed = False
         async with Grader(dest, config) as grader:
-            graded = await grader.run(suite.test_command, settings.grade_timeout)
+            graded = await grader.run(
+                render_command(suite.test_command, task.test_paths),
+                settings.grade_timeout,
+            )
             # A tampered trial is never a pass, whatever the grader says: the
             # grader is one of the files the agent could have rewritten. A
             # trial whose grader never ran is not a fail either -- it is an
@@ -278,6 +281,7 @@ async def run_trial(
             tampered=tampered,
             refused=result.refused,
             errored=result.status == "error" or grading_failed,
+            budget_paused=result.status == "paused_budget",
         )
     finally:
         # Both or neither: keeping the tree to inspect a failure and deleting

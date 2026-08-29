@@ -18,6 +18,7 @@ import pytest
 
 from harness.adapters.fake import FakeAdapter
 from harness.config import HarnessConfig
+from harness.eval.metrics import SuiteReport
 from harness.eval.pr_replay import generate, grader_was_changed
 from harness.eval.runner import TrialSettings, run_suite, run_trial
 from harness.eval.suite import Suite
@@ -1158,3 +1159,51 @@ class TestFirstEditTelemetry:
 #: Sentinel for "this event carries no tree hash at all", distinct from a
 #: hash whose value is None.
 _OMIT = object()
+
+
+class TestBudgetPausesAreVisible:
+    """A pass rate is not interpretable without knowing how many attempts ran
+    out of time. On the first real run three of eleven trials paused on the
+    budget, every one of them did all of its editing in the final turn or two,
+    and nothing in the report said so."""
+
+    async def test_S401_a_budget_pause_is_reported_and_still_graded(
+        self, task, suite, env, monkeypatch
+    ) -> None:
+        config, store, work = env
+        import harness.orchestrator as orchestrator_module
+
+        # Driven through the result status rather than through a real budget:
+        # `max_turns` alone does not pause when a wall clock is set (the loop
+        # treats it as a floor and derives a clock-based rail), so a test that
+        # set max_turns=1 would quietly assert nothing.
+        real = orchestrator_module.Orchestrator.run_task
+
+        async def paused(self, *args, **kwargs):
+            kwargs["adapter_override"] = FakeAdapter([
+                _tool("write_file", path="calc.py", content=SOLVED), _done()
+            ])
+            run_id, result = await real(self, *args, **kwargs)
+            return run_id, result.model_copy(update={"status": "paused_budget"})
+
+        monkeypatch.setattr(orchestrator_module.Orchestrator, "run_task", paused)
+        outcome = await run_trial(
+            task, suite, SETTINGS, config=config, store=store, workdir=work
+        )
+        assert outcome.budget_paused, "the pause was invisible in the outcome"
+        assert not outcome.errored, "running out of time is a result, not an error"
+        report = SuiteReport([outcome])
+        assert report.budget_paused == 1
+        assert "budget paused       : 1" in report.render()
+
+    async def test_S401_a_finished_run_is_not_marked_paused(
+        self, task, suite, env, monkeypatch
+    ) -> None:
+        config, store, work = env
+        scripted(monkeypatch, [
+            _tool("write_file", path="calc.py", content=SOLVED), _done()
+        ])
+        outcome = await run_trial(
+            task, suite, SETTINGS, config=config, store=store, workdir=work
+        )
+        assert outcome.passed and not outcome.budget_paused
