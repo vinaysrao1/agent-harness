@@ -203,6 +203,11 @@ REPO_CAPABILITIES: frozenset[str] = frozenset(
         "read_staleness",
         # S-104: bash(run_in_background), bash_output, kill.
         "background_execution",
+        # S-105. Changes what survives eviction, which changes the assembly,
+        # which N7 and N8 pin -- so it cannot be on for `CODING` until a Lane B
+        # run says otherwise. Profile half only, for S-102's reason: there is
+        # no binary to probe for.
+        "pivotal_retention",
     }
 )
 

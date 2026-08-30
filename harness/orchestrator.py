@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 from harness.adapters import get_adapter
 from harness.adapters.base import ModelAdapter
 from harness.config import HarnessConfig, PermissionMode
+from harness.condenser import KNOWN_CONDENSERS, DefaultCondenser, condenser_for
 from harness.context import ContextManager
 from harness.deadline import Deadline
 from harness.diligence import WrittenData
@@ -98,6 +99,7 @@ __all__ = [
     "CORE_RULES",
     "CODING_RULES",
     "CODING_TOOL_FACTORIES",
+    "select_condenser_strategy",
     "coding_bash_factory",
     "repo_bash_factory",
     "ToolDeps",
@@ -309,6 +311,34 @@ def repo_bash_factory(deps: "ToolDeps") -> Tool:
         reads=deps.reads,
         jobs=deps.jobs,
     )
+
+
+def select_condenser_strategy(
+    configured: str, profile: "Profile | None"
+) -> str:
+    """Which compaction strategy this run gets (S-105).
+
+    The config names one globally; only a profile that declares
+    `pivotal_retention` may depart from the default. Pivotal retention changes
+    what survives eviction, which changes the assembly, which N7 and N8 pin --
+    so a config file cannot move the benchmark path.
+
+    The override is silent rather than an error: the config is global and the
+    profile is per-run, so a machine configured for repo work must still be
+    able to run the benchmark profile without editing config first.
+    """
+    # Validated before the gate, not after. Gating first meant a typo was
+    # silently corrected to the default under `CODING` -- the benchmark
+    # profile, and the one that runs when nothing was selected -- which is
+    # exactly the failure the raise exists to prevent. It only ever raised
+    # for repo runs, where the operator had already got it right often
+    # enough to notice.
+    if configured not in KNOWN_CONDENSERS:
+        known = ", ".join(sorted(KNOWN_CONDENSERS))
+        raise ValueError(f"unknown condenser {configured!r}; known: {known}")
+    if profile is not None and profile.enables("pivotal_retention"):
+        return configured
+    return DefaultCondenser.strategy_id
 
 
 CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
@@ -983,8 +1013,15 @@ class Orchestrator:
                     declared_command = command
             elif event.kind == "compaction" and "summary" in event.payload:
                 count = int(event.payload["evicted_count"])
+                # S-105: the summary *and* whatever the strategy carried
+                # forward. Older events have no "kept" key and default to
+                # the empty list, which is what the default strategy keeps.
                 replayed[:count] = [
-                    Message(role=Role.USER, content=event.payload["summary"])
+                    Message(role=Role.USER, content=event.payload["summary"]),
+                    *(
+                        Message.model_validate(payload)
+                        for payload in event.payload.get("kept") or []
+                    ),
                 ]
 
         # Synthesize results for calls the crash left unanswered.
@@ -1221,12 +1258,18 @@ class Orchestrator:
                 policy = policy.with_grant(pattern)
             return policy
 
+        condenser_strategy = select_condenser_strategy(
+            self.config.condenser, profile
+        )
+
         def build_context(adapter: ModelAdapter) -> ContextManager:
+            summarize = _make_summarizer(adapter)
             context = ContextManager(
                 base_system_prompt=system_prompt,
                 count_tokens=adapter.count_tokens,
                 max_context=adapter.capabilities.max_context,
-                summarize=_make_summarizer(adapter),
+                summarize=summarize,
+                condenser=condenser_for(condenser_strategy, summarize),
             )
             if memory_index:
                 context.add_memory_block(memory_index)

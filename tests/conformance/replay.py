@@ -194,12 +194,12 @@ def replay_trial(shapes: list[dict], window: int) -> dict[str, Any]:
             # of the compacting traces.
             fired = False
             while True:
-                size_before = len(context.transcript)
+                size_before = context.effective_size
                 evicted = await context.maybe_compact()
                 if not evicted:
                     break
                 fired = True
-                if len(context.transcript) >= size_before:
+                if context.effective_size >= size_before:
                     break
             if fired:
                 compact_turns.append(index)
