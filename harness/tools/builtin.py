@@ -65,6 +65,15 @@ from harness.diligence import (
     lint_verification,
 )
 from harness.memory.store import FactType, MemoryStore
+from harness.jobs import (
+    Job,
+    JobRegistry,
+    kill_command,
+    kill_process_command,
+    parse_poll,
+    poll_command,
+    start_command,
+)
 from harness.permissions import ToolMeta
 from harness.reads import ReadLedger
 from harness.persistence import RunStore, TaskLedgerItem
@@ -230,8 +239,14 @@ def bash_tool(
     store: RunStore | None = None,
     agent_id: str | None = None,
     reads: "ReadLedger | None" = None,
+    jobs: "JobRegistry | None" = None,
 ) -> Tool:
     """Build the ``bash`` tool: runs a shell command in ``sandbox``.
+
+    ``jobs`` (S-104) adds ``run_in_background``. The parameter appears in the
+    tool's schema **only when a registry is supplied**, because N2 pins the
+    tool surface: adding an argument unconditionally would change `CODING`'s
+    digest and make a Lane A spec a Lane B one.
 
     Result is exit code + stdout + stderr formatted as plain text -- no
     JSON wrapping, so the model reads it the way a human reads a terminal.
@@ -313,6 +328,24 @@ def bash_tool(
                     "type": "number",
                     "description": "Timeout in seconds (default 120).",
                 },
+                # Present only with a registry (S-104). N2 pins the tool
+                # surface, so an unconditional argument would change
+                # `CODING`'s digest and make this Lane B.
+                **(
+                    {
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": (
+                                "Start the command detached and return a "
+                                "handle instead of waiting. Use for builds "
+                                "and test suites that outlast a timeout; "
+                                "read progress with bash_output."
+                            ),
+                        }
+                    }
+                    if jobs is not None
+                    else {}
+                ),
             },
             "required": ["command"],
         },
@@ -327,6 +360,13 @@ def bash_tool(
             # ever be mistaken for an agent asking to run something long.
             return LANDING_REFUSAL
         explicit = arguments.get("timeout")
+        if jobs is not None and bool(arguments.get("run_in_background", False)):
+            # Deliberately before the deadline arithmetic below: a detached
+            # command is not bounded by the exec cap, which is the entire
+            # reason it exists. It is bounded by the run instead -- the
+            # landing turn kills every live job.
+            return await _start_background(sandbox, jobs, command)
+
         from_default = explicit is None
         if from_default:
             # An omitted timeout is the harness's number, not the agent's.
@@ -928,6 +968,158 @@ def multi_edit_tool(
         return f"{result}\n\n{check}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+# ---------------------------------------------------------------------------
+# Background execution (S-104)
+# ---------------------------------------------------------------------------
+
+
+async def _start_background(
+    sandbox: Sandbox, jobs: "JobRegistry", command: str
+) -> str:
+    handle = jobs.next_handle()
+    result = await sandbox.exec(start_command(handle, command), timeout=30)
+    # The *last* line: the shell may have written a warning first (dash
+    # prints `can't access tty` when job control is unavailable), and a
+    # sandbox backend may prefix a sentinel of its own. Taking the first
+    # token of the whole stream read those as the pid.
+    lines = [ln for ln in (result.stdout or "").strip().split("\n") if ln.strip()]
+    fields = lines[-1].split() if lines else []
+    pid = fields[0] if fields else ""
+    pgid = fields[1] if len(fields) > 1 else "unknown"
+
+    if result.exit_code != 0 or not pid.isdigit():
+        detail = (result.stderr or "").strip()[:200] or "no pid returned"
+        raise ValueError(f"could not start a background job: {detail}")
+
+    if pgid == "gone":
+        # It finished before its group could be read. Nothing to isolate and
+        # nothing to kill; the exit sentinel carries the result. Recorded as
+        # finished, not merely as unkilled: registering it live meant every
+        # instant job was reaped by signalling a pid the kernel was already
+        # free to reuse, and announced at wind-down as still running.
+        # `exit_code` stays None: it is in the sentinel, unread until the
+        # first poll. `finished` is what the reap and the wind-down notice
+        # actually need to know.
+        jobs.add(
+            Job(handle=handle, command=command, pid=pid, pgid=pid, finished=True)
+        )
+        return (
+            f"started {handle} (pid {pid}) — it has already finished.\n"
+            f"Read its output with bash_output(handle=\"{handle}\")."
+        )
+
+    if pgid != pid:
+        # Refused, not degraded. A job outside its own process group cannot be
+        # killed as a group, so its children outlive every kill -- and both
+        # previous attempts at this failed silently, reporting a started job
+        # and a successful kill while a build kept running. Declining the job
+        # is better than handing back a handle that cannot be honoured.
+        await sandbox.exec(kill_process_command(pid), timeout=10)
+        raise ValueError(
+            f"could not isolate the background job's process group "
+            f"(pid {pid}, group {pgid}); refusing to start it, because a job "
+            f"outside its own group cannot be stopped cleanly. "
+            f"{(result.stderr or '').strip()[:150]}"
+        )
+
+    jobs.add(Job(handle=handle, command=command, pid=pid, pgid=pgid))
+    return (
+        f"started {handle} (pid {pid})\n"
+        f"Poll it with bash_output(handle=\"{handle}\"); stop it with "
+        f"kill(handle=\"{handle}\"). Output is buffered, so nothing is lost "
+        f"between polls."
+    )
+
+
+def bash_output_tool(sandbox: Sandbox, jobs: "JobRegistry | None") -> Tool:
+    """Build ``bash_output``: read what a background job has produced (S-104)."""
+
+    spec = ToolSpec(
+        name="bash_output",
+        description=(
+            "Read new output from a background job started with "
+            "bash(run_in_background=true). Returns only what has appeared "
+            "since the last call, and says whether the job is still running."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "The handle bash returned."},
+            },
+            "required": ["handle"],
+        },
+    )
+
+    async def handler(arguments: dict) -> str:
+        if jobs is None:
+            raise ValueError(
+                "background execution is not enabled for this agent, so "
+                "bash_output has nothing to read"
+            )
+        handle = _require_str("bash_output", arguments, "handle")
+        job = jobs.get(handle)
+        if job is None:
+            known = ", ".join(j.handle for j in jobs.all()) or "none"
+            raise ValueError(f"unknown job {handle!r}; started jobs: {known}")
+        result = await sandbox.exec(poll_command(handle, job.offset), timeout=30)
+        exit_code, output, offset = parse_poll(result.stdout or "")
+        job.polled = True
+        if offset is not None:
+            # From the shell's own `wc -c`, never from the length of the text
+            # that arrived: a non-UTF-8 byte decodes to U+FFFD and re-encodes
+            # to three, and the harness's truncation marker would be counted
+            # as job output. Either desynchronises the offset permanently and
+            # silently drops the rest of the log.
+            job.offset = offset
+        job.exit_code = exit_code
+        if exit_code is not None:
+            job.finished = True
+        status = (
+            f"{handle} finished with exit code {exit_code}"
+            if exit_code is not None
+            else f"{handle} is still running"
+        )
+        return f"{status}\n{output}" if output.strip() else status
+
+    return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+def kill_tool(sandbox: Sandbox, jobs: "JobRegistry | None") -> Tool:
+    """Build ``kill``: stop a background job and its children (S-104)."""
+
+    spec = ToolSpec(
+        name="kill",
+        description=(
+            "Stop a background job started with bash(run_in_background=true), "
+            "including any processes it spawned."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "The handle bash returned."},
+            },
+            "required": ["handle"],
+        },
+    )
+
+    async def handler(arguments: dict) -> str:
+        if jobs is None:
+            raise ValueError(
+                "background execution is not enabled for this agent, so "
+                "kill has nothing to stop"
+            )
+        handle = _require_str("kill", arguments, "handle")
+        job = jobs.get(handle)
+        if job is None:
+            known = ", ".join(j.handle for j in jobs.all()) or "none"
+            raise ValueError(f"unknown job {handle!r}; started jobs: {known}")
+        await sandbox.exec(kill_command(job.pid), timeout=30)
+        job.killed = True
+        return f"killed {handle}"
+
+    return Tool(spec=spec, meta=ToolMeta(side_effect=True), handler=handler)
 
 
 # ---------------------------------------------------------------------------

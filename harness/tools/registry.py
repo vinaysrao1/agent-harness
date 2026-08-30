@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from harness.permissions import ToolMeta
+from harness.jobs import JobRegistry
 from harness.persistence import RunStore
 from harness.secrets import SecretRegistry
 from harness.types import ToolCall, ToolResult, ToolSpec
@@ -130,6 +131,7 @@ class ToolRegistry:
         store: RunStore | None = None,
         agent_id: str | None = None,
         secrets: "SecretRegistry | None" = None,
+        jobs: "JobRegistry | None" = None,
     ) -> None:
         """Build an empty registry.
 
@@ -152,6 +154,11 @@ class ToolRegistry:
         self._store = store
         self._agent_id = agent_id
         self._secrets = secrets
+        #: This agent's background jobs (S-104), or None where the profile
+        #: does not enable them. Public because the loop reaps through it: the
+        #: jobs belong to the tools, and a second copy of that state on the
+        #: loop would be a second thing to keep correct.
+        self.jobs = jobs
 
     def register(self, tool: Tool) -> None:
         """Add ``tool`` to the registry.

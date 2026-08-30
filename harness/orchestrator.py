@@ -58,6 +58,7 @@ from harness.loop import AgentLoop, AgentResult, AskCallable, Budgets
 from harness.memory.store import MemoryStore
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
+from harness.jobs import JobRegistry
 from harness.reads import FileCache, ReadLedger
 from harness.repo import BASELINE_EVENT, GitSubstrate
 from harness.sandbox.base import Sandbox, spill_tool_output
@@ -97,6 +98,8 @@ __all__ = [
     "CORE_RULES",
     "CODING_RULES",
     "CODING_TOOL_FACTORIES",
+    "coding_bash_factory",
+    "repo_bash_factory",
     "ToolDeps",
     "ToolFactory",
     "assemble_rules",
@@ -222,6 +225,10 @@ class ToolDeps:
     #: knowledge of it, and a shared ledger would let one agent's read
     #: silence the other's staleness warning.
     reads: "ReadLedger | None" = None
+    #: This agent's background jobs (S-104). Per agent: a subagent's build is
+    #: not the lead's to reap, and the landing turn kills what *this* loop
+    #: started.
+    jobs: "JobRegistry | None" = None
 
 
 def build_secret_registry(config: HarnessConfig) -> SecretRegistry:
@@ -276,14 +283,36 @@ ToolFactory = Callable[[ToolDeps], Tool]
 #: registration order: the pre-M9a hardcoded build's 12 tools, plus
 #: ``declare_verification`` (§10.3 B1 — the loop re-runs the declared
 #: command before accepting completion).
-CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
-    lambda deps: bash_tool(
+def coding_bash_factory(deps: "ToolDeps") -> Tool:
+    """`bash` without the background parameter — the benchmark's exact schema.
+
+    Named rather than inlined so repo mode can substitute its own by
+    reference. Selecting it by list position would silently pick up whatever
+    ended up first.
+    """
+    return bash_tool(
         deps.sandbox,
         deadline=deps.deadline,
         store=deps.store,
         agent_id=deps.agent_id,
         reads=deps.reads,
-    ),
+    )
+
+
+def repo_bash_factory(deps: "ToolDeps") -> Tool:
+    """`bash` with `run_in_background` (S-104), for profiles that enable it."""
+    return bash_tool(
+        deps.sandbox,
+        deadline=deps.deadline,
+        store=deps.store,
+        agent_id=deps.agent_id,
+        reads=deps.reads,
+        jobs=deps.jobs,
+    )
+
+
+CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
+    coding_bash_factory,
     lambda deps: read_file_tool(deps.sandbox, deps.reads),
     lambda deps: write_file_tool(
         deps.sandbox,
@@ -809,6 +838,7 @@ class Orchestrator:
         deadline: Deadline | None = None,
         written_data: Callable[[], WrittenData | None] | None = None,
         staleness_advisories: bool = False,
+        background_jobs: bool = False,
     ) -> ToolRegistry:
         """Build a registry from ``tool_factories`` bound to this run.
 
@@ -838,6 +868,9 @@ class Orchestrator:
         ``spawn_agent``/``await_agents`` (depth cap 1); :meth:`_execute`
         adds those two to the lead agent's registry only.
         """
+        # Before ToolDeps, which hands it to the tools, and before ToolRegistry,
+        # which the loop reaps through. One object, two readers.
+        job_registry = JobRegistry() if background_jobs else None
         deps = ToolDeps(
             sandbox=sandbox,
             memory=memory,
@@ -858,6 +891,7 @@ class Orchestrator:
             # file created by a `bash` heredoc is "never read", so every later
             # edit would carry one. The cache changes no bytes and stays on.
             reads=ReadLedger(cache=self._file_cache, advise=staleness_advisories),
+            jobs=job_registry,
         )
         factories = (
             CODING_TOOL_FACTORIES if tool_factories is None else tool_factories
@@ -872,6 +906,7 @@ class Orchestrator:
             store=self.store,
             agent_id=agent_id,
             secrets=self.secrets,
+            jobs=job_registry,
         )
         for factory in factories:
             registry.register(factory(deps))
@@ -1127,6 +1162,11 @@ class Orchestrator:
         staleness_advisories = profile is not None and profile.enables(
             "read_staleness"
         )
+        # S-104. Repo mode only: the background parameter changes `bash`'s
+        # schema, which N2 pins.
+        background_jobs = profile is not None and profile.enables(
+            "background_execution"
+        )
 
         memory = MemoryStore(self.config.home / "memory")
         skills = SkillLibrary(self.config.home / "skills")
@@ -1323,6 +1363,7 @@ class Orchestrator:
                             deadline,
                             lambda: child_written,
                             staleness_advisories,
+                            background_jobs,
                         )
                         child_loop = build_loop(
                             child_adapter,
@@ -1401,6 +1442,7 @@ class Orchestrator:
             deadline,
             lambda: lead_written,
             staleness_advisories,
+            background_jobs,
         )
         lead_registry.register(_spawn_agent_tool(spawn_handler))
         lead_registry.register(_await_agents_tool(await_handler))
