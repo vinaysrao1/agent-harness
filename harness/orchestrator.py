@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -57,8 +58,14 @@ from harness.loop import AgentLoop, AgentResult, AskCallable, Budgets
 from harness.memory.store import MemoryStore
 from harness.permissions import Policy, ToolMeta
 from harness.persistence import RunStore
+from harness.reads import FileCache, ReadLedger
 from harness.repo import BASELINE_EVENT, GitSubstrate
 from harness.sandbox.base import Sandbox, spill_tool_output
+from harness.secrets import (
+    CREDENTIAL_ENV_VARS,
+    SecretRegistry,
+    SecretTooShortError,
+)
 from harness.sandbox.docker import DockerSandbox
 from harness.sandbox.local import LocalSandbox
 from harness.skills import SkillLibrary
@@ -96,6 +103,7 @@ __all__ = [
     "UnknownModelError",
     "UnknownRunError",
     "Orchestrator",
+    "build_secret_registry",
 ]
 
 #: Concurrency cap on simultaneously *running* subagents (DESIGN.md §4.12:
@@ -209,6 +217,54 @@ class ToolDeps:
     #: the registry was assembled. ``None`` disables the lint (warn-only
     #: either way — no control flow depends on it).
     written_data: Callable[[], WrittenData | None] | None = None
+    #: This agent's file cache and read ledger (S-102). Per agent, not per
+    #: run: two agents editing the same file have genuinely different
+    #: knowledge of it, and a shared ledger would let one agent's read
+    #: silence the other's staleness warning.
+    reads: "ReadLedger | None" = None
+
+
+def build_secret_registry(config: HarnessConfig) -> SecretRegistry:
+    """Collect the credential values this run already had to resolve (S-108).
+
+    The harness cannot mask a secret it was never told about, and this is the
+    set it demonstrably knows: the credentials in the environment the provider
+    SDKs read, plus any key a configured model resolves. A key that fails to
+    resolve, or is too short to mask safely, is skipped -- registration is
+    best-effort, because a run must not fail because redaction could not be
+    set up.
+
+    Resolving *every* configured model's key is eager and has a cost: a
+    ``keychain:`` reference is a keyring read per model per call. Callers that
+    build many Orchestrators -- the eval runner builds one per trial -- should
+    build this once and pass it to ``Orchestrator(secrets=...)``.
+    """
+    registry = SecretRegistry()
+
+    # Environment credentials first. When config omits `api_key` the adapters
+    # deliberately let the provider SDK read its own variable -- a supported
+    # and probably modal setup -- and reading only `ModelConfig` left the
+    # registry empty for it while the key sat in `os.environ`, inherited by
+    # every sandbox subprocess.
+    for name in CREDENTIAL_ENV_VARS:
+        try:
+            registry.register(f"env:{name}", os.environ.get(name))
+        except SecretTooShortError:
+            continue
+
+    for name, model in config.models.items():
+        try:
+            value = model.resolve_api_key()
+        except Exception:  # noqa: BLE001 - an unresolvable key is not fatal here
+            continue
+        try:
+            registry.register(f"{name}-api-key", value)
+        except SecretTooShortError:
+            # Too short to replace without corrupting ordinary output. Not
+            # masking it is the lesser harm, and it is almost certainly a
+            # placeholder rather than a live credential.
+            continue
+    return registry
 
 
 #: A tool factory: binds the live dependency bundle into a ready
@@ -226,19 +282,22 @@ CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
         deadline=deps.deadline,
         store=deps.store,
         agent_id=deps.agent_id,
+        reads=deps.reads,
     ),
-    lambda deps: read_file_tool(deps.sandbox),
+    lambda deps: read_file_tool(deps.sandbox, deps.reads),
     lambda deps: write_file_tool(
         deps.sandbox,
         deadline=deps.deadline,
         store=deps.store,
         agent_id=deps.agent_id,
+        reads=deps.reads,
     ),
     lambda deps: edit_file_tool(
         deps.sandbox,
         deadline=deps.deadline,
         store=deps.store,
         agent_id=deps.agent_id,
+        reads=deps.reads,
     ),
     lambda deps: memory_read_fact_tool(deps.memory),
     lambda deps: memory_write_fact_tool(deps.memory),
@@ -364,9 +423,26 @@ class Orchestrator:
         :mod:`harness.persistence`'s threading contract).
     """
 
-    def __init__(self, config: HarnessConfig, store: RunStore) -> None:
+    def __init__(
+        self,
+        config: HarnessConfig,
+        store: RunStore,
+        secrets: "SecretRegistry | None" = None,
+    ) -> None:
         self.config = config
         self.store = store
+        #: Credential values to redact from tool results and persisted events
+        #: (S-108). Built from the configured models' API keys unless the
+        #: caller supplies one. Empty when no model has a resolvable key,
+        #: which is the case for every fake-adapter test and therefore the
+        #: case the neutrality invariants observe.
+        self.secrets = (
+            secrets if secrets is not None else build_secret_registry(config)
+        )
+        # The store is built by the caller, before a registry can exist, so it
+        # is told here rather than at construction. Without this the whole
+        # persistence half of S-108 was unreachable outside its own tests.
+        store.bind_secrets(self.secrets)
         #: Every live :class:`AgentLoop` of the current run (lead first).
         self._live_loops: list[AgentLoop] = []
         #: Allow-patterns granted mid-run via :meth:`grant` ("always for
@@ -374,6 +450,9 @@ class Orchestrator:
         self._grants: list[str] = []
         #: Lead agent id of the current run; where grant events persist.
         self._lead_agent_id: str | None = None
+        #: One file cache per run, shared by the lead and every subagent
+        #: because they share a sandbox by default (S-102).
+        self._file_cache = FileCache()
 
     # -- session grants ------------------------------------------------------
 
@@ -729,6 +808,7 @@ class Orchestrator:
         tool_factories: Sequence[ToolFactory] | None = None,
         deadline: Deadline | None = None,
         written_data: Callable[[], WrittenData | None] | None = None,
+        staleness_advisories: bool = False,
     ) -> ToolRegistry:
         """Build a registry from ``tool_factories`` bound to this run.
 
@@ -768,6 +848,16 @@ class Orchestrator:
             context=context,
             deadline=deadline,
             written_data=written_data,
+            # One ledger per agent over one cache per run (S-102). The cache
+            # is a belief about the filesystem, which subagents share; the
+            # versions are what *this* agent has seen. A per-agent cache let a
+            # child rewrite a file while the parent kept serving old bytes.
+            #
+            # `advise` is off unless the profile asks for it: a stale-edit
+            # advisory changes tool-result bytes, and on the benchmark path a
+            # file created by a `bash` heredoc is "never read", so every later
+            # edit would carry one. The cache changes no bytes and stays on.
+            reads=ReadLedger(cache=self._file_cache, advise=staleness_advisories),
         )
         factories = (
             CODING_TOOL_FACTORIES if tool_factories is None else tool_factories
@@ -777,7 +867,12 @@ class Orchestrator:
             """Write an oversized tool result into the sandbox's /tmp."""
             return await spill_tool_output(sandbox, content)
 
-        registry = ToolRegistry(spill=spill, store=self.store, agent_id=agent_id)
+        registry = ToolRegistry(
+            spill=spill,
+            store=self.store,
+            agent_id=agent_id,
+            secrets=self.secrets,
+        )
         for factory in factories:
             registry.register(factory(deps))
         return registry
@@ -1025,6 +1120,13 @@ class Orchestrator:
         self._live_loops = []
         self._grants = list(grants)
         self._lead_agent_id = lead_agent_id
+        self._file_cache = FileCache()
+        # S-102 advisories are a repo-mode feature. On the benchmark path a
+        # file created by a `bash` heredoc has never been "read", so every
+        # later edit would carry an advisory and change the tool-result bytes.
+        staleness_advisories = profile is not None and profile.enables(
+            "read_staleness"
+        )
 
         memory = MemoryStore(self.config.home / "memory")
         skills = SkillLibrary(self.config.home / "skills")
@@ -1220,6 +1322,7 @@ class Orchestrator:
                             tool_factories,
                             deadline,
                             lambda: child_written,
+                            staleness_advisories,
                         )
                         child_loop = build_loop(
                             child_adapter,
@@ -1297,6 +1400,7 @@ class Orchestrator:
             tool_factories,
             deadline,
             lambda: lead_written,
+            staleness_advisories,
         )
         lead_registry.register(_spawn_agent_tool(spawn_handler))
         lead_registry.register(_await_agents_tool(await_handler))

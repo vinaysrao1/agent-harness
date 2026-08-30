@@ -128,10 +128,21 @@ class TestCapabilitiesAreAskedForNotSwitchedOn:
 
     def test_S004_repo_capabilities_are_named_not_implemented(self) -> None:
         # Naming them is the seam; none is active until the environment
-        # affirms it (S-005) and the feature exists (Layer 2). CODING_REPO
-        # therefore still ships today's tool set.
+        # affirms it (S-005) and the feature exists.
         assert CODING_REPO.capabilities == REPO_CAPABILITIES
-        assert CODING_REPO.tool_factories == CODING_TOOL_FACTORIES
+
+    def test_S004_repo_tools_are_a_superset_of_the_benchmark_profile(self) -> None:
+        # This asserted equality until S-103, whose whole point was to add
+        # `multi_edit` to repo mode. The invariant that actually matters is
+        # not "the lists are equal" but "CODING's list is untouched": repo
+        # mode may grow, the benchmark profile may not, because tool-surface
+        # growth degrades selection quality on the scored model. A promotion
+        # into CODING is Lane B and must remove or merge an existing tool.
+        assert len(CODING_REPO.tool_factories) > len(CODING_TOOL_FACTORIES)
+        assert CODING_REPO.tool_factories[: len(CODING_TOOL_FACTORIES)] == (
+            CODING_TOOL_FACTORIES
+        )
+        assert CODING.tool_factories == CODING_TOOL_FACTORIES
 
     def test_S004_no_profile_leaks_capabilities_into_coding(self) -> None:
         for profile in ALL_PROFILES:

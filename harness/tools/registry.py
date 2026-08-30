@@ -25,6 +25,7 @@ from typing import Final
 
 from harness.permissions import ToolMeta
 from harness.persistence import RunStore
+from harness.secrets import SecretRegistry
 from harness.types import ToolCall, ToolResult, ToolSpec
 
 __all__ = [
@@ -128,6 +129,7 @@ class ToolRegistry:
         spill: SpillWriter | None = None,
         store: RunStore | None = None,
         agent_id: str | None = None,
+        secrets: "SecretRegistry | None" = None,
     ) -> None:
         """Build an empty registry.
 
@@ -140,11 +142,16 @@ class ToolRegistry:
         ``tool_output_spilled`` transcript event on that agent's stream
         (measurement first: whether a named path is actually read is the
         question the mechanism exists to answer).
+
+        ``secrets`` (S-108) redacts known credential values from every result
+        before it is measured, spilled, or returned. ``None`` and an empty
+        registry are both exact no-ops.
         """
         self._tools: dict[str, Tool] = {}
         self._spill = spill
         self._store = store
         self._agent_id = agent_id
+        self._secrets = secrets
 
     def register(self, tool: Tool) -> None:
         """Add ``tool`` to the registry.
@@ -223,6 +230,9 @@ class ToolRegistry:
         ``spill`` writer, the full result is first written into the sandbox
         and the marker names that path and how to read it.
         """
+        def _mask(text: str) -> str:
+            return self._secrets.mask(text) if self._secrets is not None else text
+
         try:
             tool = self._tools[call.name]
         except KeyError:
@@ -234,11 +244,24 @@ class ToolRegistry:
         try:
             content = await tool.handler(call.arguments)
         except Exception as exc:  # noqa: BLE001 - deliberately broad; see docstring
+            # Masked like any other result. An exception message routinely
+            # carries the thing that failed -- a CalledProcessError with the
+            # command, an HTTP client raising with the request URL -- and this
+            # return goes to the model's context and the event log exactly as
+            # a successful one does.
             return ToolResult(
                 tool_call_id=call.id,
-                content=f"tool {call.name!r} raised {type(exc).__name__}: {exc}",
+                content=_mask(
+                    f"tool {call.name!r} raised {type(exc).__name__}: {exc}"
+                ),
                 is_error=True,
             )
+        # Masked here, before anything measures or copies it (S-108). The
+        # spill below writes the *full* result into the sandbox, so masking
+        # after truncation would keep the model's copy clean and leave the
+        # secret on disk. An empty registry returns the same string, so the
+        # benchmark path pays one boolean check.
+        content = _mask(content)
         full_bytes = len(content.encode("utf-8"))
         spill_path: str | None = None
         if full_bytes > MAX_RESULT_BYTES:

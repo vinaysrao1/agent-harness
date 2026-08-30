@@ -42,9 +42,10 @@ from harness.eval.pr_replay import (
 )
 from harness.eval.suite import Suite, render_command
 from harness.loop import Budgets
-from harness.orchestrator import Orchestrator
+from harness.orchestrator import Orchestrator, build_secret_registry
 from harness.persistence import RunStore
 from harness.profiles import CODING_REPO
+from harness.secrets import SecretRegistry
 from harness.repo import (
     BASELINE_EVENT,
     CHECKPOINT_EVENT,
@@ -190,6 +191,7 @@ async def run_trial(
     store: RunStore,
     workdir: Path,
     trial: int = 0,
+    secrets: "SecretRegistry | None" = None,
 ) -> TaskOutcome:
     """Run one agent attempt at one task and grade it.
 
@@ -214,7 +216,11 @@ async def run_trial(
             # failure cannot be attributed to the agent either.
             baseline_green = baseline.passed if baseline.ran else None
 
-        orchestrator = Orchestrator(config, store)
+        # One registry for the whole suite, not one per trial: building it
+        # resolves every configured model's API key, and a `keychain:`
+        # reference is a keyring read each time -- which on a 60-trial suite
+        # is 60 unlock prompts for models the run never uses.
+        orchestrator = Orchestrator(config, store, secrets=secrets)
         run_id, result = await orchestrator.run_task(
             task.prompt(include_body=settings.include_commit_body),
             settings.model,
@@ -310,6 +316,8 @@ async def run_suite(
     measurements meaningless and put several agents on the same machine's CPU
     while one of them is being timed.
     """
+    # Built once for the suite; see `run_trial`.
+    secrets = build_secret_registry(config)
     report = SuiteReport()
     for trial in range(trials):
         for task in tasks:
@@ -317,6 +325,7 @@ async def run_suite(
                 outcome = await run_trial(
                     task, suite, settings,
                     config=config, store=store, workdir=workdir, trial=trial,
+                    secrets=secrets,
                 )
             except Exception:  # noqa: BLE001
                 # A suite is hours of model calls. Losing all of it because

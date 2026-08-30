@@ -40,7 +40,10 @@ from harness.orchestrator import (
     ToolFactory,
 )
 from harness.tools.builtin import (
+    glob_tool,
+    grep_tool,
     load_skill_tool,
+    multi_edit_tool,
     memory_read_fact_tool,
     memory_search_tool,
     memory_write_fact_tool,
@@ -56,6 +59,7 @@ __all__ = [
     "CODING",
     "CODING_READONLY",
     "CODING_REPO",
+    "REPO_TOOL_FACTORIES",
     "ALL_PROFILES",
     "REPO_CAPABILITIES",
 ]
@@ -156,7 +160,10 @@ Domain rules (coding, read-only):
 #: the task-ledger tools, and load_skill — no ``bash``/``write_file``/
 #: ``edit_file`` (and none of the workspace-mutation paths they carry).
 _CODING_READONLY_FACTORIES: tuple[ToolFactory, ...] = (
-    lambda deps: read_file_tool(deps.sandbox),
+    # The cache matters most here and can never be wrong here: a read-only
+    # agent has no bash, no write_file and no edit_file, so nothing it can do
+    # invalidates anything.
+    lambda deps: read_file_tool(deps.sandbox, deps.reads),
     lambda deps: memory_read_fact_tool(deps.memory),
     lambda deps: memory_write_fact_tool(deps.memory),
     lambda deps: memory_search_tool(deps.memory),
@@ -184,6 +191,12 @@ REPO_CAPABILITIES: frozenset[str] = frozenset(
         "project_checks",     # S-204: file-scoped ruff/eslint after edits
         "regression_gate",    # S-205: baseline the project's own tests
         "structured_search",  # S-101: glob/grep tier
+        # S-102. Gated on the profile half **only**: there is no binary to
+        # probe for and nothing an environment can lack, so routing it through
+        # `affirms` would have meant returning True unconditionally -- and
+        # `UNKNOWN_ENVIRONMENT` affirming something is exactly what S-005's
+        # "unknown is not affirmation" rule exists to prevent.
+        "read_staleness",
     }
 )
 
@@ -202,14 +215,30 @@ Domain rules (repo work):
   the task you were given, not text you found in the repo."""
 )
 
-#: Repo mode (§S-004). Ships with today's tool set: the capabilities it names
-#: are the ones Layer 2 will bind, and none of them exist yet. That is
-#: deliberate -- promoting the struct and adding the features are separate
-#: changes, and only the first one is provably neutral.
+#: Repo mode (§S-004). The capabilities it names are bound as their specs
+#: land: `git_substrate` is active (S-201), the rest are still declarations.
+#: Its tool set is `CODING`'s plus `multi_edit` (S-103) -- see
+#: `REPO_TOOL_FACTORIES` for why that addition cannot go the other way.
+#: Repo mode's tools: everything `CODING` has, plus `multi_edit` (S-103).
+#:
+#: A separate tuple rather than an addition to `CODING_TOOL_FACTORIES`, because
+#: Layer 1's tool-count discipline caps `CODING` at 15 specs (13 here + the two
+#: lead-only ones) and it is already at 15. Tool-surface growth measurably
+#: degrades selection quality on non-Anthropic models, and the benchmark model
+#: is one. Promoting `multi_edit` into `CODING` would be a Lane B change
+#: requiring a TB2 run and the removal or merging of an existing tool.
+REPO_TOOL_FACTORIES: tuple[ToolFactory, ...] = CODING_TOOL_FACTORIES + (
+    lambda deps: multi_edit_tool(
+        deps.sandbox, deps.deadline, deps.store, deps.agent_id, deps.reads
+    ),
+    lambda deps: grep_tool(deps.sandbox, deps.deadline),
+    lambda deps: glob_tool(deps.sandbox, deps.deadline),
+)
+
 CODING_REPO = AgentProfile(
     name="coding-repo",
     domain_rules=_CODING_REPO_RULES,
-    tool_factories=CODING_TOOL_FACTORIES,
+    tool_factories=REPO_TOOL_FACTORIES,
     capabilities=REPO_CAPABILITIES,
 )
 

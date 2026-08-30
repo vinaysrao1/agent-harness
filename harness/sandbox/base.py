@@ -26,6 +26,8 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from harness.edits import describe_mismatch
+
 __all__ = [
     "MAX_OUTPUT_BYTES",
     "SPILL_DIR",
@@ -296,7 +298,15 @@ def apply_edit(
         raise SandboxError("old_string must be non-empty")
     count = content.count(old_string)
     if count == 0:
-        raise SandboxError("old_string not found in file")
+        # Keeps its original opening so callers matching on it still match;
+        # what follows is S-103's diagnostic. A bare "not found" throws away
+        # everything needed to fix the edit -- the file was just read, so the
+        # near-miss and the reason are already in hand, and the common failure
+        # is whitespace, not absence.
+        detail = describe_mismatch(content, old_string)
+        raise SandboxError(
+            "old_string not found in file" + (f"\n{detail}" if detail else "")
+        )
     if not replace_all and count > 1:
         raise SandboxError(
             f"old_string is not unique in file ({count} occurrences); pass "

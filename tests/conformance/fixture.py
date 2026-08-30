@@ -24,6 +24,8 @@ from harness.orchestrator import (
     _spawn_agent_tool,
 )
 from harness.permissions import PermissionMode
+from harness.reads import FileCache
+from harness.secrets import SecretRegistry
 from harness.skills import SkillLibrary
 from harness.types import Role, ToolSpec
 
@@ -165,6 +167,16 @@ def coding_tool_specs(
     """
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.store = store
+    # The benchmark path has no secrets to redact, and an empty registry is
+    # the identity function -- which is exactly the state N2 must pin. Set
+    # explicitly rather than defaulted inside `_build_registry`, so an
+    # Orchestrator built without one stays a construction bug rather than
+    # becoming a silent no-op.
+    orchestrator.secrets = SecretRegistry()
+    # One cache per run (S-102). Set explicitly for the same reason as
+    # `secrets` above: an Orchestrator built without one stays a construction
+    # bug rather than becoming a silent no-op.
+    orchestrator._file_cache = FileCache()
     skills = fixture_skills(tmp_path)
     registry = orchestrator._build_registry(
         sandbox=_InertSandbox(),

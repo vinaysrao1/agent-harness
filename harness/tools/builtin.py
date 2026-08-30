@@ -40,11 +40,23 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from harness.checks import run_syntax_check
 from harness.deadline import Deadline
+from harness.edits import EditError, apply_edits
+from harness.search import (
+    DEFAULT_HEAD_LIMIT,
+    MAX_HEAD_LIMIT,
+    OUTPUT_MODES,
+    SearchRequest,
+    fallback_program,
+    describe_failure,
+    render_results,
+    ripgrep_command,
+)
 from harness.diligence import (
     VERIFICATION_LINT_EVENT,
     VERIFICATION_TOOL_NAME,
@@ -54,8 +66,9 @@ from harness.diligence import (
 )
 from harness.memory.store import FactType, MemoryStore
 from harness.permissions import ToolMeta
+from harness.reads import ReadLedger
 from harness.persistence import RunStore, TaskLedgerItem
-from harness.sandbox.base import Sandbox
+from harness.sandbox.base import Sandbox, apply_edit
 from harness.skills import SkillLibrary
 from harness.tools.registry import Tool
 from harness.types import ToolSpec
@@ -216,6 +229,7 @@ def bash_tool(
     deadline: Deadline | None = None,
     store: RunStore | None = None,
     agent_id: str | None = None,
+    reads: "ReadLedger | None" = None,
 ) -> Tool:
     """Build the ``bash`` tool: runs a shell command in ``sandbox``.
 
@@ -404,7 +418,15 @@ def bash_tool(
             f"no timeout was given, so the default was shortened to "
             f"{effective}s to fit the ~{remaining}s of wall-clock remaining"
         )
-        result = await sandbox.exec(command, timeout=effective)
+        try:
+            result = await sandbox.exec(command, timeout=effective)
+        finally:
+            if reads is not None:
+                # In a `finally`: a command that raises part way through may
+                # already have written. A shell command can rewrite any path
+                # without the harness learning which, so everything cached is
+                # now a belief rather than knowledge.
+                reads.invalidate_all()
         lines = [f"exit code: {result.exit_code}"]
         if result.timed_out:
             if capped:
@@ -441,7 +463,7 @@ def bash_tool(
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
 
 
-def read_file_tool(sandbox: Sandbox) -> Tool:
+def read_file_tool(sandbox: Sandbox, reads: "ReadLedger | None" = None) -> Tool:
     """Build the ``read_file`` tool: reads a text file from ``sandbox``.
 
     Three optional arguments (DESIGN.md §10.2 A4) turn a whole-file read into
@@ -510,7 +532,20 @@ def read_file_tool(sandbox: Sandbox) -> Tool:
 
     async def handler(arguments: dict) -> str:
         path = _require_str("read_file", arguments, "path")
-        content = await sandbox.read_file(path)
+        # S-102: a cache hit costs nothing; a miss costs the read it would
+        # have cost anyway. No revalidating stat -- that would be the sandbox
+        # call this exists to avoid. Correctness comes from invalidation on
+        # observed writes and after any `bash` command.
+        content = reads.cached(path) if reads is not None else None
+        if content is None:
+            # The generation is taken *before* the await. Tool calls in a turn
+            # run concurrently, so a `bash` invalidation can land while this
+            # read is suspended -- and storing afterwards would reinsert
+            # pre-command bytes that nothing would evict again.
+            generation = reads.generation if reads is not None else None
+            content = await sandbox.read_file(path)
+            if reads is not None:
+                reads.record_read(path, content, generation=generation)
 
         raw_offset = arguments.get("offset")
         raw_limit = arguments.get("limit")
@@ -585,6 +620,7 @@ def write_file_tool(
     deadline: Deadline | None = None,
     store: RunStore | None = None,
     agent_id: str | None = None,
+    reads: "ReadLedger | None" = None,
 ) -> Tool:
     """Build the ``write_file`` tool: writes/overwrites/appends a file in ``sandbox``.
 
@@ -664,6 +700,14 @@ def write_file_tool(
                 f"{_WRITE_FILE_MODES!r}, got {mode!r}"
             )
         await sandbox.write_file(path, content, mode=mode)
+        if reads is not None:
+            if mode == "overwrite":
+                reads.note_write(path, content)
+            else:
+                # Appended: the harness knows a change happened but not the
+                # resulting whole, and claiming to know it would be worse
+                # than admitting it does not.
+                reads.invalidate(path)
         size = len(content.encode("utf-8"))
         verb = "appended" if mode == "append" else "wrote"
         result = f"{verb} {size} bytes to {path}"
@@ -688,6 +732,7 @@ def edit_file_tool(
     deadline: Deadline | None = None,
     store: RunStore | None = None,
     agent_id: str | None = None,
+    reads: "ReadLedger | None" = None,
 ) -> Tool:
     """Build the ``edit_file`` tool: an old/new-string replacement in ``sandbox``.
 
@@ -740,10 +785,32 @@ def edit_file_tool(
         old_string = _require_str("edit_file", arguments, "old_string")
         new_string = _require_str("edit_file", arguments, "new_string")
         replace_all = bool(arguments.get("replace_all", False))
+
+        stale = None
+        before = ""
+        if reads is not None:
+            before = await sandbox.read_file(path)
+            stale = reads.check(path, before)
+
         await sandbox.edit_file(
             path, old_string, new_string, replace_all=replace_all
         )
         result = f"edited {path}"
+        if reads is not None:
+            # The harness authored this content, so it knows it. `before` is
+            # already in hand and the edit is deterministic, so the result is
+            # computed rather than re-read. Without this, a second edit to the
+            # same file warned that it "changed since it was last read" --
+            # blaming an external change for the harness's own edit, on the
+            # commonest sequence there is.
+            reads.note_write(
+                path, apply_edit(before, old_string, new_string, replace_all=replace_all)
+            )
+        if stale is not None:
+            # Appended, never raised: rejecting the edit would add a failure
+            # mode under a wall clock, and the harness's belief about
+            # staleness is itself approximate.
+            result = f"{result}\n\n{stale.advisory()}"
         check = await run_syntax_check(
             sandbox,
             path,
@@ -757,6 +824,369 @@ def edit_file_tool(
         return f"{result}\n\n{check}"
 
     return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+def multi_edit_tool(
+    sandbox: Sandbox,
+    deadline: Deadline | None = None,
+    store: RunStore | None = None,
+    agent_id: str | None = None,
+    reads: "ReadLedger | None" = None,
+) -> Tool:
+    """Build the ``multi_edit`` tool: several edits to one file, atomically (S-103).
+
+    Two properties, and both are the point:
+
+    **Atomic.** Every edit is applied to an in-memory copy and the file is
+    written once, after all of them succeed. A failure part way through leaves
+    the file byte-identical -- there is no partial state to roll back, because
+    nothing was written. A model that half-applies a three-hunk change and then
+    has to reason about which half landed is a model that has lost the thread.
+
+    **One check, not N.** :func:`~harness.checks.run_syntax_check` runs after
+    the whole batch. Running it per edit would report a syntax error for every
+    intermediate state -- which is *expected*, since a rename touching three
+    call sites is broken after the first one -- and would spend the deadline
+    three times to say so.
+    """
+
+    spec = ToolSpec(
+        name="multi_edit",
+        description=(
+            "Apply several old_string/new_string edits to ONE file in a single "
+            "call. Edits apply in order and each sees the previous one's "
+            "result. Either all of them apply or the file is left untouched. "
+            "Prefer this over repeated edit_file calls on the same file."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the sandbox workspace root.",
+                },
+                "edits": {
+                    "type": "array",
+                    "description": "Edits to apply in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": "Exact text to replace.",
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "Text to replace it with.",
+                            },
+                            "replace_all": {
+                                "type": "boolean",
+                                "description": "Replace every occurrence (default false).",
+                            },
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                },
+            },
+            "required": ["path", "edits"],
+        },
+    )
+
+    async def handler(arguments: dict) -> str:
+        path = _require_str("multi_edit", arguments, "path")
+        edits = arguments.get("edits")
+        if not isinstance(edits, list) or not edits:
+            raise ValueError("multi_edit requires a non-empty 'edits' array")
+
+        content = await sandbox.read_file(path)
+        stale = reads.check(path, content) if reads is not None else None
+        try:
+            edited = apply_edits(content, edits)
+        except EditError as exc:
+            # Nothing has been written; say so, because the model's next move
+            # depends on whether it is looking at a half-edited file.
+            raise ValueError(
+                f"{exc}\n\nNo changes were written to {path}."
+            ) from exc
+
+        await sandbox.write_file(path, edited, mode="overwrite")
+        if reads is not None:
+            reads.note_write(path, edited)
+        result = f"applied {len(edits)} edit(s) to {path}"
+        if stale is not None:
+            result = f"{result}\n\n{stale.advisory()}"
+        check = await run_syntax_check(
+            sandbox,
+            path,
+            deadline=deadline,
+            store=store,
+            agent_id=agent_id,
+            tool="multi_edit",
+        )
+        if check is None:
+            return result
+        return f"{result}\n\n{check}"
+
+    return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+# ---------------------------------------------------------------------------
+# Structured search (S-101)
+# ---------------------------------------------------------------------------
+
+
+#: Directories the `find` fallback prunes, mirroring the grep fallback's
+#: SKIP_DIRS. `rg --files` honours .gitignore and skips hidden files, so
+#: without this the two engines return unrelated answers in any real repo.
+_GLOB_SKIP_DIRS = (
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "target", "dist",
+    "build", ".tox", ".next",
+)
+
+
+def _find_path_pattern(pattern: str) -> str:
+    """Translate a glob into a ``find -path`` pattern.
+
+    Three things `find` needs that a glob does not say:
+
+    - ``-path`` matches the path **as find prints it**, which begins ``./``, so
+      a bare ``pkg/*.py`` matches nothing. A leading ``*/`` covers that and any
+      depth above it.
+    - ``*`` already spans ``/`` in ``-path``, so ``**/`` is redundant — and
+      *harmful*, because it then requires at least one directory: ``pkg/**/*.py``
+      would miss ``pkg/b.py``. It is removed rather than translated.
+    - A pattern that already starts with ``*`` needs no prefix; adding one
+      makes ``*/pkg/*.py`` into ``*/*/pkg/*.py``, which requires an extra
+      directory level that is not there.
+    """
+    cleaned = pattern.lstrip("./").replace("**/", "").replace("**", "*")
+    if pattern.startswith("*"):
+        return pattern.replace("**/", "").replace("**", "*")
+    return f"*/{cleaned}"
+
+
+class _Engine:
+    """Which search backend this sandbox has, decided once and remembered.
+
+    Probed at first use rather than read from :class:`EnvironmentProfile`,
+    because a registry is built before the environment probe runs and a tool
+    that captured "no rg" at construction time would keep believing it for the
+    whole run. One `command -v` per sandbox is cheaper than being wrong.
+    """
+
+    def __init__(self, sandbox: Sandbox) -> None:
+        self._sandbox = sandbox
+        self._has_ripgrep: bool | None = None
+
+    async def has_ripgrep(self) -> bool:
+        if self._has_ripgrep is None:
+            try:
+                result = await self._sandbox.exec("command -v rg", timeout=10)
+                self._has_ripgrep = result.exit_code == 0 and bool(result.stdout.strip())
+            except Exception:  # noqa: BLE001 - absence is the safe assumption
+                self._has_ripgrep = False
+        return self._has_ripgrep
+
+
+def _contained(tool: str, path: str | None) -> str | None:
+    """Reject a path that leaves the workspace.
+
+    Every other file-touching tool resolves against the workspace root; search
+    took its `path` verbatim, so `/etc` and `../` both worked and returned
+    real results. Read-only, but it is still the harness reading files the
+    agent was not given.
+    """
+    if path is None:
+        return None
+    if not isinstance(path, str):
+        raise ValueError(f"{tool}: 'path' must be a string")
+    if path.startswith("/") or path.startswith("~"):
+        raise ValueError(f"{tool}: 'path' must be inside the workspace, got {path!r}")
+    if any(part == ".." for part in path.replace("\\", "/").split("/")):
+        raise ValueError(f"{tool}: 'path' must not contain '..', got {path!r}")
+    return path
+
+
+async def _run_search(
+    engine: _Engine, sandbox: Sandbox, request: SearchRequest, timeout: float
+) -> str:
+    """Execute ``request`` with whichever backend is available.
+
+    The exit code, stderr and timeout flag are all consulted. `Sandbox.exec`
+    does not raise on a non-zero exit — it returns them — so an earlier version
+    that only wrapped this in `try/except` discarded every one of them and
+    rendered empty stdout as "no matches". An invalid regex, an unknown
+    `--type`, a missing `python3` and a backtracking timeout all reported the
+    repository as not containing the pattern.
+    """
+    if await engine.has_ripgrep():
+        command = ripgrep_command(request)
+        name = "rg"
+    else:
+        command, _ = fallback_program(request)
+        name = "python fallback"
+    try:
+        result = await sandbox.exec(command, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"search failed: {exc}") from exc
+
+    failure = describe_failure(
+        request,
+        engine=name,
+        exit_code=result.exit_code,
+        stderr=getattr(result, "stderr", "") or "",
+        timed_out=bool(getattr(result, "timed_out", False)),
+    )
+    if failure is not None:
+        raise ValueError(failure)
+    return render_results(request, result.stdout or "", engine=name)
+
+
+def grep_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
+    """Build the ``grep`` tool: regex search over the workspace (S-101)."""
+
+    engine = _Engine(sandbox)
+
+    spec = ToolSpec(
+        name="grep",
+        description=(
+            "Search file contents by regular expression. Returns matching file "
+            "paths by default; set output_mode='content' for matching lines "
+            "with line numbers, or 'count' for per-file totals. Results are "
+            "capped, so prefer a narrow `path` or `glob` over a broad pattern."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regular expression to search for."},
+                "path": {"type": "string", "description": "Directory or file to search (default: the workspace root)."},
+                "glob": {"type": "string", "description": "Only search files matching this glob, e.g. '*.py'."},
+                "type": {"type": "string", "description": "Only search this ripgrep file type, e.g. 'py'. Ignored without ripgrep."},
+                "output_mode": {
+                    "type": "string",
+                    "enum": list(OUTPUT_MODES),
+                    "description": "files_with_matches (default), content, or count.",
+                },
+                "context": {"type": "integer", "description": "Lines of context around each match (content mode only)."},
+                "head_limit": {"type": "integer", "description": f"Maximum results (default {DEFAULT_HEAD_LIMIT}, hard cap {MAX_HEAD_LIMIT})."},
+                "case_insensitive": {"type": "boolean", "description": "Match case-insensitively."},
+            },
+            "required": ["pattern"],
+        },
+    )
+
+    async def handler(arguments: dict) -> str:
+        request = SearchRequest(
+            pattern=_require_str("grep", arguments, "pattern"),
+            path=_contained("grep", arguments.get("path")),
+            glob=arguments.get("glob"),
+            type=arguments.get("type"),
+            output_mode=arguments.get("output_mode", "files_with_matches"),
+            context=int(arguments.get("context", 0) or 0),
+            head_limit=int(arguments.get("head_limit", DEFAULT_HEAD_LIMIT) or DEFAULT_HEAD_LIMIT),
+            case_insensitive=bool(arguments.get("case_insensitive", False)),
+        )
+        return await _run_search(engine, sandbox, request, _search_timeout(deadline))
+
+    return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+def glob_tool(sandbox: Sandbox, deadline: Deadline | None = None) -> Tool:
+    """Build the ``glob`` tool: find files by name pattern (S-101)."""
+
+    engine = _Engine(sandbox)
+
+    spec = ToolSpec(
+        name="glob",
+        description=(
+            "Find files whose path matches a glob pattern, e.g. '*.py' or "
+            "'src/**/*.ts'. Returns paths only. Results are capped."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern, e.g. '*.py'."},
+                "path": {"type": "string", "description": "Directory to search under (default: the workspace root)."},
+                "head_limit": {"type": "integer", "description": f"Maximum results (default {DEFAULT_HEAD_LIMIT}, hard cap {MAX_HEAD_LIMIT})."},
+            },
+            "required": ["pattern"],
+        },
+    )
+
+    async def handler(arguments: dict) -> str:
+        pattern = _require_str("glob", arguments, "pattern")
+        limit = int(arguments.get("head_limit") or DEFAULT_HEAD_LIMIT)
+        path = _contained("glob", arguments.get("path"))
+        timeout = _search_timeout(deadline)
+
+        using_ripgrep = await engine.has_ripgrep()
+        if using_ripgrep:
+            args = ["rg", "--files", "--no-messages", "--glob", pattern]
+            if path:
+                args.append(path)
+            command = " ".join(shlex.quote(a) for a in args)
+            name = "rg"
+        else:
+            # `-name` matches the basename only, so a pattern containing a
+            # separator has to go to `-path` -- and `-path` matches the path
+            # *as find prints it*, which begins "./". Matching the bare pattern
+            # made every documented example ('pkg/*.py', 'src/**/*.ts') return
+            # nothing, which reads to the model as "no such file".
+            #
+            # `*` spans `/` in `-path`, so a leading `*/` covers any depth and
+            # `**` needs no special handling.
+            if "/" in pattern:
+                flag, target = "-path", _find_path_pattern(pattern)
+            else:
+                flag, target = "-name", pattern
+            prune = " -o ".join(
+                f"-name {shlex.quote(name)}" for name in _GLOB_SKIP_DIRS
+            )
+            # Same noise directories the grep fallback skips. Without this,
+            # glob('*.py') in a repo with a .venv returns fifty vendored files
+            # and a "stopped at 50" notice, while the rg engine -- which honours
+            # .gitignore -- returns the sources.
+            command = (
+                f"find {shlex.quote(path or '.')} "
+                f"\\( -type d \\( {prune} \\) -prune \\) -o "
+                f"\\( -type f {flag} {shlex.quote(target)} -print \\) 2>/dev/null"
+            )
+            name = "find"
+        try:
+            result = await sandbox.exec(command, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"glob failed: {exc}") from exc
+
+        request = SearchRequest(pattern=pattern, head_limit=limit)
+        failure = describe_failure(
+            request,
+            engine=name,
+            exit_code=result.exit_code,
+            stderr=getattr(result, "stderr", "") or "",
+            timed_out=bool(getattr(result, "timed_out", False)),
+        )
+        if failure is not None:
+            raise ValueError(failure)
+        return render_results(request, result.stdout or "", engine=name)
+
+    return Tool(spec=spec, meta=_NOT_SIDE_EFFECTING, handler=handler)
+
+
+def _search_timeout(deadline: Deadline | None) -> float:
+    """Seconds a search may take, shrunk to fit the remaining wall clock."""
+    default = 30.0
+    if deadline is None:
+        return default
+    affordable = getattr(deadline, "affordable_exec_seconds", None)
+    if callable(affordable):
+        try:
+            available = affordable()
+        except Exception:  # noqa: BLE001
+            return default
+        if available is not None:
+            return max(1.0, min(default, available))
+    return default
 
 
 # ---------------------------------------------------------------------------

@@ -359,13 +359,23 @@ def record_written_data(
 ) -> None:
     """Feed one successful tool call into ``written_data``.
 
-    Only three tools can put a literal into a file: ``write_file`` (whole
-    ``content``), ``edit_file`` (the ``new_string`` it splices in), and
-    ``bash`` — the latter strictly through an ``echo``/``printf`` redirect
-    or a heredoc into a file (:func:`_record_bash_writes`). A ``bash``
-    command that redirects a *program's* output into a file records
-    nothing, which is exactly what keeps ``grep -q PASS test.log`` off the
-    tautology list. Unknown tools and malformed arguments are ignored.
+    Four tools can put a literal into a file: ``write_file`` (whole
+    ``content``), ``edit_file`` (the ``new_string`` it splices in),
+    ``multi_edit`` (every edit's ``new_string``), and ``bash`` — the latter
+    strictly through an ``echo``/``printf`` redirect or a heredoc into a file
+    (:func:`_record_bash_writes`). A ``bash`` command that redirects a
+    *program's* output into a file records nothing, which is exactly what
+    keeps ``grep -q PASS test.log`` off the tautology list. Unknown tools and
+    malformed arguments are ignored.
+
+    ``multi_edit`` (S-103) had to be added here explicitly, and forgetting it
+    was silent: the call still arrived, matched no branch, and recorded
+    nothing, so :func:`_lint_tautology`, :func:`_lint_no_execution` and
+    :func:`_lint_self_authored_checker` all went quiet for anything written
+    through it — while its own tool description tells the model to *prefer*
+    it over repeated ``edit_file`` calls. An empty finding list is
+    indistinguishable from a clean one, so any new write path must be
+    registered here in the same commit that introduces it.
     """
     if not isinstance(arguments, dict):
         return
@@ -379,6 +389,16 @@ def record_written_data(
         new_string = arguments.get("new_string")
         if isinstance(path, str) and isinstance(new_string, str):
             written_data.record(path, new_string)
+    elif tool_name == "multi_edit":
+        path = arguments.get("path")
+        edits = arguments.get("edits")
+        if isinstance(path, str) and isinstance(edits, list):
+            for edit in edits:
+                if not isinstance(edit, dict):
+                    continue
+                new_string = edit.get("new_string")
+                if isinstance(new_string, str):
+                    written_data.record(path, new_string)
     elif tool_name == "bash":
         command = arguments.get("command")
         if isinstance(command, str):

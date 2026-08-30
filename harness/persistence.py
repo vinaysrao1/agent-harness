@@ -47,6 +47,8 @@ from types import TracebackType
 
 from pydantic import BaseModel, ConfigDict
 
+from harness.secrets import SecretRegistry
+
 from harness.types import Usage
 
 __all__ = [
@@ -271,12 +273,21 @@ class RunStore:
     itself (callers never supply their own).
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        secrets: "SecretRegistry | None" = None,
+    ) -> None:
         """Open (creating if necessary) the SQLite database at ``db_path``.
 
         Applies the schema (idempotent — ``CREATE TABLE IF NOT EXISTS``),
         turns on WAL journaling and foreign-key enforcement.
+
+        ``secrets`` (S-108) redacts known credential values from every
+        persisted event payload. ``None`` and an empty registry are exact
+        no-ops, which is what keeps this off the benchmark path.
         """
+        self._secrets = secrets
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
@@ -286,6 +297,18 @@ class RunStore:
         with self._conn:
             self._conn.executescript(_SCHEMA)
         self._migrate()
+
+    def bind_secrets(self, secrets: "SecretRegistry | None") -> None:
+        """Attach a registry whose values are redacted from every event (S-108).
+
+        Exists because the constructor argument was not enough. Every entry
+        point builds the store *before* it can build the registry -- the CLI,
+        the eval runner and the Harbor bridge all do -- so a `secrets=` keyword
+        was passed by exactly one caller: a test. The feature was real, tested,
+        and dead in every actual run. :class:`~harness.orchestrator.Orchestrator`
+        is the one object that holds both, so it binds them here.
+        """
+        self._secrets = secrets
 
     def _migrate(self) -> None:
         """Bring a pre-existing database up to the current schema.
@@ -454,6 +477,13 @@ class RunStore:
         deliberately no update or delete method — the log is append-only by
         construction, per DESIGN.md §4.10.
         """
+        # S-108: the event log outlives the run and is the copy nobody thinks
+        # to check. Masking at the tool boundary alone would leave a secret in
+        # any event a tool did not produce -- the model's own message, a
+        # nudge quoting a command, a run_error carrying a URL with credentials
+        # in it. An unset or empty registry returns the payload unchanged.
+        if self._secrets is not None:
+            payload = self._secrets.mask_payload(payload)
         payload_json = json.dumps(payload)
         created_at = _utc_now_iso()
         self._conn.execute("BEGIN IMMEDIATE")
