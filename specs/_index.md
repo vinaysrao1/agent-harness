@@ -12,6 +12,7 @@
 | [S-101](S-101-structured-search.md) | Structured search tier | Implemented | A | S-005 | M |
 | [S-102](S-102-read-cache.md) | File cache and read staleness | Implemented | A | S-101 | S |
 | [S-103](S-103-edit-ergonomics.md) | Edit ergonomics | Implemented | A | - | S |
+| [S-104](S-104-background-execution.md) | Background execution | Implemented | A | S-005 | M |
 | [S-108](S-108-secret-masking.md) | Secret masking at the tool boundary | Implemented | A | - | S |
 | [S-110](S-110-refusal-handling.md) | Report a model refusal as a refusal | Implemented | A | S-001 | XS |
 | [S-201](S-201-git-substrate.md) | Git substrate | Implemented | A | S-005 | M |

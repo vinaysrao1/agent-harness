@@ -118,6 +118,7 @@ from harness.diligence import (
 )
 from harness.permissions import Decision, Policy, ToolMeta, evaluate
 from harness.persistence import RunStore
+from harness.jobs import ABANDONED_EVENT, kill_command
 from harness.repo import (
     CHECKPOINT_EVENT,
     CHECKPOINT_SKIPPED_EVENT,
@@ -504,6 +505,82 @@ class AgentLoop:
 
     # -- persistence helpers -------------------------------------------------
 
+    async def _background_job_notice(self) -> str | None:
+        """Text naming still-running background jobs, or ``None``.
+
+        Read through the registry rather than held on the loop: the jobs
+        belong to the tools, and a second copy of that state on the loop would
+        be a second thing to keep correct.
+        """
+        jobs = getattr(self.registry, "jobs", None)
+        live = jobs.live() if jobs is not None else []
+        if not live:
+            return None
+        names = ", ".join(f"{job.handle} ({job.command[:40]})" for job in live)
+        return (
+            f"Note from the harness: {len(live)} background job(s) are still "
+            f"running: {names}. They will be stopped when this run lands, so "
+            f"collect anything you need from them with bash_output now."
+        )
+
+    async def _reap_background_jobs(self, reason: str) -> None:
+        """Kill every live background job this agent started (S-104).
+
+        Called on the landing turn, and from the loop's teardown. A detached
+        command is deliberately not bounded by the exec cap, so nothing else
+        in the harness would ever stop it -- and a sandbox left compiling is
+        one the next trial inherits.
+
+        A job started and never polled is recorded before it is killed:
+        whether the model actually comes back for its build is the question
+        this feature exists to answer, and a mechanism nobody uses should be
+        visible as unused rather than counted as shipped. `abandoned()`
+        excludes what has already been reported, because this now runs twice
+        on a run that reaches landing and once on a run that errors -- raw
+        event counts would have said abandonment is twice as common on
+        successful runs.
+
+        Nothing here may raise. It runs inside `run`'s `finally`, so an
+        exception would *replace* the run's real outcome: a store that has
+        gone away at teardown would report itself as the cause of a failure it
+        merely witnessed, and skip the kills on the way out.
+
+        `CancelledError` is caught per job and re-raised at the end rather
+        than allowed to abort the loop. Harbor wraps the run in
+        `asyncio.wait_for`, so a second cancellation can land while this is
+        awaiting a kill; letting it through left every remaining job running,
+        with no backstop underneath (`HarborSandbox.stop` is a no-op).
+        """
+        jobs = getattr(self.registry, "jobs", None)
+        if jobs is None:
+            return
+        cancelled: BaseException | None = None
+        for job in jobs.abandoned():
+            job.abandonment_reported = True
+            try:
+                self.store.append_event(
+                    self.agent_id,
+                    ABANDONED_EVENT,
+                    {
+                        "spec": "S-104",
+                        "handle": job.handle,
+                        "command": job.command[:200],
+                        "reason": reason,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - telemetry must not break teardown
+                pass
+        for job in jobs.live():
+            try:
+                await self.sandbox.exec(kill_command(job.pid), timeout=10)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception:  # noqa: BLE001 - teardown is best effort
+                pass
+            job.killed = True
+        if cancelled is not None:
+            raise cancelled
+
     def _append_message(self, message: Message) -> None:
         """Add ``message`` to the live context and persist it as an event."""
         self.context.append(message)
@@ -870,7 +947,23 @@ class AgentLoop:
         budget check, compaction check, model call, tool dispatch or
         diligence check — persisting every event as it happens. See the
         class and module docstrings for the full per-turn contract.
+
+        Background jobs (S-104) are reaped in a ``finally``. Reaping only on
+        the landing turn was not enough: a run that errors, pauses on budget,
+        or is cancelled never reaches landing, and a subagent that finishes
+        before the landing band never arms it at all — so its jobs were
+        discarded still running and without the abandonment event. On the
+        benchmark path there is no backstop underneath, because
+        ``HarborSandbox.stop`` is a no-op by design, so a leaked build keeps
+        compiling *into the grading phase*, competing with the verifier for
+        the container.
         """
+        try:
+            return await self._run(goal)
+        finally:
+            await self._reap_background_jobs("teardown")
+
+    async def _run(self, goal: str) -> AgentResult:
         self._append_message(Message(role=Role.USER, content=goal))
 
         total_usage = Usage()
@@ -1031,6 +1124,12 @@ class AgentLoop:
                             "expected_call_seconds": expected,
                         },
                     )
+                    # S-104: the landing turn is the last chance to stop what
+                    # this agent started. A background build outlives the exec
+                    # cap by design, so nothing else would ever end it, and a
+                    # container left compiling is a container the next trial
+                    # inherits.
+                    await self._reap_background_jobs("landing")
             # Nothing here couples ``landing`` to ``wound_down``: by the
             # time this band can arm, 1b below has either fired long ago or
             # fires in this same iteration (its threshold is at least 300s,
@@ -1068,6 +1167,14 @@ class AgentLoop:
                         },
                     )
                     wound_down = True
+                    # S-104: name what is still running while there is still
+                    # time to act on it. Killing here would be wrong -- the
+                    # build may be the work -- so this only tells the model.
+                    notice = await self._background_job_notice()
+                    if notice:
+                        self._append_message(
+                            Message(role=Role.USER, content=notice)
+                        )
 
             try:
                 # 2. Compaction, run to fixpoint: one halving per turn may

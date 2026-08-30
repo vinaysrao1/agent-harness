@@ -22,6 +22,7 @@ from harness.edits import (
     describe_mismatch,
     nearest_candidates,
 )
+from harness.jobs import JobRegistry
 from harness.reads import ReadLedger
 from harness.sandbox.base import SandboxError, apply_edit
 from harness.sandbox.local import LocalSandbox
@@ -314,6 +315,7 @@ class _FakeDeps:
         self.context = None
         self.written_data = lambda: None
         self.reads = ReadLedger()
+        self.jobs = JobRegistry()
 
 
 class TestToolCountDiscipline:

@@ -122,6 +122,7 @@ EVENT_KIND_SPECS: dict[str, str] = {
     "repo_checkpoint": "S-201",
     "repo_checkpoint_skipped": "S-201",
     "repo_baseline": "S-201",
+    "background_job_abandoned": "S-104",
     "model_refusal": "S-110",
 }
 

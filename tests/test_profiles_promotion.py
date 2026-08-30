@@ -132,16 +132,32 @@ class TestCapabilitiesAreAskedForNotSwitchedOn:
         assert CODING_REPO.capabilities == REPO_CAPABILITIES
 
     def test_S004_repo_tools_are_a_superset_of_the_benchmark_profile(self) -> None:
-        # This asserted equality until S-103, whose whole point was to add
-        # `multi_edit` to repo mode. The invariant that actually matters is
-        # not "the lists are equal" but "CODING's list is untouched": repo
-        # mode may grow, the benchmark profile may not, because tool-surface
-        # growth degrades selection quality on the scored model. A promotion
-        # into CODING is Lane B and must remove or merge an existing tool.
-        assert len(CODING_REPO.tool_factories) > len(CODING_TOOL_FACTORIES)
-        assert CODING_REPO.tool_factories[: len(CODING_TOOL_FACTORIES)] == (
-            CODING_TOOL_FACTORIES
-        )
+        # Narrow on purpose: this asserts only the *direction* of the
+        # relationship -- repo mode may grow, and every name CODING has it
+        # also has. It has been progressively relaxed (equality until S-103
+        # added `multi_edit`; factory identity until S-104 substituted repo
+        # mode's `bash` for one carrying `run_in_background`), and each
+        # relaxation was justified by the fact that it is not the guard.
+        #
+        # N2 -- "CODING's tool surface is byte-identical" -- is enforced by
+        # `tests/conformance/test_neutrality.py::...n2...`, which hashes the
+        # canonical surface (names, order, descriptions, JSON schemas)
+        # against a frozen golden and has negative tests for an added tool,
+        # an edited description, a reordering, and a schema change. Changing
+        # `bash`'s schema in CODING breaks that golden; nothing here would
+        # notice. Read the two together, and do not strengthen this one in
+        # place of re-freezing that one.
+        #
+        # `CODING.tool_factories == CODING_TOOL_FACTORIES` below is a wiring
+        # check, not an invariant: it fails only if `profiles.py` stops
+        # passing the orchestrator's tuple through.
+        from tests.test_edits import _FakeDeps
+
+        def names(profile):
+            deps = _FakeDeps()
+            return {factory(deps).spec.name for factory in profile.tool_factories}
+
+        assert names(CODING) < names(CODING_REPO)
         assert CODING.tool_factories == CODING_TOOL_FACTORIES
 
     def test_S004_no_profile_leaks_capabilities_into_coding(self) -> None:

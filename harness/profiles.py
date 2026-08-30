@@ -38,10 +38,14 @@ from harness.orchestrator import (
     CODING_RULES,
     CODING_TOOL_FACTORIES,
     ToolFactory,
+    coding_bash_factory,
+    repo_bash_factory,
 )
 from harness.tools.builtin import (
+    bash_output_tool,
     glob_tool,
     grep_tool,
+    kill_tool,
     load_skill_tool,
     multi_edit_tool,
     memory_read_fact_tool,
@@ -197,6 +201,8 @@ REPO_CAPABILITIES: frozenset[str] = frozenset(
         # `UNKNOWN_ENVIRONMENT` affirming something is exactly what S-005's
         # "unknown is not affirmation" rule exists to prevent.
         "read_staleness",
+        # S-104: bash(run_in_background), bash_output, kill.
+        "background_execution",
     }
 )
 
@@ -227,12 +233,17 @@ Domain rules (repo work):
 #: degrades selection quality on non-Anthropic models, and the benchmark model
 #: is one. Promoting `multi_edit` into `CODING` would be a Lane B change
 #: requiring a TB2 run and the removal or merging of an existing tool.
-REPO_TOOL_FACTORIES: tuple[ToolFactory, ...] = CODING_TOOL_FACTORIES + (
+REPO_TOOL_FACTORIES: tuple[ToolFactory, ...] = tuple(
+    repo_bash_factory if factory is coding_bash_factory else factory
+    for factory in CODING_TOOL_FACTORIES
+) + (
     lambda deps: multi_edit_tool(
         deps.sandbox, deps.deadline, deps.store, deps.agent_id, deps.reads
     ),
     lambda deps: grep_tool(deps.sandbox, deps.deadline),
     lambda deps: glob_tool(deps.sandbox, deps.deadline),
+    lambda deps: bash_output_tool(deps.sandbox, deps.jobs),
+    lambda deps: kill_tool(deps.sandbox, deps.jobs),
 )
 
 CODING_REPO = AgentProfile(
