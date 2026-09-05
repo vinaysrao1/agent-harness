@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 from harness.adapters import get_adapter
 from harness.adapters.base import ModelAdapter
 from harness.config import HarnessConfig, PermissionMode
-from harness.condenser import KNOWN_CONDENSERS, DefaultCondenser, condenser_for
+from harness.condenser import condenser_for
 from harness.context import ContextManager
 from harness.deadline import Deadline
 from harness.diligence import WrittenData
@@ -99,7 +99,7 @@ __all__ = [
     "CORE_RULES",
     "CODING_RULES",
     "CODING_TOOL_FACTORIES",
-    "select_condenser_strategy",
+    "WINDOW_OVERRIDE_EVENT",
     "coding_bash_factory",
     "repo_bash_factory",
     "ToolDeps",
@@ -313,33 +313,10 @@ def repo_bash_factory(deps: "ToolDeps") -> Tool:
     )
 
 
-def select_condenser_strategy(
-    configured: str, profile: "Profile | None"
-) -> str:
-    """Which compaction strategy this run gets (S-105).
-
-    The config names one globally; only a profile that declares
-    `pivotal_retention` may depart from the default. Pivotal retention changes
-    what survives eviction, which changes the assembly, which N7 and N8 pin --
-    so a config file cannot move the benchmark path.
-
-    The override is silent rather than an error: the config is global and the
-    profile is per-run, so a machine configured for repo work must still be
-    able to run the benchmark profile without editing config first.
-    """
-    # Validated before the gate, not after. Gating first meant a typo was
-    # silently corrected to the default under `CODING` -- the benchmark
-    # profile, and the one that runs when nothing was selected -- which is
-    # exactly the failure the raise exists to prevent. It only ever raised
-    # for repo runs, where the operator had already got it right often
-    # enough to notice.
-    if configured not in KNOWN_CONDENSERS:
-        known = ", ".join(sorted(KNOWN_CONDENSERS))
-        raise ValueError(f"unknown condenser {configured!r}; known: {known}")
-    if profile is not None and profile.enables("pivotal_retention"):
-        return configured
-    return DefaultCondenser.strategy_id
-
+#: Emitted once per run whose context window was overridden (S-404). Without
+#: it, a scorer that globs `state.db` files cannot tell a forced-window run
+#: from a production one and would pool them into one denominator.
+WINDOW_OVERRIDE_EVENT = "context_window_override"
 
 CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
     coding_bash_factory,
@@ -552,6 +529,7 @@ class Orchestrator:
         tool_factories: Sequence[ToolFactory] | None = None,
         profile: Profile | None = None,
         deadline: Deadline | None = None,
+        max_context: int | None = None,
     ) -> tuple[str, AgentResult]:
         """Run one task end-to-end and return ``(run_id, lead result)``.
 
@@ -632,6 +610,7 @@ class Orchestrator:
             tool_factories=tool_factories,
             profile=profile,
             deadline=deadline,
+            max_context=max_context,
         )
         return run_id, result
 
@@ -1013,15 +992,8 @@ class Orchestrator:
                     declared_command = command
             elif event.kind == "compaction" and "summary" in event.payload:
                 count = int(event.payload["evicted_count"])
-                # S-105: the summary *and* whatever the strategy carried
-                # forward. Older events have no "kept" key and default to
-                # the empty list, which is what the default strategy keeps.
                 replayed[:count] = [
-                    Message(role=Role.USER, content=event.payload["summary"]),
-                    *(
-                        Message.model_validate(payload)
-                        for payload in event.payload.get("kept") or []
-                    ),
+                    Message(role=Role.USER, content=event.payload["summary"])
                 ]
 
         # Synthesize results for calls the crash left unanswered.
@@ -1150,6 +1122,7 @@ class Orchestrator:
         tool_factories: Sequence[ToolFactory] | None = None,
         profile: "Profile | None" = None,
         deadline: Deadline | None = None,
+        max_context: int | None = None,
     ) -> AgentResult:
         """Shared engine behind :meth:`run_task` and :meth:`resume_task`.
 
@@ -1258,18 +1231,45 @@ class Orchestrator:
                 policy = policy.with_grant(pattern)
             return policy
 
-        condenser_strategy = select_condenser_strategy(
-            self.config.condenser, profile
-        )
+
+        if max_context is not None:
+            # Once per run, not once per `build_context` call: that closure
+            # runs for the lead *and* for every spawned subagent, and always
+            # wrote to `lead_agent_id`, so a run with three subagents emitted
+            # four identical events on the lead. Recorded at all because
+            # `condenser-oracle` globs `state.db` files and otherwise cannot
+            # tell a forced-window run from a production one -- it would pool
+            # them into one denominator and report the mixture.
+            self.store.append_event(
+                lead_agent_id,
+                WINDOW_OVERRIDE_EVENT,
+                {"spec": "S-404", "max_context": max_context},
+            )
 
         def build_context(adapter: ModelAdapter) -> ContextManager:
             summarize = _make_summarizer(adapter)
             context = ContextManager(
                 base_system_prompt=system_prompt,
                 count_tokens=adapter.count_tokens,
-                max_context=adapter.capabilities.max_context,
+                # S-404. Shrinking the window is how compaction is made to
+                # fire at all: it has never fired on this workload -- zero
+                # events across 760 recorded agents -- so an eval that waits
+                # for it measures a treatment that never applies. Overriding
+                # here rather than faking the adapter keeps every other
+                # capability real.
+                max_context=(
+                    adapter.capabilities.max_context
+                    if max_context is None
+                    else max_context
+                ),
                 summarize=summarize,
-                condenser=condenser_for(condenser_strategy, summarize),
+                # `condenser_for` validates the name and raises on a typo.
+                # There was a profile gate here that returned the default
+                # unless the profile declared `pivotal_retention`; with the
+                # marker deleted there is one strategy, so the gate had
+                # nothing left to gate. It comes back with the second
+                # strategy, and with the evidence that earns it.
+                condenser=condenser_for(self.config.condenser, summarize),
             )
             if memory_index:
                 context.add_memory_block(memory_index)

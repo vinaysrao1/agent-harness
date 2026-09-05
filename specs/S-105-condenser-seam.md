@@ -9,6 +9,29 @@ effort: M
 
 # S-105 — Condenser seam
 
+> **Superseded in part by S-404.** `PivotalCondenser`, the `mark_pivotal`
+> machinery, **and the retention plumbing behind them** were measured and
+> **deleted**. S-404 scored the retention decision against what runs actually
+> did next: a **25% loss rate** (compaction really does destroy things a run
+> comes back for) against **0% marker recall** — it marked 1 turn of 100 and
+> not one of the 25 — while keeping the single newest turn caught 46% on the
+> spans where that is a condensation at all. The marker watched *errors*; what
+> a run loses is *knowledge*. That is a category mismatch, not a tuning
+> problem.
+>
+> The plumbing went too, one round later. Mutation testing showed every
+> load-bearing line of it — `_Applied.kept` in `_effective`, the prune
+> protection, the resume splice — could be deleted with the full 2,562-test
+> suite still green. It was exercised by one assertion on an event payload,
+> and that payload logged the strategy's *request* rather than what was
+> applied. Keeping it as a documented capability nothing honours would have
+> been the archetype this project keeps catching. The next retention strategy
+> re-adds ~50 lines with the evidence that earns them.
+>
+> What remains from this spec, and is live: the `Condenser` seam, the
+> non-destructive transcript, and `effective_size`. Sections below describing
+> pivotal retention are the record of what was built and why it went.
+
 ## Contract
 Extract compaction into a `Condenser` protocol; persist condensation as an
 event that is *applied* at assembly time rather than destructively rewriting

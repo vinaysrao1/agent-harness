@@ -19,3 +19,4 @@
 | [S-201](S-201-git-substrate.md) | Git substrate | Implemented | A | S-005 | M |
 | [S-202](S-202-diff-as-artifact.md) | Diff as the artifact | Implemented | A | S-201 | S |
 | [S-401](S-401-pr-replay-eval.md) | PR-replay coding eval | Implemented | A | S-201 | L |
+| [S-404](S-404-condenser-oracle.md) | Condenser oracle eval | Implemented | A | S-105 | M |

@@ -584,8 +584,10 @@ class AgentLoop:
     def _append_message(self, message: Message) -> int:
         """Add ``message`` to the live context and persist it as an event.
 
-        Returns the context's event ref, so a caller that knows the message
-        matters can mark it pivotal (S-105).
+        Returns the context's event ref. Every caller currently discards it;
+        it is the transcript's own identifier for the message and the only way
+        to name one from outside, which is what the deleted pivotal marking
+        used and what any successor will.
         """
         ref = self.context.append(message)
         self.store.append_event(
@@ -1215,33 +1217,13 @@ class AgentLoop:
                                 for message in evicted
                             ],
                             "summary": self.context.last_summary,
-                            # S-105. Which strategy ran, and what it carried
-                            # forward. A retention that never retains, or
-                            # always retains, is visible here rather than
-                            # inferred from behaviour.
+                            # S-105. Which strategy ran, and what it
+                            # carried forward.
                             "strategy_id": (
                                 condensation.strategy_id
                                 if condensation is not None
                                 else None
                             ),
-                            "kept_refs": list(
-                                condensation.kept_refs
-                                if condensation is not None
-                                else ()
-                            ),
-                            "pivotal_reasons": list(
-                                condensation.reasons
-                                if condensation is not None
-                                else ()
-                            ),
-                            # Resume rebuilds the transcript from events, so
-                            # the retained turns have to travel with the
-                            # event. Splicing in only the summary dropped
-                            # them -- silently, and only on resume.
-                            "kept": [
-                                message.model_dump(mode="json")
-                                for message in self.context.last_kept
-                            ],
                         },
                     )
                     if self.context.effective_size >= size_before:
@@ -1298,9 +1280,6 @@ class AgentLoop:
                     response.message.tool_calls
                 )
                 for result in results:
-                    # An error result marks its own turn pivotal (S-105);
-                    # `ContextManager.append` does it, so a resumed run gets
-                    # the same marks from the same messages.
                     self.context.append(
                         Message(role=Role.TOOL, tool_result=result)
                     )
@@ -1627,23 +1606,15 @@ class AgentLoop:
                     # Persisted as a regular 'message' event (like the
                     # diligence nudge) so resume replays the transcript
                     # the model actually saw.
-                    # S-105: this message *is* the failed verification --
-                    # the command, its exit code, and its output. It is the
-                    # single most expensive thing for a compaction to render
-                    # as "ran the tests", because the run is about to act on
-                    # it.
-                    self.context.mark_pivotal(
-                        self._append_message(
-                            Message(
-                                role=Role.USER,
-                                content=VERIFICATION_FAILED_REMINDER.format(
-                                    command=payload["command"],
-                                    exit_code=payload["exit_code"],
-                                    output=payload["output"],
-                                ),
-                            )
-                        ),
-                        "verification_failed",
+                    self._append_message(
+                        Message(
+                            role=Role.USER,
+                            content=VERIFICATION_FAILED_REMINDER.format(
+                                command=payload["command"],
+                                exit_code=payload["exit_code"],
+                                output=payload["output"],
+                            ),
+                        )
                     )
                     continue
                 else:

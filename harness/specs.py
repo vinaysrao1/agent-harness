@@ -124,6 +124,7 @@ EVENT_KIND_SPECS: dict[str, str] = {
     "repo_baseline": "S-201",
     "background_job_abandoned": "S-104",
     "model_refusal": "S-110",
+    "context_window_override": "S-404",
 }
 
 

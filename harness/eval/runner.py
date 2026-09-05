@@ -73,6 +73,13 @@ class TrialSettings:
     include_commit_body: bool = False
     #: Keep the task tree after the trial (for inspecting a failure).
     keep_tree: bool = False
+    #: Override the model's context window (S-404). Compaction has never
+    #: fired on this workload -- zero events across 760 recorded agents -- so
+    #: an eval of the condenser that waits for it measures nothing. Shrinking
+    #: the window turns compaction from a rare event into an independent
+    #: variable, and the resulting curve says how small a window this harness
+    #: tolerates, which is worth having on its own.
+    max_context: int | None = None
 
 
 def _git(repo: Path, *args: str, strip: bool = True) -> tuple[int, str, str]:
@@ -230,6 +237,7 @@ async def run_trial(
                 max_turns=settings.max_turns,
                 wall_clock_seconds=settings.wall_clock_seconds,
             ),
+            max_context=settings.max_context,
         )
         agent_id = next(
             agent.id
