@@ -560,7 +560,7 @@ async def test_maybe_compact_threshold_is_strictly_greater() -> None:
     cm.append(user("note"))
     cm.append(Message(role=Role.ASSISTANT, content="turn 2"))
     assert await cm.maybe_compact() is None
-    assert len(cm.transcript) == 4
+    assert cm.effective_size == 4
 
     # One more message: 600 > 500 -> compaction triggers.
     cm.append(user("another note"))
@@ -568,7 +568,10 @@ async def test_maybe_compact_threshold_is_strictly_greater() -> None:
     assert evicted is not None
     assert len(evicted) == 2  # oldest half of 5 messages
     # 5 messages - 2 evicted + 1 summary = 4.
-    assert len(cm.transcript) == 4
+    assert cm.effective_size == 4
+    # S-105: the raw transcript is not rewritten. Asserting on it here is what
+    # made the effective/raw distinction easy to miss.
+    assert len(cm.transcript) == 5
     assert COMPACTION_THRESHOLD == 0.8
 
 
@@ -583,13 +586,16 @@ async def test_compact_replaces_oldest_half_with_summary_message() -> None:
 
     evicted = await cm.compact()
     assert [m.content for m in evicted] == contents[:2]
-    assert len(cm.transcript) == 4  # summary + 3 survivors
-    summary = cm.transcript[0]
+    effective = cm.effective_messages()
+    assert len(effective) == 4  # summary + 3 survivors
+    summary = effective[0]
     assert summary.role is Role.USER
     assert summary.content is not None
     assert summary.content.startswith(COMPACTION_SUMMARY_PREFIX + "\n")
     assert "STUB SUMMARY of 2 messages" in summary.content
-    assert [m.content for m in cm.transcript[1:]] == contents[2:]
+    assert [m.content for m in effective[1:]] == contents[2:]
+    # S-105: nothing was destroyed to produce that view.
+    assert [m.content for m in cm.transcript] == contents
 
 
 async def test_goal_text_preserved_verbatim_in_summary_header() -> None:

@@ -46,7 +46,15 @@ call) lives in :meth:`ContextManager.maybe_compact` /
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
+from harness.condenser import (
+    COMPACTION_SUMMARY_PREFIX,
+    Condensation,
+    CondenseContext,
+    Condenser,
+    DefaultCondenser,
+)
 from harness.types import Message, Role, ToolResult
 
 __all__ = [
@@ -78,8 +86,9 @@ PRUNE_TARGET_FRACTION = 0.40
 #: Fraction of ``max_context`` beyond which compaction triggers (strictly >).
 COMPACTION_THRESHOLD = 0.8
 
-#: First line of the user message that replaces an evicted transcript span.
-COMPACTION_SUMMARY_PREFIX = "[COMPACTION SUMMARY]"
+# `COMPACTION_SUMMARY_PREFIX` now lives in `harness.condenser` -- it is part
+# of what a strategy emits -- and is re-exported here so the existing import
+# sites are unchanged.
 
 #: Opening delimiter for recalled-memory blocks. The label is part of the
 #: prompt-injection defense (§4.5/§4.8): memory content is data, never
@@ -90,6 +99,20 @@ MEMORY_BLOCK_BEGIN = (
 
 #: Closing delimiter for recalled-memory blocks.
 MEMORY_BLOCK_END = "=== END RECALLED MEMORY ==="
+
+
+@dataclass(frozen=True)
+class _Applied:
+    """One condensation, in the form :meth:`ContextManager._effective` applies.
+
+    ``boundary`` indexes the view the *previous* condensations produce, not the
+    raw transcript. Compaction always evicts a prefix, so applying the chain is
+    a sequence of prefix replacements and nothing has to be re-indexed.
+    """
+
+    boundary: int
+    summary: Message
+    summary_ref: int
 
 
 class ContextManager:
@@ -121,6 +144,7 @@ class ContextManager:
         max_context: int,
         summarize: Callable[[list[Message]], Awaitable[str]],
         reminder_interval: int = 5,
+        condenser: Condenser | None = None,
     ) -> None:
         if max_context <= 0:
             raise ValueError(f"max_context must be positive, got {max_context}")
@@ -133,12 +157,24 @@ class ContextManager:
         self._count_tokens = count_tokens
         self._max_context = max_context
         self._summarize = summarize
+        #: How an evicted span becomes a summary (S-105). Defaults to the
+        #: behaviour this seam was extracted from, byte for byte.
+        self.condenser: Condenser = condenser or DefaultCondenser(summarize)
 
-        #: Live transcript. Mutate only via :meth:`append` / :meth:`compact`
-        #: so event refs stay aligned.
+        #: Every message ever appended, in order. **Compaction does not touch
+        #: it** (S-105): condensations are recorded separately and applied at
+        #: assembly time by :meth:`_effective`. Read
+        #: :attr:`effective_size` -- not ``len(self.transcript)`` -- to ask
+        #: whether compaction is still making progress.
         self.transcript: list[Message] = []
         self._event_refs: list[int] = []
         self._next_ref = 1
+
+        #: Condensations in the order they were made. Each is a *prefix*
+        #: replacement over the view the previous ones produce, because
+        #: compaction always evicts a prefix -- which is what makes the chain
+        #: cheap to apply and easy to reason about.
+        self._condensations: list[_Applied] = []
 
         self._instructions: list[tuple[str, str]] = []
         self._task_snapshot: str | None = None
@@ -158,6 +194,11 @@ class ContextManager:
         #: :meth:`compact` so the agent loop can persist it alongside the
         #: evicted span (resume replays it in place of the span).
         self.last_summary: str | None = None
+        #: The whole of the most recent condensation -- strategy id, what it
+        #: kept and why -- so the loop can put it in the event payload. A
+        #: retention that never retains, or always retains, is then visible in
+        #: the log rather than inferred from behaviour.
+        self.last_condensation: Condensation | None = None
 
         #: Per-turn memoization. ``_raw_count_cache`` is the *unpruned*
         #: assembly's size (the pruning pressure signal); ``_token_count_cache``
@@ -169,6 +210,10 @@ class ContextManager:
         self._raw_count_cache: int | None = None
         self._token_count_cache: int | None = None
         self._prune_cache: frozenset[int] | None = None
+        #: The condensed view, memoized per turn alongside the counts. Every
+        #: index-bearing reader derives from this one call, so a prune plan's
+        #: indices cannot drift from the messages they name.
+        self._effective_cache: tuple[list[Message], list[int]] | None = None
 
     # -- state mutation ------------------------------------------------------
 
@@ -177,6 +222,7 @@ class ContextManager:
         self._raw_count_cache = None
         self._token_count_cache = None
         self._prune_cache = None
+        self._effective_cache = None
 
     def append(self, message: Message) -> int:
         """Append one message to the transcript and return its event ref.
@@ -266,13 +312,46 @@ class ContextManager:
         )
         return self._reminder_due or on_cadence
 
+    def _effective(self) -> tuple[list[Message], list[int]]:
+        """What the model sees: the transcript with condensations applied.
+
+        Memoized per turn. Every index-bearing reader below goes through here,
+        so a prune plan built from one call cannot name different messages
+        than the assembly built from another.
+        """
+        if self._effective_cache is None:
+            messages = list(self.transcript)
+            refs = list(self._event_refs)
+            for applied in self._condensations:
+                messages[: applied.boundary] = [applied.summary]
+                refs[: applied.boundary] = [applied.summary_ref]
+            self._effective_cache = (messages, refs)
+        return self._effective_cache
+
+    def effective_messages(self) -> list[Message]:
+        """The condensed view, as a copy. What the model sees, minus the
+        trailing reminder :meth:`assemble` may append."""
+        return list(self._effective()[0])
+
+    @property
+    def effective_size(self) -> int:
+        """Messages the model would see this turn.
+
+        What the loop's compact-to-fixpoint pass must read. It used to read
+        ``len(self.transcript)``, which under a non-destructive transcript
+        never changes -- so the shrink guard would never fire and the loop
+        would summarize forever, spending the whole budget before the first
+        model call.
+        """
+        return len(self._effective()[0])
+
     # -- assembly ------------------------------------------------------------
 
     def _message_ages(self) -> list[int]:
         """``ages[i]`` = assistant messages strictly after ``transcript[i]``."""
         ages: list[int] = []
         seen_assistant = 0
-        for message in reversed(self.transcript):
+        for message in reversed(self._effective()[0]):
             ages.append(seen_assistant)
             if message.role is Role.ASSISTANT:
                 seen_assistant += 1
@@ -283,7 +362,7 @@ class ContextManager:
         """Map tool-call ids to tool names, for pruning stubs."""
         return {
             call.id: call.name
-            for message in self.transcript
+            for message in self._effective()[0]
             if message.role is Role.ASSISTANT
             for call in message.tool_calls
         }
@@ -299,7 +378,9 @@ class ContextManager:
         ages = self._message_ages()
         return [
             (index, message, age)
-            for index, (message, age) in enumerate(zip(self.transcript, ages))
+            for index, (message, age) in enumerate(
+                zip(self._effective()[0], ages)
+            )
             if message.role is Role.TOOL and message.tool_result is not None
         ]
 
@@ -367,9 +448,8 @@ class ContextManager:
         tool_names = self._tool_names() if prune else {}
 
         messages: list[Message] = []
-        for index, (message, ref) in enumerate(
-            zip(self.transcript, self._event_refs)
-        ):
+        effective, effective_refs = self._effective()
+        for index, (message, ref) in enumerate(zip(effective, effective_refs)):
             if (
                 index in prune
                 and message.role is Role.TOOL
@@ -451,8 +531,9 @@ class ContextManager:
         *starts* with tool results has ``tool_use_id`` references with no
         preceding ``tool_use`` block, which provider APIs reject.
         """
-        half = len(self.transcript) // 2
-        while half < len(self.transcript) and self.transcript[half].role is Role.TOOL:
+        effective = self._effective()[0]
+        half = len(effective) // 2
+        while half < len(effective) and effective[half].role is Role.TOOL:
             half += 1
         return half
 
@@ -478,10 +559,15 @@ class ContextManager:
         return None
 
     async def compact(self) -> list[Message]:
-        """Evict the oldest half of the transcript and return the evicted span.
+        """Condense the oldest half of the effective view; return what it held.
 
-        The evicted messages are summarized via the injected ``summarize``
-        callable and replaced in the transcript by a single user message::
+        The evicted messages are handed to :attr:`condenser`, which returns a
+        summary and a retention decision. The result is *recorded* as a
+        condensation and applied by :meth:`_effective` -- the raw transcript is
+        never rewritten, so nothing that was said is unavailable to a later
+        strategy, a later retention decision, or an eval reading the run back.
+
+        The summary message reads::
 
             [COMPACTION SUMMARY]
             Original goal (verbatim, never summarized):
@@ -489,40 +575,45 @@ class ContextManager:
             ---
             <summary>
 
-        The eviction boundary is half the transcript by message count,
+        The eviction boundary is half the effective view by message count,
         snapped forward past TOOL-role messages (see
         :meth:`_eviction_boundary`) so a tool-calling assistant message and
-        its results are always evicted — or kept — together.
+        its results are always evicted -- or kept -- together.
 
-        The goal text is folded into the header **verbatim** — the goal never
+        The goal text is folded into the header **verbatim** -- the goal never
         depends on summarizer quality, per DESIGN.md §4.5's compaction
-        contract — and the next :meth:`assemble` appends the instruction
-        reminder regardless of cadence. The returned span is exactly what
-        was removed, intact, so the caller can persist it (§4.3.4); the
-        summary message's full text is exposed as :attr:`last_summary` so
-        the caller can persist that too (resume substitutes it for the
-        evicted span when replaying). With fewer than two transcript
-        messages there is nothing to evict and an empty list is returned
-        without calling the summarizer.
+        contract -- and the next :meth:`assemble` appends the instruction
+        reminder regardless of cadence. The returned span is exactly what was
+        evicted, intact, so the caller can persist it (§4.3.4); the summary
+        message's full text is exposed as :attr:`last_summary` and the whole
+        decision as :attr:`last_condensation`. With fewer than two messages in
+        the effective view there is nothing to evict and an empty list is
+        returned without calling the condenser.
         """
         half = self._eviction_boundary()
         if half < 1:
             return []
-        evicted = self.transcript[:half]
-        summary = await self._summarize(list(evicted))
-        header_goal = self._goal_text or ""
-        content = (
-            f"{COMPACTION_SUMMARY_PREFIX}\n"
-            f"Original goal (verbatim, never summarized):\n"
-            f"{header_goal}\n"
-            f"---\n"
-            f"{summary}"
+        effective, effective_refs = self._effective()
+        evicted = effective[:half]
+        evicted_refs = tuple(effective_refs[:half])
+        condensation = await self.condenser.condense(
+            list(evicted),
+            CondenseContext(
+                goal=self._goal_text or "",
+                refs=evicted_refs,
+            ),
         )
-        summary_message = Message(role=Role.USER, content=content)
-        self.last_summary = content
-        self.transcript[:half] = [summary_message]
-        self._event_refs[:half] = [self._next_ref]
+        summary_ref = self._next_ref
         self._next_ref += 1
+        self._condensations.append(
+            _Applied(
+                boundary=half,
+                summary=Message(role=Role.USER, content=condensation.summary),
+                summary_ref=summary_ref,
+            )
+        )
+        self.last_summary = condensation.summary
+        self.last_condensation = condensation
         self._reminder_due = True
         self._invalidate_counts()
         return evicted

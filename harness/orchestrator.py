@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 from harness.adapters import get_adapter
 from harness.adapters.base import ModelAdapter
 from harness.config import HarnessConfig, PermissionMode
+from harness.condenser import condenser_for
 from harness.context import ContextManager
 from harness.deadline import Deadline
 from harness.diligence import WrittenData
@@ -98,6 +99,7 @@ __all__ = [
     "CORE_RULES",
     "CODING_RULES",
     "CODING_TOOL_FACTORIES",
+    "WINDOW_OVERRIDE_EVENT",
     "coding_bash_factory",
     "repo_bash_factory",
     "ToolDeps",
@@ -311,6 +313,11 @@ def repo_bash_factory(deps: "ToolDeps") -> Tool:
     )
 
 
+#: Emitted once per run whose context window was overridden (S-404). Without
+#: it, a scorer that globs `state.db` files cannot tell a forced-window run
+#: from a production one and would pool them into one denominator.
+WINDOW_OVERRIDE_EVENT = "context_window_override"
+
 CODING_TOOL_FACTORIES: tuple[ToolFactory, ...] = (
     coding_bash_factory,
     lambda deps: read_file_tool(deps.sandbox, deps.reads),
@@ -522,6 +529,7 @@ class Orchestrator:
         tool_factories: Sequence[ToolFactory] | None = None,
         profile: Profile | None = None,
         deadline: Deadline | None = None,
+        max_context: int | None = None,
     ) -> tuple[str, AgentResult]:
         """Run one task end-to-end and return ``(run_id, lead result)``.
 
@@ -602,6 +610,7 @@ class Orchestrator:
             tool_factories=tool_factories,
             profile=profile,
             deadline=deadline,
+            max_context=max_context,
         )
         return run_id, result
 
@@ -1113,6 +1122,7 @@ class Orchestrator:
         tool_factories: Sequence[ToolFactory] | None = None,
         profile: "Profile | None" = None,
         deadline: Deadline | None = None,
+        max_context: int | None = None,
     ) -> AgentResult:
         """Shared engine behind :meth:`run_task` and :meth:`resume_task`.
 
@@ -1221,12 +1231,45 @@ class Orchestrator:
                 policy = policy.with_grant(pattern)
             return policy
 
+
+        if max_context is not None:
+            # Once per run, not once per `build_context` call: that closure
+            # runs for the lead *and* for every spawned subagent, and always
+            # wrote to `lead_agent_id`, so a run with three subagents emitted
+            # four identical events on the lead. Recorded at all because
+            # `condenser-oracle` globs `state.db` files and otherwise cannot
+            # tell a forced-window run from a production one -- it would pool
+            # them into one denominator and report the mixture.
+            self.store.append_event(
+                lead_agent_id,
+                WINDOW_OVERRIDE_EVENT,
+                {"spec": "S-404", "max_context": max_context},
+            )
+
         def build_context(adapter: ModelAdapter) -> ContextManager:
+            summarize = _make_summarizer(adapter)
             context = ContextManager(
                 base_system_prompt=system_prompt,
                 count_tokens=adapter.count_tokens,
-                max_context=adapter.capabilities.max_context,
-                summarize=_make_summarizer(adapter),
+                # S-404. Shrinking the window is how compaction is made to
+                # fire at all: it has never fired on this workload -- zero
+                # events across 760 recorded agents -- so an eval that waits
+                # for it measures a treatment that never applies. Overriding
+                # here rather than faking the adapter keeps every other
+                # capability real.
+                max_context=(
+                    adapter.capabilities.max_context
+                    if max_context is None
+                    else max_context
+                ),
+                summarize=summarize,
+                # `condenser_for` validates the name and raises on a typo.
+                # There was a profile gate here that returned the default
+                # unless the profile declared `pivotal_retention`; with the
+                # marker deleted there is one strategy, so the gate had
+                # nothing left to gate. It comes back with the second
+                # strategy, and with the evidence that earns it.
+                condenser=condenser_for(self.config.condenser, summarize),
             )
             if memory_index:
                 context.add_memory_block(memory_index)

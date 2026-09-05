@@ -216,6 +216,14 @@ class HarnessConfig(BaseModel):
     #: fnmatch globs threaded into every run's :class:`~harness.permissions.Policy`.
     permission_allow: tuple[str, ...] = ()
     permission_deny: tuple[str, ...] = ()
+    #: Compaction strategy (S-105). One name is currently valid, so the only
+    #: behaviour this field has is to break a run on a typo -- `condenser_for`
+    #: raises rather than falling back, because a silent fallback makes a
+    #: mistyped config indistinguishable from a working one. There was a
+    #: profile gate that stopped a config from moving the benchmark assembly;
+    #: S-404 deleted the second strategy, so the gate had nothing to gate, and
+    #: it comes back with the next one.
+    condenser: str = "summarize-halve"
 
 
 def _describe_validation_error(exc: ValidationError) -> str:

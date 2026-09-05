@@ -581,12 +581,19 @@ class AgentLoop:
         if cancelled is not None:
             raise cancelled
 
-    def _append_message(self, message: Message) -> None:
-        """Add ``message`` to the live context and persist it as an event."""
-        self.context.append(message)
+    def _append_message(self, message: Message) -> int:
+        """Add ``message`` to the live context and persist it as an event.
+
+        Returns the context's event ref. Every caller currently discards it;
+        it is the transcript's own identifier for the message and the only way
+        to name one from outside, which is what the deleted pivotal marking
+        used and what any successor will.
+        """
+        ref = self.context.append(message)
         self.store.append_event(
             self.agent_id, "message", message.model_dump(mode="json")
         )
+        return ref
 
     def _record_decision(
         self, call: ToolCall, decision: Decision, decided_by: str
@@ -1186,23 +1193,40 @@ class AgentLoop:
                 # span). The summarizer calls the same adapter as the model
                 # call, so its AdapterError is handled identically below.
                 while True:
-                    size_before = len(self.context.transcript)
+                    # S-105: the effective size, not the raw transcript.
+                    # Compaction no longer rewrites `transcript`, so its
+                    # length never falls -- and `len >= size_before` would
+                    # then be true on the *first* check every turn, turning
+                    # compact-to-fixpoint back into compact-once. A heavy
+                    # transcript that one halving cannot bring under the
+                    # threshold would go to the model over the window, which
+                    # is the case this loop was written for.
+                    size_before = self.context.effective_size
                     evicted = await self.context.maybe_compact()
                     if not evicted:
                         break
+                    condensation = self.context.last_condensation
                     self.store.append_event(
                         self.agent_id,
                         "compaction",
                         {
+                            "spec": "S-105",
                             "evicted_count": len(evicted),
                             "evicted": [
                                 message.model_dump(mode="json")
                                 for message in evicted
                             ],
                             "summary": self.context.last_summary,
+                            # S-105. Which strategy ran, and what it
+                            # carried forward.
+                            "strategy_id": (
+                                condensation.strategy_id
+                                if condensation is not None
+                                else None
+                            ),
                         },
                     )
-                    if len(self.context.transcript) >= size_before:
+                    if self.context.effective_size >= size_before:
                         break
 
                 # 3. Model call. Retries happen inside the adapter (single

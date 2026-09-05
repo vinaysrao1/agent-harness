@@ -213,6 +213,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from harness.eval.runner import TrialSettings, run_suite
     from harness.eval.suite import Suite, is_heldout
 
+    if args.max_context is not None and args.max_context <= 0:
+        # Caught here rather than inside `ContextManager.__init__` mid-run,
+        # where it surfaces as a crashed trial rather than a bad flag.
+        print("--max-context must be positive")
+        return 2
+
     config = load_config(args.config)
     suite = Suite.load(Path(args.suite).expanduser())
     # The suite name comes out of a JSON file, so it is data, not a path
@@ -283,6 +289,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         max_turns=args.max_turns,
         grade_timeout=args.grade_timeout,
         keep_tree=args.keep_trees,
+        max_context=args.max_context,
     )
     with RunStore(config.home / "state.db") as store:
         report = _asyncio.run(
@@ -409,10 +416,63 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Leave each task tree on disk for inspection.",
     )
+    ev.add_argument(
+        "--max-context",
+        type=int,
+        default=None,
+        help=(
+            "Override the model's context window (S-404). Compaction has "
+            "never fired on this workload, so an eval of the condenser that "
+            "waits for it measures nothing; shrinking the window makes it an "
+            "independent variable. Also answers how small a window this "
+            "harness tolerates."
+        ),
+    )
     add_config(ev)
     ev.set_defaults(func=_cmd_eval, validate=True)
 
+    oracle = subparsers.add_parser(
+        "condenser-oracle",
+        help=(
+            "Score a run's compaction retention against what it did next "
+            "(S-404). Reads stored runs; makes no model calls."
+        ),
+    )
+    oracle.add_argument(
+        "paths", nargs="+", help="state.db paths or globs (** is expanded)."
+    )
+    oracle.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        help="Turns the recency baseline keeps (default: 4).",
+    )
+    oracle.add_argument(
+        "--reach",
+        action="store_true",
+        help=(
+            "Replay the longest run at a range of windows and report where "
+            "compaction starts firing, instead of scoring."
+        ),
+    )
+    oracle.add_argument("--json", action="store_true")
+    oracle.set_defaults(func=_cmd_condenser_oracle)
+
     return parser
+
+
+def _cmd_condenser_oracle(args: argparse.Namespace) -> int:
+    """``harness condenser-oracle``: S-404's offline scorer."""
+    from harness.eval.condenser_oracle import DEFAULT_RECENCY_KEEP
+    from harness.eval.condenser_oracle import main as oracle_main
+
+    argv = list(args.paths)
+    argv += ["--keep", str(args.keep if args.keep is not None else DEFAULT_RECENCY_KEEP)]
+    if args.reach:
+        argv.append("--reach")
+    if args.json:
+        argv.append("--json")
+    return oracle_main(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
