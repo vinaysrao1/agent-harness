@@ -31,6 +31,9 @@ api_key  = "env:MOONSHOT_API_KEY"
 [sandbox]
 network = "none"            # none | allowlist | open
 
+[routing]                   # optional: which model serves which kind of call
+summarize = "kimi"          # compaction summaries; defaults to the run's model
+
 [permissions]
 default = "gated"           # gated (approval prompts) | auto
 ```

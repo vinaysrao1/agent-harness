@@ -113,6 +113,23 @@ def _total_tokens(usage) -> int:
     )
 
 
+def _trial_tokens(store: RunStore, run_id: str) -> int:
+    """Every token the trial cost, from the ledger rather than from memory.
+
+    `AgentResult.usage` is accumulated in the loop from the *lead's main model
+    calls*. It therefore omitted every subagent's tokens (pre-existing) and,
+    once S-106 started recording them, every compaction summarizer call as
+    well. The usage table has all of it.
+
+    Both omissions are currently zero on this suite -- PR-replay trials do not
+    spawn subagents, and compaction never fires (S-404) -- which is why this
+    can change without moving any recorded number. It stops being zero the
+    moment either happens, and the failure mode is a cost figure that quietly
+    undercounts the thing you changed.
+    """
+    return sum(_total_tokens(record.usage) for record in store.list_usage(run_id))
+
+
 def _files_touched(tree: TaskTree) -> frozenset[str]:
     """Repo-relative paths whose content differs from the starting state.
 
@@ -280,7 +297,7 @@ async def run_trial(
         return TaskOutcome(
             task_id=task.task_id,
             passed=passed,
-            tokens=_total_tokens(result.usage),
+            tokens=_trial_tokens(store, run_id),
             turns=result.turns,
             turns_to_first_edit=first_edit,
             first_edit_measured=measured,

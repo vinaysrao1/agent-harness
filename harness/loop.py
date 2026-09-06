@@ -118,6 +118,7 @@ from harness.diligence import (
 )
 from harness.permissions import Decision, Policy, ToolMeta, evaluate
 from harness.persistence import RunStore
+from harness.routing import CallPurpose
 from harness.jobs import ABANDONED_EVENT, kill_command
 from harness.repo import (
     CHECKPOINT_EVENT,
@@ -1266,6 +1267,7 @@ class AgentLoop:
                 self.model,
                 response.usage,
                 duration_ms=duration_ms,
+                purpose=CallPurpose.MAIN.value,
             )
             self._record_turn_provenance(response, turns, duration_ms)
             self._append_message(response.message)
