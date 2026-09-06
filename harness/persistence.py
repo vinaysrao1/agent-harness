@@ -186,6 +186,12 @@ class UsageRecord(BaseModel):
     model: str
     usage: Usage
     duration_ms: int = 0
+    #: Which kind of call this was (S-106). Readable here because otherwise
+    #: the column exists and nothing can see it: `harness cost` buckets by
+    #: model, and under the default unrouted config a summarizer row carries
+    #: the run's own model name -- so the line item the routing story is about
+    #: would be indistinguishable from a main call.
+    purpose: str = "main"
     created_at: str
 
 
@@ -260,6 +266,7 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_write_tokens  INTEGER NOT NULL,
     duration_ms         INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
+    purpose             TEXT NOT NULL DEFAULT 'main',
     created_at          TEXT NOT NULL
 );
 """
@@ -334,6 +341,16 @@ class RunStore:
                 self._conn.execute(
                     "ALTER TABLE usage ADD COLUMN "
                     "reasoning_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+        if "purpose" not in usage_columns:
+            # S-106. The default is a claim about history, and it is a safe
+            # one: every pre-S-106 row *is* a main-model call, because
+            # `record_usage` had exactly one caller and the summarizer was
+            # not it.
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE usage ADD COLUMN "
+                    "purpose TEXT NOT NULL DEFAULT 'main'"
                 )
 
     def close(self) -> None:
@@ -672,20 +689,27 @@ class RunStore:
         usage: Usage,
         *,
         duration_ms: int = 0,
+        purpose: str = "main",
     ) -> int:
         """Log token usage for one model call and return the new row's id.
 
         ``duration_ms`` is the call's wall-clock duration in whole
         milliseconds (DESIGN.md §10.2 A5); it defaults to ``0`` for callers
         that do not measure.
+
+        ``purpose`` is a :class:`~harness.routing.CallPurpose` value (S-106).
+        It defaults to ``"main"`` because that is what every caller meant
+        before there was a second kind of call -- and for two years there was
+        only one caller, so the summarizer's tokens were recorded nowhere and
+        every cost figure this harness produced excluded them.
         """
         created_at = _utc_now_iso()
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO usage (run_id, agent_id, model, input_tokens, "
                 "output_tokens, cache_read_tokens, cache_write_tokens, "
-                "duration_ms, reasoning_tokens, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "duration_ms, reasoning_tokens, purpose, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     agent_id,
@@ -696,6 +720,7 @@ class RunStore:
                     usage.cache_write_tokens,
                     duration_ms,
                     usage.reasoning_tokens,
+                    purpose,
                     created_at,
                 ),
             )
@@ -712,6 +737,7 @@ class RunStore:
                 run_id=row["run_id"],
                 agent_id=row["agent_id"],
                 model=row["model"],
+                purpose=row["purpose"],
                 usage=Usage(
                     input_tokens=row["input_tokens"],
                     output_tokens=row["output_tokens"],

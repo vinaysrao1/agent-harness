@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from harness.adapters import get_adapter
 from harness.adapters.base import ModelAdapter
 from harness.config import HarnessConfig, PermissionMode
 from harness.condenser import condenser_for
+from harness.routing import CallPurpose, build_router
 from harness.context import ContextManager
 from harness.deadline import Deadline
 from harness.diligence import WrittenData
@@ -413,16 +415,33 @@ def _require_str(tool_name: str, arguments: dict, key: str) -> str:
     return value
 
 
-def _make_summarizer(adapter: ModelAdapter):
+def _make_summarizer(
+    adapter: ModelAdapter,
+    *,
+    store: "RunStore | None" = None,
+    run_id: str | None = None,
+    agent_id: str | None = None,
+    model_label: str = "",
+    clock: Callable[[], float] | None = None,
+):
     """Build the compaction summarizer for one agent, bound to ``adapter``.
 
-    v1 deliberately uses the agent's own adapter (see module docstring);
-    the returned coroutine renders the evicted span as plain text and asks
-    for a structured summary with no tools offered. Retry policy lives
-    inside ``adapter.complete`` itself (the single retry layer, §4.1); an
-    :class:`~harness.adapters.base.AdapterError` that survives it is
+    ``adapter`` is the run's own unless `[routing]` sends `summarize`
+    elsewhere (S-106). The returned coroutine renders the evicted span as
+    plain text and asks for a structured summary with no tools offered. Retry
+    policy lives inside ``adapter.complete`` itself (the single retry layer,
+    §4.1); an :class:`~harness.adapters.base.AdapterError` that survives it is
     handled by the agent loop exactly like a failed model call — the run
     finishes with status ``error`` instead of crashing.
+
+    **It records its own usage.** For as long as this function existed it did
+    not, and `record_usage` had exactly one caller — the loop's main call — so
+    every cost figure the harness produced silently excluded compaction. That
+    error was zero only because compaction never fired (S-404); routing the
+    summarizer to a cheap model without counting it would have shown up as a
+    saving with no line item, because the calls it replaced were uncounted
+    too. Recording is best-effort: a telemetry failure must not fail a run
+    that is otherwise fine.
     """
 
     async def summarize(evicted: list[Message]) -> str:
@@ -437,9 +456,26 @@ def _make_summarizer(adapter: ModelAdapter):
             if message.tool_result is not None:
                 lines.append(f"[tool result] {message.tool_result.content}")
         prompt = "Summarize this transcript span:\n\n" + "\n".join(lines)
+        started = clock() if clock is not None else 0.0
         response = await adapter.complete(
             [Message(role=Role.USER, content=prompt)], [], _SUMMARIZER_SYSTEM
         )
+        if store is not None and run_id is not None:
+            try:
+                store.record_usage(
+                    run_id,
+                    agent_id,
+                    model_label,
+                    response.usage,
+                    duration_ms=(
+                        int((clock() - started) * 1000)
+                        if clock is not None
+                        else 0
+                    ),
+                    purpose=CallPurpose.SUMMARIZE.value,
+                )
+            except Exception:  # noqa: BLE001 - telemetry never fails a run
+                pass
         return response.message.content or "(summarizer produced no text)"
 
     return summarize
@@ -591,6 +627,11 @@ class Orchestrator:
                 tool_factories = profile.tool_factories
         mode = mode or self.config.permission_mode
         make_adapter = self._adapter_factory(model_name, adapter_override)
+        # Before any row is created, matching `UnknownModelError`'s documented
+        # contract. Validating inside `_execute` left a typo'd `[routing]` with
+        # a run stuck in `status='running'`, an agent row, and a workspace
+        # directory -- for a mistake that is knowable from config alone.
+        build_router(model_name, self.config.routing, set(self.config.models))
         run_id = self.store.create_run(goal, model_name, mode.value)
         lead_agent_id = self.store.create_agent(run_id, goal)
         resolved_workspace = self._prepare_workspace(run_id, workspace)
@@ -690,10 +731,16 @@ class Orchestrator:
         # Budget scope is strictly per-agent, live and resumed alike:
         # subtract only the lead's own token spend, not the whole run's
         # (which counts subagents that never drew on the lead's budget).
+        # `purpose == "main"` matches what the live loop counts: it accrues
+        # `total_usage` from the model call only (`harness/loop.py`), so
+        # counting S-106's summarizer rows here would make the resumed run
+        # subtract spend the live run never did -- two definitions of one
+        # budget, differing by however much compaction cost. Measured at 40%
+        # on a compacting run before this filter existed.
         tokens_used = sum(
             record.usage.input_tokens + record.usage.output_tokens
             for record in self.store.list_usage(run_id)
-            if record.agent_id == lead.id
+            if record.agent_id == lead.id and record.purpose == "main"
         )
         remaining = Budgets(
             max_turns=max(base.max_turns - turns_used, 0),
@@ -1246,8 +1293,31 @@ class Orchestrator:
                 {"spec": "S-404", "max_context": max_context},
             )
 
-        def build_context(adapter: ModelAdapter) -> ContextManager:
-            summarize = _make_summarizer(adapter)
+        # S-106. Built once per run, and only when the purpose actually goes
+        # somewhere else: an unrouted `summarize` must reuse the run's adapter
+        # *object*, so "the default path is unchanged" is provable rather than
+        # a claim about two equivalent objects.
+        router = build_router(
+            model_label, self.config.routing, set(self.config.models)
+        )
+        summarizer_model = router.model_for(CallPurpose.SUMMARIZE)
+        summarizer_adapter = (
+            get_adapter(self.config.models[summarizer_model])
+            if router.is_routed(CallPurpose.SUMMARIZE)
+            else None
+        )
+
+        def build_context(
+            adapter: ModelAdapter, agent_id: str
+        ) -> ContextManager:
+            summarize = _make_summarizer(
+                summarizer_adapter or adapter,
+                store=self.store,
+                run_id=run_id,
+                agent_id=agent_id,
+                model_label=summarizer_model,
+                clock=time.monotonic,
+            )
             context = ContextManager(
                 base_system_prompt=system_prompt,
                 count_tokens=adapter.count_tokens,
@@ -1389,7 +1459,9 @@ class Orchestrator:
                         extra_sandboxes.append(child_sandbox)
                         await child_sandbox.start()
                     try:
-                        child_context = build_context(child_adapter)
+                        child_context = build_context(
+                            child_adapter, agent_id
+                        )
                         # Per-agent, like the transcript it lints against:
                         # a subagent's writes are not the lead's evidence.
                         child_written = WrittenData()
@@ -1472,7 +1544,7 @@ class Orchestrator:
             return "\n\n".join(sections)
 
         lead_adapter = make_adapter()
-        lead_context = build_context(lead_adapter)
+        lead_context = build_context(lead_adapter, lead_agent_id)
         lead_written = WrittenData()
         lead_registry = self._build_registry(
             sandbox,

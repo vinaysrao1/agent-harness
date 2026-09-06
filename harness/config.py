@@ -224,6 +224,16 @@ class HarnessConfig(BaseModel):
     #: S-404 deleted the second strategy, so the gate had nothing to gate, and
     #: it comes back with the next one.
     condenser: str = "summarize-halve"
+    #: Per-purpose model routing (S-106): `{purpose: registry model name}`,
+    #: e.g. `[routing] summarize = "glm-flash"`. Empty means every purpose
+    #: uses the run's own model, which is what happened before this existed
+    #: -- and the run's own adapter *object*, not an equivalent one, so the
+    #: default path is provably unchanged rather than merely equal.
+    #:
+    #: An unknown model or purpose raises at run construction. Falling back
+    #: silently is the failure where a run reports the cheap model in config
+    #: and bills the expensive one, and the only place it surfaces is a bill.
+    routing: dict[str, str] = Field(default_factory=dict)
 
 
 def _describe_validation_error(exc: ValidationError) -> str:
@@ -308,6 +318,17 @@ def load_config(path: str | Path | None = None) -> HarnessConfig:
             ),
             permission_allow=tuple(permissions.get("allow", [])),
             permission_deny=tuple(permissions.get("deny", [])),
+            # Every field the model declares has to be read here. This
+            # function builds `HarnessConfig` from an explicit keyword list,
+            # so a field added to the model and not added here is silently
+            # unreachable from `config.toml` -- the setting exists, validates,
+            # documents itself, and does nothing. `routing` (S-106) and
+            # `condenser` (S-105) both shipped that way, which made a typo in
+            # either one a no-op rather than the error each spec promised.
+            # `test_S106_every_config_field_is_readable_from_toml` fails on
+            # the next one.
+            condenser=data.get("condenser", "summarize-halve"),
+            routing=dict(data.get("routing", {})),
         )
     except ValidationError as exc:
         # ``from None``: chaining the original ValidationError would put its
