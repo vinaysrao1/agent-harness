@@ -125,6 +125,7 @@ EVENT_KIND_SPECS: dict[str, str] = {
     "background_job_abandoned": "S-104",
     "model_refusal": "S-110",
     "context_window_override": "S-404",
+    "stuck_signal": "S-107",
 }
 
 
