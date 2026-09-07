@@ -458,6 +458,21 @@ def _build_parser() -> argparse.ArgumentParser:
     oracle.add_argument("--json", action="store_true")
     oracle.set_defaults(func=_cmd_condenser_oracle)
 
+    audit = subparsers.add_parser(
+        "progress-audit",
+        help=(
+            "Score S-107's stuck detectors against recorded trials that carry "
+            "a verifier reward. Reads stored runs; makes no model calls."
+        ),
+    )
+    audit.add_argument(
+        "pattern",
+        nargs="?",
+        default="jobs/**/agent/harness-home/state.db",
+        help="Glob for trial state.db files (** is expanded).",
+    )
+    audit.set_defaults(func=_cmd_progress_audit)
+
     return parser
 
 
@@ -473,6 +488,14 @@ def _cmd_condenser_oracle(args: argparse.Namespace) -> int:
     if args.json:
         argv.append("--json")
     return oracle_main(argv)
+
+
+def _cmd_progress_audit(args: argparse.Namespace) -> int:
+    """``harness progress-audit``: S-107's precision/recall against outcomes."""
+    from harness.progress import audit
+
+    print(audit(args.pattern))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

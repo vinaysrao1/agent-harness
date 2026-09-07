@@ -118,6 +118,7 @@ from harness.diligence import (
 )
 from harness.permissions import Decision, Policy, ToolMeta, evaluate
 from harness.persistence import RunStore
+from harness.progress import STUCK_EVENT, ProgressMonitor
 from harness.routing import CallPurpose
 from harness.jobs import ABANDONED_EVENT, kill_command
 from harness.repo import (
@@ -499,6 +500,12 @@ class AgentLoop:
         self.written_data = (
             written_data if written_data is not None else WrittenData()
         )
+        #: S-107. Per-agent, loop state rather than context state so
+        #: compaction cannot erase it -- a detector that forgot what it had
+        #: seen every time the window filled would be blindest on exactly the
+        #: long runs it is for. Not persisted: a resumed run starts fresh and
+        #: simply detects less, which is the same trade `written_data` makes.
+        self.progress = ProgressMonitor()
         #: Monotonic counter for synthetic verification-execution tool-call
         #: ids, so each execution's permission decision is auditable on its
         #: own row (§4.11: every decision is logged).
@@ -581,6 +588,16 @@ class AgentLoop:
             job.killed = True
         if cancelled is not None:
             raise cancelled
+
+    def _record_stuck(self, signal) -> None:
+        """Persist a stuck signal, if one tripped. Emits and nothing else:
+        no nudge, no branch on the result (S-107). A third nudge source would
+        break N5 by construction, and the best detector here is 1.31x against
+        a length-matched base rate on sixteen firings."""
+        if signal is not None:
+            self.store.append_event(
+                self.agent_id, STUCK_EVENT, signal.payload()
+            )
 
     def _append_message(self, message: Message) -> int:
         """Add ``message`` to the live context and persist it as an event.
@@ -1278,10 +1295,27 @@ class AgentLoop:
                     self.store.append_event(
                         self.agent_id, "tool_call", call.model_dump(mode="json")
                     )
+                    # S-107. Emits and nothing else: no nudge, no branch on
+                    # the result. A third nudge source would break N5 by
+                    # construction, and at 75% precision one nudge in four
+                    # lands on a run that was going to succeed anyway.
+                    self._record_stuck(
+                        self.progress.observe_call(
+                            call.id, call.name, call.arguments
+                        )
+                    )
                 results = await self._resolve_tool_calls(
                     response.message.tool_calls
                 )
                 for result in results:
+                    # S-107's second detector needs the *result*: a command
+                    # exiting non-zero is not `is_error`, which is what made
+                    # the first measurement of it read as a refutation.
+                    self._record_stuck(
+                        self.progress.observe_result(
+                            result.tool_call_id, result.content, result.is_error
+                        )
+                    )
                     self.context.append(
                         Message(role=Role.TOOL, tool_result=result)
                     )
